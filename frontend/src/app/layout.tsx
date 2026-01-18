@@ -8,8 +8,8 @@ import MainLayout from "@/components/layout/MainLayout";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "EvoQuant OS v2.0",
-  description: "AI-Driven Quantitative Research System",
+  title: "EvoAlpha OS",
+  description: "数据驱动的Alpha机会发现平台 - 进化即自由",
 };
 
 export default function RootLayout({

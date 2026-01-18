@@ -40,7 +40,7 @@ def get_latest_trade_date():
         return str(date.today())
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="EvoQuant 策略调度器")
+    parser = argparse.ArgumentParser(description="EvoAlpha 策略调度器")
     parser.add_argument(
         '--strategy', '-s', 
         type=str, 

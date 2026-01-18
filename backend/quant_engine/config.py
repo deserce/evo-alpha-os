@@ -87,7 +87,7 @@ def save_results_to_db(engine, all_results, trade_date):
 
 def parse_arguments():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="EvoQuant 选股执行器")
+    parser = argparse.ArgumentParser(description="EvoAlpha 选股执行器")
     
     # 添加 --strategy 参数
     parser.add_argument(
