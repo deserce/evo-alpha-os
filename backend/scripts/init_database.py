@@ -1,5 +1,5 @@
 """
-EvoAlpha OS - 数据库初始化脚本
+EvoAlpha OS - 数据库初始化脚本（完整版）
 创建所有必需的数据表
 """
 
@@ -29,8 +29,8 @@ def init_database():
 
         try:
             with engine.begin() as conn:
-                # 1. 基础数据表
-                logger.info("  创建基础数据表...")
+                # ========== 1. 基础数据表 ==========
+                logger.info("  [1/8] 创建基础数据表...")
 
                 # 股票基本信息
                 conn.execute(text("""
@@ -86,8 +86,8 @@ def init_database():
                     );
                 """))
 
-                # 2. 量化因子表
-                logger.info("  创建量化因子表...")
+                # ========== 2. 量化因子表 ==========
+                logger.info("  [2/8] 创建量化因子表...")
 
                 # 个股 RPS
                 conn.execute(text("""
@@ -137,13 +137,192 @@ def init_database():
                         trade_date DATE,
                         symbol VARCHAR(20),
                         signal_type VARCHAR(10),
-                        meta_info JSONB,
+                        meta_info TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (strategy_name, trade_date, symbol)
                     );
                 """))
 
-                # 3. 创建索引
+                # ========== 3. ETF 相关表 ==========
+                logger.info("  [3/8] 创建 ETF 相关表...")
+
+                # ETF 基础信息
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS etf_info (
+                        symbol VARCHAR(20) PRIMARY KEY,
+                        name VARCHAR(100),
+                        fund_type VARCHAR(50),
+                        underlying_index VARCHAR(100),
+                        launch_date DATE,
+                        expense_ratio FLOAT,
+                        fund_company VARCHAR(100),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+
+                # ETF 行情
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS etf_daily_prices (
+                        symbol VARCHAR(20),
+                        trade_date DATE,
+                        open FLOAT,
+                        high FLOAT,
+                        low FLOAT,
+                        close FLOAT,
+                        volume FLOAT,
+                        amount FLOAT,
+                        pct_chg FLOAT,
+                        PRIMARY KEY (symbol, trade_date)
+                    );
+                """))
+
+                # ETF RPS
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS etf_feature_rps (
+                        symbol VARCHAR(20),
+                        trade_date DATE,
+                        rps_20 FLOAT,
+                        rps_50 FLOAT,
+                        rps_250 FLOAT,
+                        PRIMARY KEY (symbol, trade_date)
+                    );
+                """))
+
+                # 全天候配置记录
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS all_weather_allocations (
+                        allocation_date DATE PRIMARY KEY,
+                        tech_ratio FLOAT,
+                        dividend_ratio FLOAT,
+                        nasdaq_ratio FLOAT,
+                        gold_ratio FLOAT,
+                        soybean_ratio FLOAT,
+                        total_value FLOAT,
+                        rebalance_reason TEXT
+                    );
+                """))
+
+                # ========== 4. 新闻舆情表 ==========
+                logger.info("  [4/8] 创建新闻舆情表...")
+
+                # 新闻文章
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS news_articles (
+                        article_id VARCHAR(50) PRIMARY KEY,
+                        title VARCHAR(200),
+                        content TEXT,
+                        source VARCHAR(50),
+                        publish_time TIMESTAMP,
+                        url VARCHAR(500),
+                        sentiment_type VARCHAR(10),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+
+                # 新闻-股票关联
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS news_stock_relation (
+                        article_id VARCHAR(50),
+                        symbol VARCHAR(20),
+                        relevance_score FLOAT,
+                        sentiment_type VARCHAR(10),
+                        PRIMARY KEY (article_id, symbol)
+                    );
+                """))
+
+                # ========== 5. 连板数据表 ==========
+                logger.info("  [5/8] 创建连板数据表...")
+
+                # 涨停板交易
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS limit_board_trading (
+                        trade_date DATE,
+                        symbol VARCHAR(20),
+                        name VARCHAR(100),
+                        limit_time TIME,
+                        limit_price FLOAT,
+                        turnover_rate FLOAT,
+                        amount FLOAT,
+                        is_new_high BOOLEAN,
+                        boards INT,
+                        PRIMARY KEY (trade_date, symbol)
+                    );
+                """))
+
+                # 连板统计
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS consecutive_boards_stats (
+                        trade_date DATE,
+                        boards INT,
+                        stock_count INT,
+                        PRIMARY KEY (trade_date, boards)
+                    );
+                """))
+
+                # ========== 6. 宏观数据表 ==========
+                logger.info("  [6/8] 创建宏观数据表...")
+
+                # 宏观指标
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS macro_indicators (
+                        indicator_name VARCHAR(50),
+                        indicator_code VARCHAR(20),
+                        period VARCHAR(20),
+                        value FLOAT,
+                        unit VARCHAR(20),
+                        publish_date DATE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (indicator_code, period)
+                    );
+                """))
+
+                # ========== 7. Alpha 机会表 ==========
+                logger.info("  [7/8] 创建 Alpha 机会表...")
+
+                # Alpha 机会列表
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS alpha_opportunities (
+                        opportunity_id VARCHAR(50) PRIMARY KEY,
+                        trade_date DATE,
+                        symbol VARCHAR(20),
+                        opportunity_type VARCHAR(50),
+                        confidence_score FLOAT,
+                        reason TEXT,
+                        status VARCHAR(20),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+
+                # 机会跟踪
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS opportunity_tracking (
+                        opportunity_id VARCHAR(50),
+                        update_date DATE,
+                        current_price FLOAT,
+                        return_pct FLOAT,
+                        status VARCHAR(20),
+                        PRIMARY KEY (opportunity_id, update_date)
+                    );
+                """))
+
+                # ========== 8. AI 分析表 ==========
+                logger.info("  [8/8] 创建 AI 分析表...")
+
+                # AI 分析缓存
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS ai_analysis_cache (
+                        analysis_type VARCHAR(50),
+                        target_id VARCHAR(50),
+                        analysis_result TEXT,
+                        model_version VARCHAR(20),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expire_at TIMESTAMP,
+                        PRIMARY KEY (analysis_type, target_id, created_at)
+                    );
+                """))
+
+                # ========== 创建索引 ==========
                 logger.info("  创建索引...")
 
                 # 个股日线索引
@@ -161,6 +340,19 @@ def init_database():
                 # 策略结果索引
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_strategy_date ON quant_strategy_results (trade_date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_strategy_symbol ON quant_strategy_results (symbol);"))
+
+                # ETF 行情索引
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_etf_kline_symbol ON etf_daily_prices (symbol);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_etf_kline_date ON etf_daily_prices (trade_date);"))
+
+                # 新闻索引
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_news_time ON news_articles (publish_time);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_news_symbol ON news_stock_relation (symbol);"))
+
+                # 连板索引
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_boards_date ON limit_board_trading (trade_date);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_boards_symbol ON limit_board_trading (symbol);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_date ON consecutive_boards_stats (trade_date);"))
 
             logger.success(f"✅ {mode} 数据库初始化完成")
 
@@ -189,6 +381,18 @@ def drop_database():
             with engine.begin() as conn:
                 # 删除所有表
                 tables = [
+                    "ai_analysis_cache",
+                    "opportunity_tracking",
+                    "alpha_opportunities",
+                    "consecutive_boards_stats",
+                    "limit_board_trading",
+                    "macro_indicators",
+                    "news_stock_relation",
+                    "news_articles",
+                    "all_weather_allocations",
+                    "etf_feature_rps",
+                    "etf_daily_prices",
+                    "etf_info",
                     "quant_strategy_results",
                     "quant_stock_pool",
                     "quant_feature_sector_rps",
