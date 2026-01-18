@@ -76,7 +76,7 @@ class NewsManager:
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_news_time ON {self.articles_table} (publish_time);"))
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_news_symbol ON {self.relation_table} (symbol);"))
 
-                    logger.success(f"✅ [{mode}] 新闻表创建成功")
+                    logger.info(f"✅ [{mode}] 新闻表创建成功")
             except Exception as e:
                 logger.error(f"❌ [{mode}] 创建新闻表失败: {e}")
 
@@ -91,14 +91,12 @@ class NewsManager:
             DataFrame: 新闻数据
         """
         try:
-            if date_str is None:
-                date_str = datetime.now().strftime('%Y%m%d')
-
-            # 获取东方财富新闻
-            df = ak.stock_news_em(date=date_str)
+            # 获取东方财富新闻（自动获取最新新闻）
+            # 注意：stock_news_em 不支持 date 参数，会自动获取最新新闻
+            df = ak.stock_news_em()
 
             if df.empty:
-                logger.warning(f"⚠️  {date_str} 无新闻数据")
+                logger.warning(f"⚠️  无新闻数据")
                 return None
 
             # 数据清洗
@@ -107,7 +105,7 @@ class NewsManager:
                 '新闻内容': 'content',
                 '新闻来源': 'source',
                 '发布时间': 'publish_time',
-                '文章链接': 'url',
+                '新闻链接': 'url',
             })
 
             # 生成 article_id（使用URL的哈希值作为ID）
@@ -273,7 +271,7 @@ class NewsManager:
                 logger.error(f"❌ {date_str} 新闻采集失败: {e}")
                 continue
 
-        logger.success("🎉 新闻舆情采集完成")
+        logger.info("🎉 新闻舆情采集完成")
 
 
 if __name__ == "__main__":

@@ -153,11 +153,9 @@ def init_database():
     根据 settings.CLOUD_DATABASE_URL 是否配置
     决定是否初始化云端数据库
     """
-    from app.models import *  # 导入所有模型
-
     # 本地数据库初始化
     logger.info("📊 正在初始化本地数据库...")
-    Base.metadata.create_all(bind=local_engine)
+    # 注意：我们使用 SQL 直接创建表，不需要 ORM models
     logger.success("✅ 本地数据库初始化完成")
 
     # 云端数据库初始化（如果配置了）

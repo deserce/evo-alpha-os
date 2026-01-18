@@ -27,7 +27,7 @@ def update_stock_list():
         # 1. 本地 SQLite
         # 2. 云端 CockroachDB
 
-        logger.success("股票名单更新完成")
+        logger.info("股票名单更新完成")
         return stock_list
 
     except Exception as e:
@@ -52,7 +52,7 @@ def update_sector_list():
 
         # TODO: 写入数据库
 
-        logger.success("板块名单更新完成")
+        logger.info("板块名单更新完成")
         return sector_list
 
     except Exception as e:

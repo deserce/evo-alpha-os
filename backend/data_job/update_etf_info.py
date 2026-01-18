@@ -104,7 +104,7 @@ class ETFInfoManager:
                                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                             );
                         """))
-                        logger.success(f"✅ [{mode}] 表 {self.table_name} 创建成功")
+                        logger.info(f"✅ [{mode}] 表 {self.table_name} 创建成功")
                     else:
                         logger.info(f"ℹ️  [{mode}] 表 {self.table_name} 已存在")
             except Exception as e:
@@ -166,7 +166,7 @@ class ETFInfoManager:
                     # 插入新数据
                     df.to_sql(self.table_name, conn, if_exists='append', index=False)
 
-                logger.success(f"✅ [{mode}] 保存 {len(df)} 条 ETF 信息")
+                logger.info(f"✅ [{mode}] 保存 {len(df)} 条 ETF 信息")
             except Exception as e:
                 logger.error(f"❌ [{mode}] 保存 ETF 信息失败: {e}")
 
@@ -206,7 +206,7 @@ class ETFInfoManager:
         # 保存到数据库
         if all_etfs:
             self.save_etf_info(all_etfs)
-            logger.success(f"🎉 ETF 信息采集完成，共 {len(all_etfs)} 只")
+            logger.info(f"🎉 ETF 信息采集完成，共 {len(all_etfs)} 只")
         else:
             logger.error("❌ 未采集到任何 ETF 信息")
 

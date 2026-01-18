@@ -59,7 +59,7 @@ class MacroDataManager:
                     """))
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_macro_date ON {self.table_name} (publish_date);"))
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_macro_name ON {self.table_name} (indicator_name);"))
-                    logger.success(f"✅ [{mode}] 宏观指标表创建成功")
+                    logger.info(f"✅ [{mode}] 宏观指标表创建成功")
             except Exception as e:
                 logger.error(f"❌ [{mode}] 创建宏观指标表失败: {e}")
 
@@ -208,7 +208,7 @@ class MacroDataManager:
         # 保存数据
         if all_data:
             self.save_macro_data(all_data)
-            logger.success(f"🎉 宏观数据采集完成，共 {len(pd.concat(all_data))} 条")
+            logger.info(f"🎉 宏观数据采集完成，共 {len(pd.concat(all_data))} 条")
         else:
             logger.error("❌ 未获取到任何宏观数据")
 

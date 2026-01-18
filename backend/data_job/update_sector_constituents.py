@@ -158,7 +158,7 @@ class SectorConstituentsManager:
         if all_stocks:
             combined_df = pd.concat(all_stocks, ignore_index=True)
             self.save_sector_stocks(combined_df)
-            logger.success(f"🎉 板块成分股更新完成，共 {len(combined_df)} 条关系")
+            logger.info(f"🎉 板块成分股更新完成，共 {len(combined_df)} 条关系")
         else:
             logger.error("❌ 未获取到任何成分股数据")
 

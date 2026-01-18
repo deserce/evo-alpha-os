@@ -69,7 +69,7 @@ class ETFKlineManager:
                         """))
                         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_etf_kline_symbol ON {self.table_name} (symbol);"))
                         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_etf_kline_date ON {self.table_name} (trade_date);"))
-                        logger.success(f"✅ [{mode}] 表 {self.table_name} 创建成功")
+                        logger.info(f"✅ [{mode}] 表 {self.table_name} 创建成功")
                     else:
                         logger.info(f"ℹ️  [{mode}] 表 {self.table_name} 已存在")
             except Exception as e:
@@ -240,7 +240,7 @@ class ETFKlineManager:
                 logger.error(f"❌ {symbol} 采集失败: {e}")
                 continue
 
-        logger.success(f"🎉 ETF K线采集完成，成功 {success_count}/{len(symbols)}")
+        logger.info(f"🎉 ETF K线采集完成，成功 {success_count}/{len(symbols)}")
 
 
 if __name__ == "__main__":

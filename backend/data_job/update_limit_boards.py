@@ -77,7 +77,7 @@ class LimitBoardManager:
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_boards_symbol ON {self.boards_table} (symbol);"))
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_stats_date ON {self.stats_table} (trade_date);"))
 
-                    logger.success(f"✅ [{mode}] 连板表创建成功")
+                    logger.info(f"✅ [{mode}] 连板表创建成功")
             except Exception as e:
                 logger.error(f"❌ [{mode}] 创建连板表失败: {e}")
 
@@ -280,7 +280,7 @@ class LimitBoardManager:
                 logger.error(f"❌ {date_str} 采集失败: {e}")
                 continue
 
-        logger.success("🎉 连板数据采集完成")
+        logger.info("🎉 连板数据采集完成")
 
 
 if __name__ == "__main__":
