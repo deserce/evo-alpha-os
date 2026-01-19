@@ -4,12 +4,12 @@
 
 ## 🚧 项目状态
 
-**⚠️ 重要提示：本项目正在开发中，暂时还不能使用！**
+**✅ 数据采集系统 v2.1.0 - 生产就绪！**
 
 - ✅ 项目框架已搭建
 - ✅ 核心代码已从 EvoQuant OS 移植
+- ✅ **数据采集系统完成**（v2.1.0 - 增量更新与自动化版）
 - 🚧 正在整合和调试
-- 🚧 数据库配置待完成
 - 🚧 AI Agent 待接入
 
 **预计可用时间**：2025年2月
@@ -102,11 +102,46 @@ EvoAlpha-OS/
 │   │   ├── sync/             # 同步模块
 │   │   └── scheduler/        # 定时任务
 │   │
-│   ├── data_job/             # 📊 数据采集（本地工厂）
-│   │   ├── update_stock_kline.py
-│   │   ├── update_stock_sector_list.py
-│   │   ├── update_capital_flow.py
-│   │   └── update_finance_summary.py
+│   ├── data_job/             # 📊 数据采集系统 v2.1.0 ✅
+│   │   ├── README.md         # 数据采集系统主文档
+│   │   ├── requirements.txt  # Python 依赖清单
+│   │   │
+│   │   ├── core/             # 核心框架层
+│   │   │   └── base_collector.py
+│   │   ├── common/           # 公共工具层
+│   │   │   ├── network_utils.py
+│   │   │   ├── path_utils.py
+│   │   │   ├── logger_utils.py
+│   │   │   └── exception_utils.py
+│   │   ├── config/           # 配置管理层
+│   │   │   ├── collector_config.py
+│   │   │   └── collection_schedule.yaml
+│   │   ├── collectors/       # 12个数据采集器
+│   │   │   ├── stock_kline_collector.py
+│   │   │   ├── sector_kline_collector.py
+│   │   │   ├── etf_kline_collector.py
+│   │   │   ├── stock_valuation_collector.py
+│   │   │   ├── limit_boards_collector.py
+│   │   │   ├── news_collector.py
+│   │   │   ├── fund_holdings_collector.py
+│   │   │   ├── northbound_holdings_collector.py
+│   │   │   ├── etf_info_collector.py
+│   │   │   ├── finance_summary_collector.py
+│   │   │   ├── macro_data_collector.py
+│   │   │   └── stock_sector_list_collector.py
+│   │   ├── utils/            # 工具脚本
+│   │   │   └── scheduler.py  # 定时调度器
+│   │   ├── scripts/          # 独立脚本
+│   │   │   └── init_data_collection.py
+│   │   ├── docs/             # 数据采集文档
+│   │   │   ├── QUICKSTART.md
+│   │   │   ├── ARCHITECTURE.md
+│   │   │   └── DEVELOPMENT_GUIDE.md
+│   │   └── backup/           # 归档文件
+│   │
+│   ├── init_data.sh          # 🚀 初始化数据采集脚本
+│   ├── start_scheduler.sh    # ⏰ 启动定时调度器
+│   └── run_daily_collection.sh # 📊 每日数据采集
 │   │
 │   ├── quant_engine/         # ⚡ 量化引擎（本地工厂）
 │   │   ├── core/             # 核心工具（tdx_lib）
@@ -188,7 +223,12 @@ EvoAlpha-OS/
 - [x] 技术蓝图设计（BLUEPRINT.md）
 - [x] 从 EvoQuant OS 移植核心代码
 - [x] 双引擎数据库系统（本地 + 云端）
-- [x] 数据采集模块（AkShare）
+- [x] **数据采集系统 v2.1.0** ⭐
+  - 12个数据采集器（K线、估值、新闻、财务等）
+  - 增量更新机制（性能提升90%+）
+  - 定时调度系统（每日/每月/每季度自动采集）
+  - 初始化数据采集脚本（7-9小时全量采集）
+  - 完整文档和使用指南
 - [x] 量化引擎（RPS 计算、MRGC 策略）
 - [x] 前端页面框架
 
@@ -237,9 +277,17 @@ EvoAlpha-OS/
 
 ## 📚 文档
 
+### 核心文档
 - **[技术蓝图](./BLUEPRINT.md)**：完整的系统设计和技术架构
 - **[移植计划](./MIGRATION_PLAN.md)**：从 EvoQuant OS 移植代码的计划
-- **[项目结构](./PROJECT_STRUCTURE.md)**：详细的目录结构说明
+
+### 数据采集系统文档 ⭐
+- **[快速开始](./backend/data_job/docs/QUICKSTART.md)**：3分钟快速上手数据采集
+- **[系统架构](./backend/data_job/docs/ARCHITECTURE.md)**：v2.1.0 架构设计文档
+- **[开发指南](./backend/data_job/docs/DEVELOPMENT_GUIDE.md)**：新增采集器开发规范
+- **[主文档](./backend/data_job/README.md)**：数据采集系统完整说明
+- **[优化报告](./backend/data_job/INCREMENTAL_UPDATE_REPORT.md)**：增量更新性能报告
+- **[采集规划](./backend/data_job/COLLECTION_SCHEDULE.md)**：数据采集频率规划
 
 ---
 
@@ -255,6 +303,6 @@ Copyright © 2025 dlab (Evolution Lab). All rights reserved.
 
 ---
 
-**项目状态**：🚧 开发中
-**最后更新**：2025-01-18
+**项目状态**：🚧 开发中 | 📊 数据采集系统 v2.1.0 已完成
+**最后更新**：2026-01-19
 **预计可用**：2025年2月

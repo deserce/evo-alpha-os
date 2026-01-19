@@ -1,0 +1,165 @@
+# 数据采集调度配置
+# 定义每个采集器的执行频率和执行时间
+
+schedule:
+  # ==================== 每日采集任务 ====================
+  daily:
+    enabled: true
+    description: "每日数据采集（交易日收盘后）"
+    trigger_time: "15:30"  # 收盘后30分钟
+    timezone: "Asia/Shanghai"
+    weekdays: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]  # 仅工作日
+
+    collectors:
+      - name: "StockKlineCollector"
+        description: "个股K线数据"
+        priority: 1
+        estimated_time: "30-45分钟"
+        retry_on_failure: true
+
+      - name: "SectorKlineCollector"
+        description: "板块K线数据"
+        priority: 2
+        estimated_time: "5-10分钟"
+        retry_on_failure: true
+
+      - name: "ETFKlineCollector"
+        description: "ETF K线数据"
+        priority: 3
+        estimated_time: "10-15分钟"
+        retry_on_failure: true
+
+      - name: "StockValuationCollector"
+        description: "股票估值数据"
+        priority: 4
+        estimated_time: "5-10分钟"
+        retry_on_failure: true
+
+      - name: "LimitBoardsCollector"
+        description: "连板数据"
+        priority: 5
+        estimated_time: "2-5分钟"
+        retry_on_failure: true
+
+      - name: "NewsCollector"
+        description: "新闻舆情数据"
+        priority: 6
+        estimated_time: "10-20分钟"
+        retry_on_failure: true
+
+  # ==================== 每月采集任务 ====================
+  monthly:
+    enabled: true
+    description: "每月数据采集（月初1-3号）"
+    trigger_day: 1  # 每月1号
+    trigger_time: "08:00"
+    timezone: "Asia/Shanghai"
+
+    collectors:
+      - name: "MacroDataCollector"
+        description: "宏观数据（GDP、CPI、PMI等）"
+        priority: 1
+        estimated_time: "10-15分钟"
+        retry_on_failure: true
+
+      - name: "ETFInfoCollector"
+        description: "ETF基础信息"
+        priority: 2
+        estimated_time: "5-10分钟"
+        retry_on_failure: true
+
+      - name: "StockSectorListCollector"
+        description: "股票列表和板块映射"
+        priority: 3
+        estimated_time: "10-15分钟"
+        retry_on_failure: true
+
+  # ==================== 季度采集任务 ====================
+  quarterly:
+    enabled: true
+    description: "季度数据采集（季报发布后1周）"
+    trigger_months: [1, 4, 7, 10]  # 季报月份
+    trigger_day: 15  # 季报月中（给财报发布留出时间）
+    trigger_time: "08:00"
+    timezone: "Asia/Shanghai"
+
+    collectors:
+      - name: "FundHoldingsCollector"
+        description: "基金季度持仓数据"
+        priority: 1
+        estimated_time: "10-15分钟"
+        retry_on_failure: true
+        target_quarters:
+          - "20241231"  # 最新季度在前
+          - "20240930"
+          - "20240630"
+          - "20240331"
+
+      - name: "FinanceSummaryCollector"
+        description: "财务摘要数据"
+        priority: 2
+        estimated_time: "2-3小时"
+        retry_on_failure: true
+
+  # ==================== 一次性采集任务 ====================
+  onetime:
+    enabled: false
+    description: "一次性历史数据采集"
+
+    collectors:
+      - name: "NorthboundHoldingsCollector"
+        description: "北向资金历史持股（数据截至2024-08-16）"
+        status: "completed"  # 已完成
+        completed_at: "2026-01-19"
+        note: "监管规则变更，数据停止披露"
+
+# ==================== 全局配置 ====================
+global:
+  # 错误处理
+  error_handling:
+    max_retries: 3
+    retry_delay: 60  # 秒
+    alert_on_failure: true
+
+  # 并发控制
+  concurrency:
+    max_parallel_collectors: 3  # 同时运行的最大采集器数量
+    per_collector_delay: 5  # 采集器之间的延迟（秒）
+
+  # 数据保留策略
+  data_retention:
+    daily_data_days: 1095  # 3年
+    monthly_data_days: 3650  # 10年
+    quarterly_data_days: 3650  # 10年
+
+  # 日志配置
+  logging:
+    level: "INFO"
+    save_logs: true
+    log_dir: "logs/scheduled_collections"
+    log_retention_days: 30
+
+# ==================== 监控配置 ====================
+monitoring:
+  # 采集统计
+  statistics:
+    enabled: true
+    save_to_database: true
+
+  # 数据质量检查
+  quality_check:
+    enabled: true
+    min_rows_threshold: 10  # 最小数据行数阈值
+
+  # 告警配置
+  alerts:
+    enabled: false  # 需要配置时启用
+    email: ""
+    webhook_url: ""
+    alert_conditions:
+      - condition: "collector_failed"
+        severity: "error"
+      - condition: "data_quality_issue"
+        severity: "warning"
+      - condition: "collection_timeout"
+        severity: "warning"

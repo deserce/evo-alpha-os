@@ -1,0 +1,17 @@
+# EvoAlpha OS - 数据采集系统依赖
+
+# 数据采集核心依赖
+akshare>=1.12.0
+pandas>=2.0.0
+sqlalchemy>=2.0.0
+
+# 定时任务依赖
+apscheduler>=3.10.0
+
+# 数据库
+sqlite3  # Python 标准库，无需安装
+
+# 可选依赖（用于生产环境）
+# gunicorn>=21.0.0       # WSGI 服务器
+# supervisor>=4.0.0      # 进程管理
+# python-dotenv>=1.0.0   # 环境变量管理
