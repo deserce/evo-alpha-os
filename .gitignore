@@ -24,18 +24,6 @@ wheels/
 venv/
 ENV/
 env/
-.venv/
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-local_quant.db
-
-# Environment variables
-.env
-.env.local
-.env.*.local
 
 # IDE
 .vscode/
@@ -43,33 +31,26 @@ local_quant.db
 *.swp
 *.swo
 *~
-.DS_Store
+
+# Environment Variables
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
 
 # Logs
-*.log
 logs/
+*.log
 
-# Node modules (for frontend)
-node_modules/
+# Data Collection Runtime State
+backend/data_job/data/collection_progress/*.json
 
-# Next.js
-.next/
-out/
-
-# Production
-build/
-dist/
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Temporary files
-*.tmp
-*.temp
-*.cache
-*.bak
+# Collection Data
+backend/data/
 
 # OS
+.DS_Store
 Thumbs.db
