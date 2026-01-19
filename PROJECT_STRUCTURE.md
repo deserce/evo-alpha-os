@@ -1,15 +1,28 @@
 # EvoAlpha OS - 项目结构说明
 
+> **版本**: v2.1.0
+> **最后更新**: 2026-01-19
+> **状态**: ✅ 数据采集系统已完成
+
 ## 📂 完整目录树
 
 ```
 EvoAlpha-OS/
 ├── BLUEPRINT.md              # 📘 技术蓝图（完整系统设计）
 ├── README.md                 # 📄 项目说明
-├── PROJECT_PLAN.md           # 📋 项目计划
+├── DOCS_INDEX.md             # 📚 文档索引（新增）
+├── CLAUDE.md                 # 📝 开发日志
 ├── PROJECT_STRUCTURE.md      # 📁 本文件
+├── .gitignore                # Git忽略配置
+│
+├── docs/                     # 📖 文档目录
+│   └── archive/              # 归档文档
+│       ├── README.md         # 归档说明
+│       ├── PROJECT_PLAN.md   # 项目初始化计划（已归档）
+│       ├── MIGRATION_PLAN.md # 代码移植计划（已归档）
+│       └── DATA_ANALYSIS.md  # 数据分析报告（已归档）
+│
 ├── .env.example              # 环境变量模板
-├── .gitignore                # Git 忽略配置
 │
 ├── backend/                  # 🔧 Python 后端
 │   ├── main.py               # FastAPI 应用入口（云端）
@@ -48,12 +61,42 @@ EvoAlpha-OS/
 │   │       ├── daily_job.py  # 每日任务
 │   │       └── email_sender.py  # 邮件发送
 │   │
-│   ├── data_job/             # 📊 数据采集（本地工厂）
-│   │   ├── __init__.py
-│   │   ├── update_stock_list.py   # 股票名单 ✅
-│   │   ├── update_kline.py        # K 线数据 ✅
-│   │   ├── update_news.py         # 新闻舆情
-│   │   └── update_finance.py      # 财报数据
+│   ├── data_job/             # 📊 数据采集系统 v2.1.0 ✅
+│   │   ├── README.md         # 数据采集系统主文档
+│   │   ├── requirements.txt  # Python 依赖清单
+│   │   │
+│   │   ├── core/             # 核心框架层
+│   │   │   └── base_collector.py
+│   │   ├── common/           # 公共工具层
+│   │   │   ├── network_utils.py
+│   │   │   ├── path_utils.py
+│   │   │   ├── logger_utils.py
+│   │   │   └── exception_utils.py
+│   │   ├── config/           # 配置管理层
+│   │   │   ├── collector_config.py
+│   │   │   └── collection_schedule.yaml
+│   │   ├── collectors/       # 12个数据采集器
+│   │   │   ├── stock_kline_collector.py
+│   │   │   ├── sector_kline_collector.py
+│   │   │   ├── etf_kline_collector.py
+│   │   │   ├── stock_valuation_collector.py
+│   │   │   ├── limit_boards_collector.py
+│   │   │   ├── news_collector.py
+│   │   │   ├── fund_holdings_collector.py
+│   │   │   ├── northbound_holdings_collector.py
+│   │   │   ├── etf_info_collector.py
+│   │   │   ├── finance_summary_collector.py
+│   │   │   ├── macro_data_collector.py
+│   │   │   └── stock_sector_list_collector.py
+│   │   ├── utils/            # 工具脚本
+│   │   │   └── scheduler.py  # 定时调度器
+│   │   ├── scripts/          # 独立脚本
+│   │   │   └── init_data_collection.py
+│   │   ├── docs/             # 数据采集文档
+│   │   │   ├── QUICKSTART.md
+│   │   │   ├── ARCHITECTURE.md
+│   │   │   └── DEVELOPMENT_GUIDE.md
+│   │   └── backup/           # 归档文件
 │   │
 │   ├── quant_engine/         # ⚡ 量化引擎（本地工厂）
 │   │   ├── __init__.py

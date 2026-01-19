@@ -277,17 +277,29 @@ EvoAlpha-OS/
 
 ## 📚 文档
 
-### 核心文档
-- **[技术蓝图](./BLUEPRINT.md)**：完整的系统设计和技术架构
-- **[移植计划](./MIGRATION_PLAN.md)**：从 EvoQuant OS 移植代码的计划
+### 📖 文档导航 ⭐
+- **[文档索引](./DOCS_INDEX.md)** - 完整的文档导航和阅读路径指南
 
-### 数据采集系统文档 ⭐
-- **[快速开始](./backend/data_job/docs/QUICKSTART.md)**：3分钟快速上手数据采集
-- **[系统架构](./backend/data_job/docs/ARCHITECTURE.md)**：v2.1.0 架构设计文档
-- **[开发指南](./backend/data_job/docs/DEVELOPMENT_GUIDE.md)**：新增采集器开发规范
-- **[主文档](./backend/data_job/README.md)**：数据采集系统完整说明
-- **[优化报告](./backend/data_job/INCREMENTAL_UPDATE_REPORT.md)**：增量更新性能报告
-- **[采集规划](./backend/data_job/COLLECTION_SCHEDULE.md)**：数据采集频率规划
+### 核心文档
+- **[README.md](./README.md)** - 项目总览（本文件）
+- **[技术蓝图](./BLUEPRINT.md)** - 完整的系统设计和技术架构
+- **[项目结构](./PROJECT_STRUCTURE.md)** - 详细的目录结构说明
+
+### 数据采集系统文档 (v2.1.0 ✅ 已完成)
+- **[快速开始](./backend/data_job/docs/QUICKSTART.md)** - 3分钟快速上手数据采集
+- **[系统架构](./backend/data_job/docs/ARCHITECTURE.md)** - v2.1.0 架构设计文档
+- **[开发指南](./backend/data_job/docs/DEVELOPMENT_GUIDE.md)** - 新增采集器开发规范
+- **[主文档](./backend/data_job/README.md)** - 数据采集系统完整说明
+- **[优化报告](./backend/data_job/INCREMENTAL_UPDATE_REPORT.md)** - 增量更新性能报告
+- **[采集规划](./backend/data_job/COLLECTION_SCHEDULE.md)** - 数据采集频率规划
+
+### 开发文档
+- **[开发日志](./CLAUDE.md)** - 开发过程中的经验、问题和解决方案
+
+### 归档文档
+- **[代码移植计划](./docs/archive/MIGRATION_PLAN.md)** - 从 EvoQuant OS 移植代码（已完成）
+- **[数据分析报告](./docs/archive/DATA_ANALYSIS.md)** - 数据采集模块分析（已完成）
+- **[项目初始化计划](./docs/archive/PROJECT_PLAN.md)** - 项目初始化（已完成）
 
 ---
 
