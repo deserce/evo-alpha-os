@@ -4,11 +4,12 @@
 
 ## 🚧 项目状态
 
-**✅ 数据采集系统 v2.1.0 - 生产就绪！**
+**✅ 自动化交易流水线 v1.0 - 生产就绪！**
 
 - ✅ 项目框架已搭建
 - ✅ 核心代码已从 EvoQuant OS 移植
 - ✅ **数据采集系统完成**（v2.1.0 - 增量更新与自动化版）
+- ✅ **自动化交易流水线**（v1.0 - 定时调度 + RPS计算 + 策略选股）
 - 🚧 正在整合和调试
 - 🚧 AI Agent 待接入
 
@@ -94,6 +95,11 @@ EvoAlpha-OS/
 ├── backend/                  # 🔧 Python 后端
 │   ├── main.py               # FastAPI 应用入口（云端）
 │   ├── requirements.txt      # Python 依赖
+│   ├── auto_pipeline.py      # 🤖 自动化交易流水线调度器 v1.0 ✅
+│   ├── check_scheduler.sh    # 📊 调度器状态监控脚本
+│   ├── restart_scheduler.sh  # 🔄 调度器重启脚本
+│   ├── run_pipeline.sh       # 🚀 流水线便捷启动脚本
+│   ├── monitor_pipeline.sh   # 📡 流水线监控通知脚本
 │   │
 │   ├── app/                  # ☁️ 云端后端模块
 │   │   ├── core/             # 核心配置（config, database）
@@ -144,10 +150,21 @@ EvoAlpha-OS/
 │   └── run_daily_collection.sh # 📊 每日数据采集
 │   │
 │   ├── quant_engine/         # ⚡ 量化引擎（本地工厂）
+│   │   ├── README.md         # 量化引擎完整文档
 │   │   ├── core/             # 核心工具（tdx_lib）
-│   │   ├── features/         # 因子计算（RPS、技术指标）
+│   │   ├── calculators/      # 因子计算器
+│   │   │   ├── stock_rps_calculator.py
+│   │   │   ├── sector_rps_calculator.py
+│   │   │   └── etf_rps_calculator.py
+│   │   ├── strategies/       # 策略执行
+│   │   │   ├── base_strategy.py
+│   │   │   ├── mrgc_strategy.py
+│   │   │   └── select_resonance.py
+│   │   ├── runner/           # 运行器
+│   │   │   ├── feature_runner.py
+│   │   │   └── strategy_runner.py
 │   │   ├── pool/             # 股票池管理
-│   │   └── strategies/       # 策略执行（MRGC、板块共振）
+│   │   └── core/             # 核心工具
 │   │
 │   └── scripts/              # 🔧 实用脚本
 │       └── init_database.py  # 数据库初始化
@@ -224,12 +241,25 @@ EvoAlpha-OS/
 - [x] 从 EvoQuant OS 移植核心代码
 - [x] 双引擎数据库系统（本地 + 云端）
 - [x] **数据采集系统 v2.1.0** ⭐
-  - 12个数据采集器（K线、估值、新闻、财务等）
+  - 13个数据采集器（K线、估值、新闻、财务等）
   - 增量更新机制（性能提升90%+）
   - 定时调度系统（每日/每月/每季度自动采集）
   - 初始化数据采集脚本（7-9小时全量采集）
   - 完整文档和使用指南
-- [x] 量化引擎（RPS 计算、MRGC 策略）
+- [x] **量化引擎系统** ⭐
+  - RPS因子计算（个股、板块、ETF）
+  - MRGC策略选股
+  - 核心股票池维护
+  - 因子计算器和策略运行器
+- [x] **自动化交易流水线 v1.0** ⭐⭐⭐
+  - 定时调度器（每日15:30 / 每季度15号08:00）
+  - 完整自动化流程：数据采集 → RPS计算 → 策略选股
+  - 监控和管理脚本
+  - 桌面通知功能
+- [x] Bug修复和优化
+  - datetime类型转换问题
+  - None类型检查
+  - 网络重试机制优化
 - [x] 前端页面框架
 
 ### 进行中 🚧
@@ -293,6 +323,15 @@ EvoAlpha-OS/
 - **[优化报告](./backend/data_job/INCREMENTAL_UPDATE_REPORT.md)** - 增量更新性能报告
 - **[采集规划](./backend/data_job/COLLECTION_SCHEDULE.md)** - 数据采集频率规划
 
+### 量化引擎系统文档
+- **[量化引擎文档](./backend/quant_engine/README.md)** - 量化引擎完整说明
+- **[因子计算器](./backend/quant_engine/calculators/)** - RPS因子计算
+- **[策略系统](./backend/quant_engine/strategies/)** - MRGC策略
+
+### 自动化流水线文档 (v1.0 ✅ 已完成)
+- **[自动化流水线文档](./backend/AUTO_PIPELINE_README.md)** - 完整的自动化流程说明
+- **[后端主文档](./backend/README.md)** - 后端系统总览
+
 ### 开发文档
 - **[开发日志](./CLAUDE.md)** - 开发过程中的经验、问题和解决方案
 
@@ -315,6 +354,6 @@ Copyright © 2025 dlab (Evolution Lab). All rights reserved.
 
 ---
 
-**项目状态**：🚧 开发中 | 📊 数据采集系统 v2.1.0 已完成
-**最后更新**：2026-01-19
+**项目状态**：🚧 开发中 | 📊 自动化交易流水线 v1.0 已完成
+**最后更新**：2026-01-20
 **预计可用**：2025年2月
