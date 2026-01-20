@@ -288,16 +288,20 @@ class BaseFeatureCalculator(ABC):
         except Exception as e:
             raise CalculationError(f"保存失败: {e}")
 
-    def run_init(self):
+    def run_init(self, days=365):
         """
-        【全量模式】重算所有历史数据
+        【全量模式】重算指定天数的数据（默认最近一年）
+
+        Args:
+            days: 加载最近N天的数据，默认365天（一年）
 
         用途：
         - 首次初始化
         - 修复数据错误
+        - 重算最近一年的数据
         """
         logger.info("=" * 80)
-        logger.info(f"🚀 [{self.__class__.__name__}] 启动全量重算...")
+        logger.info(f"🚀 [{self.__class__.__name__}] 启动全量重算（最近{days}天）...")
         logger.info("=" * 80)
 
         start_time = time.time()
@@ -311,13 +315,23 @@ class BaseFeatureCalculator(ABC):
             with self.engine.begin() as conn:
                 conn.execute(text(f"DELETE FROM {self.target_table}"))
 
-            # 3. 加载全量数据
-            df = self.load_data(start_date=None)
+            # 3. 计算起始日期
+            cutoff_date = (
+                datetime.now() - timedelta(days=days)
+            ).strftime("%Y-%m-%d")
+            logger.info(f"📅 数据范围: {cutoff_date} 至今")
 
-            # 4. 计算因子
+            # 4. 加载数据
+            df = self.load_data(start_date=cutoff_date)
+
+            if df.empty:
+                logger.warning("⚠️ 数据为空，跳过计算")
+                return
+
+            # 5. 计算因子
             result = self.compute_features(df)
 
-            # 5. 保存
+            # 6. 保存
             self.save_to_db(result, mode='append')
 
             cost = time.time() - start_time
