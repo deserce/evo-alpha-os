@@ -250,6 +250,12 @@ class LimitBoardsCollector(BaseCollector):
                     query = text(f"SELECT MAX(trade_date) as last_date FROM {self.boards_table}")
                     result = conn.execute(query).scalar()
                     if result:
+                        # 确保返回 date 对象
+                        if isinstance(result, str):
+                            from datetime import datetime
+                            result = datetime.strptime(result, '%Y-%m-%d').date()
+                        elif isinstance(result, datetime):
+                            result = result.date()
                         logger.info(f"✅ [{mode}] 最后采集日期: {result}")
                         return result
             except Exception as e:

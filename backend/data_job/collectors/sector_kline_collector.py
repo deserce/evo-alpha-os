@@ -71,6 +71,11 @@ class SectorKlineCollector(BaseCollector):
                 result = conn.execute(query, {"name": sector_name}).scalar()
 
             if result:
+                # 确保是 date 对象
+                if isinstance(result, str):
+                    result = datetime.strptime(result, '%Y-%m-%d').date()
+                elif isinstance(result, datetime):
+                    result = result.date()
                 next_date = result + timedelta(days=1)
                 return next_date.strftime("%Y%m%d")
             else:
@@ -208,7 +213,7 @@ class SectorKlineCollector(BaseCollector):
             df_raw = self.fetch_data(name, s_type, start_date)
 
             # 保存数据
-            if not df_raw.empty:
+            if df_raw is not None and not df_raw.empty:
                 if self.save_data(df_raw, name):
                     update_count += 1
             else:

@@ -87,7 +87,7 @@ class StockValuationCollector(BaseCollector):
         Returns:
             pd.DataFrame: 处理后的数据
         """
-        if df.empty:
+        if df is None or df.empty:
             return df
 
         # 1. 字段映射
@@ -161,7 +161,7 @@ class StockValuationCollector(BaseCollector):
 
         # 获取数据
         df_raw = self.fetch_data()
-        if not df_raw.empty:
+        if df_raw is not None and not df_raw.empty:
             df_clean = self.process_data(df_raw)
             self.save_data(df_clean)
             self.log_collection_end(True, f"采集 {len(df_clean)} 条数据")
