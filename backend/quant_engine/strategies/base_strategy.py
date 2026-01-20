@@ -23,14 +23,20 @@ class BaseStrategy(ABC):
     def __init__(self, strategy_name):
         self.engine = get_engine()
         self.strategy_name = strategy_name
-        
+
+        # ================= 策略元数据（子类可以覆盖） =================
+        self.strategy_display_name = strategy_name  # 显示名称
+        self.strategy_description = "策略说明（子类需实现）"  # 策略描述
+        self.strategy_logic = "核心逻辑（子类需实现）"  # 核心逻辑说明
+        self.filter_criteria = "筛选条件（子类需实现）"  # 筛选条件
+
         # ================= 核心：新宇宙表名配置 =================
         # 1. 股票池 (New)
         self.pool_table = "quant_stock_pool"
         # 2. 因子表 (New) - 个股RPS表
         self.rps_table = "quant_feature_stock_rps"
-        # 3. 结果表 (New)
-        self.result_table = "quant_strategy_results"
+        # 3. 预选结果表（New）- 区分预选和买点
+        self.preselect_table = "quant_preselect_results"  # 预选结果表
 
     def get_stock_pool(self, pool_name='core_pool'):
         """1. 获取股票池 (从 quant_stock_pool 读取)"""
@@ -62,13 +68,12 @@ class BaseStrategy(ABC):
     def get_daily_features(self, trade_date, symbols):
         """2. 获取指定日期的量化因子"""
         if not symbols: return pd.DataFrame()
-        
-        logger.info(f"📊 [{self.strategy_name}] 加载因子数据 ({trade_date})...")
-        
+
+        logger.info(f"📊 [{self.strategy_display_name}] 加载因子数据 ({trade_date})...")
+
         sym_str = "'" + "','".join(symbols) + "'"
-        
+
         try:
-            # 假设 quant_feature_rps 使用 symbol 字段
             # 使用 LIKE 匹配日期（处理带时间戳的日期格式）
             query = text(f"""
                 SELECT symbol, rps_50, rps_120, rps_250
@@ -76,7 +81,7 @@ class BaseStrategy(ABC):
                 WHERE trade_date LIKE '{trade_date}%'
                   AND symbol IN ({sym_str})
             """)
-            
+
             df = pd.read_sql(query, self.engine)
             if df.empty:
                 logger.warning(f"⚠️ {trade_date} 没有因子数据！可能是当日数据未更新。")
@@ -88,19 +93,32 @@ class BaseStrategy(ABC):
             return pd.DataFrame()
 
     def save_results(self, df_results):
-        """3. 标准化保存结果 (quant_strategy_results)"""
+        """
+        保存预选结果到quant_preselect_results表
+
+        注意：这是【预选】阶段，不是买入建议！
+        买入信号需要AI后续分析
+        """
         if df_results.empty:
-            logger.info(f"🏁 [{self.strategy_name}] 结果为空，无需保存。")
+            logger.info(f"🏁 [{self.strategy_display_name}] 预选结果为空，无需保存。")
             return
 
-        logger.info(f"💾 [{self.strategy_name}] 正在保存 {len(df_results)} 条选股结果...")
+        logger.info(f"💾 [{self.strategy_display_name}] 正在保存 {len(df_results)} 条【预选结果】...")
 
-        # 1. 补充策略名称
+        # 1. 补充策略信息
         df_results['strategy_name'] = self.strategy_name
+        df_results['strategy_display_name'] = self.strategy_display_name
+        df_results['strategy_description'] = self.strategy_description
+        df_results['strategy_logic'] = self.strategy_logic
+        df_results['filter_criteria'] = self.filter_criteria
+        df_results['result_type'] = 'PRESELECT'  # 明确标记为预选
 
-        # 2. 确保包含必要字段（根据实际表结构）
-        # 表结构: strategy_name, trade_date, symbol, signal_type, meta_info, created_at
-        required_cols = ['strategy_name', 'trade_date', 'symbol', 'signal_type', 'meta_info']
+        # 2. 确保包含必要字段
+        required_cols = [
+            'strategy_name', 'strategy_display_name', 'strategy_description',
+            'strategy_logic', 'filter_criteria', 'result_type',
+            'trade_date', 'symbol', 'signal_type', 'meta_info'
+        ]
 
         for col in required_cols:
             if col not in df_results.columns:
@@ -110,23 +128,40 @@ class BaseStrategy(ABC):
 
         try:
             with self.engine.begin() as conn:
-                # 3. 幂等性删除：根据【数据日期】删除旧记录
+                # 创建表（如果不存在）
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS {self.preselect_table} (
+                        strategy_name VARCHAR(50),
+                        strategy_display_name VARCHAR(100),
+                        strategy_description TEXT,
+                        strategy_logic TEXT,
+                        filter_criteria TEXT,
+                        result_type VARCHAR(20),
+                        trade_date DATE,
+                        symbol VARCHAR(20),
+                        signal_type VARCHAR(10),
+                        meta_info TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (strategy_name, trade_date, symbol, result_type)
+                    )
+                """))
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.preselect_table}_date ON {self.preselect_table} (trade_date);"))
+
+                # 幂等性删除：删除当天的数据
                 dates = df_save['trade_date'].unique()
-                date_list_str = "'" + "','".join([str(d) for d in dates]) + "'"
-                
-                del_sql = text(f"""
-                    DELETE FROM {self.result_table} 
-                    WHERE strategy_name = '{self.strategy_name}' 
-                      AND trade_date IN ({date_list_str})
-                """)
-                conn.execute(del_sql)
-                
-                # 4. 写入新数据
-                df_save.to_sql(self.result_table, conn, if_exists='append', index=False)
-                
-            target_date = dates[0] if len(dates) > 0 else "Unknown"
-            logger.info(f"🎉 结果已入库！(表: {self.result_table}, 日期: {target_date})")
-            
+                date_strs = [pd.to_datetime(d).strftime('%Y-%m-%d') for d in dates]
+                if date_strs:
+                    for date_str in date_strs:
+                        conn.execute(text(f"""
+                            DELETE FROM {self.preselect_table}
+                            WHERE trade_date LIKE '{date_str}%'
+                        """))
+
+                # 写入新数据
+                df_save.to_sql(self.preselect_table, conn, if_exists='append', index=False)
+
+            logger.info(f"✅ 【预选结果】已入库！表: {self.preselect_table}, 日期: {dates[0] if len(dates) > 0 else 'Unknown'}")
+
         except Exception as e:
             logger.error(f"❌ 保存失败: {e}")
 

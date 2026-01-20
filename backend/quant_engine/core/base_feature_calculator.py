@@ -288,17 +288,17 @@ class BaseFeatureCalculator(ABC):
         except Exception as e:
             raise CalculationError(f"保存失败: {e}")
 
-    def run_init(self, days=365):
+    def run_init(self, days=400):
         """
-        【全量模式】重算指定天数的数据（默认最近一年）
+        【全量模式】重算指定天数的数据（默认最近400天）
 
         Args:
-            days: 加载最近N天的数据，默认365天（一年）
+            days: 加载最近N天的数据，默认400天（确保250日RPS计算准确）
 
         用途：
         - 首次初始化
         - 修复数据错误
-        - 重算最近一年的数据
+        - 重算历史数据
         """
         logger.info("=" * 80)
         logger.info(f"🚀 [{self.__class__.__name__}] 启动全量重算（最近{days}天）...")
