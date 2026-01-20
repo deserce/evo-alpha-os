@@ -16,10 +16,10 @@ if project_root not in sys.path:
 from app.core.database import get_engine
 
 # ================= 配置 =================
-# 你的筛选逻辑配置
-FUND_THRESHOLD = 5         # 基金持仓 > 5%
-NORTH_THRESHOLD = 10000    # 北向持仓 > 1亿元 (假设你的库里单位是万元)
-                           # 如果库里单位是元，这里需要改为 100000000
+# 筛选逻辑配置
+# 只要符合以下任一条件即可入选核心股票池
+FUND_RATIO_THRESHOLD = 5.0   # 基金持仓: 基金持股数/总股本 > 5%（最近3季度任意满足）
+NORTH_MIN_VALUE = 100000000  # 北向持仓: 持股市值 > 1亿元 (单位: 元)
 
 class StockPoolMaintainer:
     def __init__(self):
@@ -28,43 +28,73 @@ class StockPoolMaintainer:
 
     def refresh_pool(self):
         print("🏊‍♂️ 开始清洗 [核心股票池] (基本面筛选)...")
-        print(f"   💡 筛选标准: 基金持股>{FUND_THRESHOLD}% 或 北向持仓>{NORTH_THRESHOLD}万元")
+        print(f"   💡 筛选标准（符合任一即可）:")
+        print(f"      1. 基金持股比例 ≥ {FUND_RATIO_THRESHOLD}%（最近3季度任意满足）")
+        print(f"      2. 北向资金持仓 ≥ 1亿元")
 
-        # 1. 构造 SQL (基于你的原始SQL进行字段适配)
-        # 变化点：
-        # - stock_list -> stock_info
-        # - code -> symbol (为了统一标准)
-        # - 输出增加 pool_name 字段，方便区分不同策略的池子
-        
+        # 使用 SQLite 兼容的语法
+        # 基金持股比例 = 基金持股数 / 总股本 × 100%
+        # 总股本 = 总市值 / 收盘价
+        # 北向持仓：直接使用hold_value（单位：元）
+
+        # 获取最近日期作为基准
+        max_fund_date = pd.read_sql(
+            "SELECT MAX(report_date) as max_date FROM finance_fund_holdings",
+            self.engine
+        ).iloc[0]['max_date']
+
+        # 计算9个月前的日期（最近3个季度）
+        max_date_obj = pd.to_datetime(max_fund_date)
+        cutoff_date = (max_date_obj - pd.DateOffset(months=9)).strftime('%Y-%m-%d')
+
+        print(f"   📅 基金数据范围: {cutoff_date} 至 {max_fund_date}（最近3季度）")
+
         sql_filter = text(f"""
-        WITH LatestFund AS (
-            SELECT DISTINCT ON (code) code, fund_ratio 
-            FROM finance_fund_holdings 
-            ORDER BY code, report_date DESC
+        WITH LatestValuation AS (
+            SELECT code, total_mv, price
+            FROM stock_valuation_daily v1
+            WHERE trade_date = (SELECT MAX(trade_date) FROM stock_valuation_daily)
+        ),
+        FundLast3Quarters AS (
+            SELECT DISTINCT
+                symbol,
+                report_date,
+                hold_count
+            FROM finance_fund_holdings
+            WHERE report_date >= '{cutoff_date}'
+        ),
+        FundRatio AS (
+            SELECT
+                f.symbol,
+                MAX(CAST(f.hold_count AS REAL) / (v.total_mv / v.price) * 100.0) as max_fund_ratio
+            FROM FundLast3Quarters f
+            JOIN LatestValuation v ON f.symbol = v.code
+            GROUP BY f.symbol
         ),
         LatestNorth AS (
-            SELECT DISTINCT ON (code) code, hold_value 
-            FROM finance_northbound 
-            ORDER BY code, trade_date DESC
+            SELECT symbol, hold_value
+            FROM stock_northbound_holdings n1
+            WHERE hold_date = (SELECT MAX(hold_date) FROM stock_northbound_holdings)
         ),
         BasicInfo AS (
-            SELECT symbol, name FROM stock_info  -- 适配: 表名变了
+            SELECT symbol, name FROM stock_info
         )
-        SELECT 
-            b.symbol, 
+        SELECT
+            b.symbol,
             b.name,
-            'core_pool' as pool_name,  -- 新增: 池子名称
-            CASE 
-                WHEN f.fund_ratio > {FUND_THRESHOLD} AND n.hold_value > {NORTH_THRESHOLD} THEN '机构+北向双重仓'
-                WHEN f.fund_ratio > {FUND_THRESHOLD} THEN '基金重仓(>{FUND_THRESHOLD}%)' 
-                WHEN n.hold_value > {NORTH_THRESHOLD} THEN '北向重仓(>1亿)'
+            'core_pool' as pool_name,
+            CASE
+                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD}
+                     AND COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE} THEN '基金+北向双重符合'
+                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD} THEN '基金重仓'
+                WHEN COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE} THEN '北向重仓'
             END as reason
         FROM BasicInfo b
-        LEFT JOIN LatestFund f ON b.symbol::text = f.code::text
-        LEFT JOIN LatestNorth n ON b.symbol::text = n.code::text
-        WHERE 
-            f.fund_ratio > {FUND_THRESHOLD} 
-            OR n.hold_value > {NORTH_THRESHOLD}
+        LEFT JOIN FundRatio fr ON b.symbol = fr.symbol
+        LEFT JOIN LatestNorth n ON b.symbol = n.symbol
+        WHERE
+            COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD}
+            OR COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE}
         """)
         
         try:
@@ -72,7 +102,10 @@ class StockPoolMaintainer:
             df = pd.read_sql(sql_filter, self.engine)
             
             if df.empty:
-                print("⚠️ 筛选结果为空！请检查 finance_fund_holdings 或 finance_northbound 是否有数据。")
+                print("⚠️ 筛选结果为空！请检查以下表是否有数据:")
+                print("   - finance_fund_holdings (基金持仓)")
+                print("   - stock_northbound_holdings (北向持仓)")
+                print("   - stock_info (股票基本信息)")
                 return
 
             print(f"✅ 成功筛选出 {len(df)} 只优质股票！")

@@ -27,8 +27,8 @@ class BaseStrategy(ABC):
         # ================= 核心：新宇宙表名配置 =================
         # 1. 股票池 (New)
         self.pool_table = "quant_stock_pool"
-        # 2. 因子表 (New)
-        self.rps_table = "quant_feature_rps"
+        # 2. 因子表 (New) - 个股RPS表
+        self.rps_table = "quant_feature_stock_rps"
         # 3. 结果表 (New)
         self.result_table = "quant_strategy_results"
 
@@ -69,10 +69,11 @@ class BaseStrategy(ABC):
         
         try:
             # 假设 quant_feature_rps 使用 symbol 字段
+            # 使用 LIKE 匹配日期（处理带时间戳的日期格式）
             query = text(f"""
-                SELECT symbol, rps_50, rps_120, rps_250 
-                FROM {self.rps_table} 
-                WHERE trade_date = '{trade_date}' 
+                SELECT symbol, rps_50, rps_120, rps_250
+                FROM {self.rps_table}
+                WHERE trade_date LIKE '{trade_date}%'
                   AND symbol IN ({sym_str})
             """)
             
@@ -93,18 +94,18 @@ class BaseStrategy(ABC):
             return
 
         logger.info(f"💾 [{self.strategy_name}] 正在保存 {len(df_results)} 条选股结果...")
-        
+
         # 1. 补充策略名称
         df_results['strategy_name'] = self.strategy_name
-        
-        # 2. 确保包含必要字段 (新表结构: symbol, name, signal_type, meta_info)
-        # 注意：这里我们不再重命名 symbol -> code，因为新表就是叫 symbol
-        required_cols = ['strategy_name', 'trade_date', 'symbol', 'name', 'signal_type', 'meta_info']
-        
+
+        # 2. 确保包含必要字段（根据实际表结构）
+        # 表结构: strategy_name, trade_date, symbol, signal_type, meta_info, created_at
+        required_cols = ['strategy_name', 'trade_date', 'symbol', 'signal_type', 'meta_info']
+
         for col in required_cols:
             if col not in df_results.columns:
                 df_results[col] = None
-                
+
         df_save = df_results[required_cols].copy()
 
         try:
