@@ -44,6 +44,13 @@ from quant_engine.pool.maintain_pool import StockPoolMaintainer
 from quant_engine.runner.feature_runner import FeatureRunner
 from quant_engine.runner.strategy_runner import StrategyRunner
 
+# ================= 导入健康检查器 =================
+from data_job.utils.data_health_checker import (
+    KlineDataHealthChecker,
+    check_kline_health,
+    verify_data_ready_for_rps
+)
+
 # ================= Logger配置 =================
 logging.basicConfig(
     level=logging.INFO,
@@ -80,8 +87,9 @@ class AutoTradingPipeline:
         """
         每日自动化流程：
         1. 数据采集（调用 data_job）
-        2. RPS因子计算（调用 quant_engine）
-        3. 策略选股（调用 quant_engine）
+        2. 数据健康度检查（新增）
+        3. RPS因子计算（调用 quant_engine）
+        4. 策略选股（调用 quant_engine）
         """
         logger.info("\n" + "=" * 80)
         logger.info("📅 开始每日自动化交易流水线")
@@ -90,7 +98,7 @@ class AutoTradingPipeline:
 
         # ========== Step 1: 数据采集 ==========
         logger.info("\n" + "▶" * 40)
-        logger.info("📊 Step 1/3: 数据采集 (data_job)")
+        logger.info("📊 Step 1/4: 数据采集 (data_job)")
         logger.info("▶" * 40)
 
         collection_success = self._run_daily_collection()
@@ -98,9 +106,21 @@ class AutoTradingPipeline:
         if not collection_success:
             logger.warning("⚠️ 数据采集部分失败，但继续执行后续流程...")
 
-        # ========== Step 2: RPS因子计算 ==========
+        # ========== Step 2: 数据健康度检查 ==========
         logger.info("\n" + "▶" * 40)
-        logger.info("🧮 Step 2/3: RPS因子计算 (quant_engine)")
+        logger.info("🏥 Step 2/4: 数据健康度检查")
+        logger.info("▶" * 40)
+
+        health_check_passed = self._run_health_check()
+
+        if not health_check_passed:
+            logger.error("❌ 数据健康度检查失败，无法继续RPS计算")
+            logger.info("💡 请根据检查结果补齐缺失数据后重试")
+            return False
+
+        # ========== Step 3: RPS因子计算 ==========
+        logger.info("\n" + "▶" * 40)
+        logger.info("🧮 Step 3/4: RPS因子计算 (quant_engine)")
         logger.info("▶" * 40)
 
         rps_success = self._run_rps_calculation()
@@ -109,9 +129,9 @@ class AutoTradingPipeline:
             logger.error("❌ RPS计算失败，跳过策略选股")
             return False
 
-        # ========== Step 3: 策略选股 ==========
+        # ========== Step 4: 策略选股 ==========
         logger.info("\n" + "▶" * 40)
-        logger.info("🎯 Step 3/3: 策略选股 (quant_engine)")
+        logger.info("🎯 Step 4/4: 策略选股 (quant_engine)")
         logger.info("▶" * 40)
 
         self._run_strategy_selection()
@@ -126,7 +146,7 @@ class AutoTradingPipeline:
 
     def _run_daily_collection(self):
         """
-        执行每日数据采集（调用 data_job 层）
+        执行每日数据采集
 
         采集内容：
         - 个股K线
@@ -136,15 +156,14 @@ class AutoTradingPipeline:
         - 连板数据
         - 新闻舆情
         """
-        logger.info("\n📡 启动数据采集...")
+        logger.info("\n📡 启动每日数据采集...")
 
+        # 使用已有的采集器
         collectors = [
-            ('StockKline', StockKlineCollector(), "30-45分钟"),
-            ('SectorKline', SectorKlineCollector(), "5-10分钟"),
-            ('ETFKline', ETFKlineCollector(), "10-15分钟"),
-            ('StockValuation', StockValuationCollector(), "5-10分钟"),
-            ('LimitBoards', LimitBoardsCollector(), "2-5分钟"),
-            ('News', NewsCollector(), "10-20分钟"),
+            ('StockKline', StockKlineCollector(), "5-10分钟"),
+            ('SectorKline', SectorKlineCollector(), "2-5分钟"),
+            ('StockValuation', StockValuationCollector(), "3-5分钟"),
+            ('LimitBoards', LimitBoardsCollector(), "1-2分钟"),
         ]
 
         success_count = 0
@@ -160,7 +179,7 @@ class AutoTradingPipeline:
                 logger.info(f"✅ {name} 完成")
             except Exception as e:
                 failed_count += 1
-                results.append((name, f"❌ 失败: {e}"))
+                results.append((name, f"❌ 失败: {str(e)[:50]}"))
                 logger.error(f"❌ {name} 失败: {e}")
 
         # 输出结果
@@ -175,20 +194,79 @@ class AutoTradingPipeline:
 
         return failed_count == 0
 
+    def _run_health_check(self):
+        """
+        执行数据健康度检查
+
+        检查项目：
+        - 股票K线数据完整性
+        - 板块K线数据完整性
+        - ETF K线数据完整性
+        - 是否满足RPS计算最低要求
+
+        Returns:
+            bool: 检查是否通过
+        """
+        logger.info("\n🏥 启动K线数据健康度检查...")
+
+        try:
+            # 执行健康检查
+            checker = KlineDataHealthChecker()
+            result = checker.check_all()
+            checker.close()
+
+            # 检查是否满足RPS计算要求
+            is_ready, reason = checker.check_minimum_for_rps()
+
+            if not is_ready:
+                logger.error(f"❌ 数据不满足RPS计算要求: {reason}")
+                return False
+
+            if result.is_healthy and result.score >= 70:
+                logger.info(f"✅ 数据健康度检查通过 (评分: {result.score}/100)")
+                return True
+            else:
+                logger.warning(f"⚠️  数据健康度评分较低: {result.score}/100")
+
+                # 检查关键指标
+                if result.stock_kline['completeness_ratio'] < 0.8:
+                    logger.error("❌ 股票K线完整度不足80%，无法继续RPS计算")
+                    return False
+
+                logger.info("⚠️  数据质量尚可，继续执行RPS计算（可能结果不准确）")
+                return True
+
+        except Exception as e:
+            logger.error(f"❌ 健康检查执行失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 检查失败时默认继续，让用户决定
+            logger.warning("⚠️  健康检查失败，继续执行后续流程...")
+            return True
+
     def _run_rps_calculation(self):
         """
-        执行RPS因子计算（调用 quant_engine 层）
+        执行RPS因子计算（调用 quant_engine 层，使用并行版本）
 
         计算内容：
         - 个股RPS (5/10/20/50/120/250日)
         - 板块RPS (5/10/20/50/120/250日)
         - ETF RPS (5/10/20/50/120/250日)
         """
-        logger.info("\n🧮 启动RPS因子计算（增量模式）...")
+        logger.info("\n🧮 启动RPS因子计算（并行增量模式）...")
 
         try:
-            # 使用 FeatureRunner 批量运行所有RPS计算器
-            results = self.feature_runner.run(calculator_names=['stock', 'sector', 'etf'], mode='daily')
+            # 优先使用并行版本
+            try:
+                from quant_engine.runner.parallel_feature_runner import ParallelFeatureRunner
+                parallel_runner = ParallelFeatureRunner()
+                results = parallel_runner.run(calculator_names=['stock', 'sector', 'etf'],
+                                             mode='daily', max_workers=3)
+                logger.info("✅ 使用并行RPS计算")
+            except ImportError:
+                # 回退到串行版本
+                results = self.feature_runner.run(calculator_names=['stock', 'sector', 'etf'], mode='daily')
+                logger.info("⚠️  并行版本不可用，回退到串行版本")
 
             # 检查结果
             success_count = sum(1 for r in results.values() if r.get('success'))
@@ -199,7 +277,7 @@ class AutoTradingPipeline:
 
             for name, result in results.items():
                 status = "✅ 成功" if result.get('success') else "❌ 失败"
-                elapsed = result.get('elapsed', 0)
+                elapsed = result.get('elapsed_time', result.get('elapsed', 0))
                 logger.info(f"  {name.upper()}: {status} (耗时: {elapsed:.1f}秒)")
 
             return all(r.get('success') for r in results.values())

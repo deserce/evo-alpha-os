@@ -74,7 +74,7 @@ class StockSectorListCollector(BaseCollector):
         logger.info(f"📋 [1/2] 正在更新股票列表 [模式: {settings.APP_ENV}]")
         try:
             # 使用基类的重试机制
-            df = self._retry_call(ak.stock_zh_a_spot_em, desc="拉取A股列表")
+            df = self._retry_call(ak.stock_zh_a_spot_em)
             if df is None:
                 return
 
@@ -100,7 +100,7 @@ class StockSectorListCollector(BaseCollector):
 
         try:
             # 使用基类的重试机制
-            df_list = self._retry_call(name_func, desc=f"获取{type_label}名单")
+            df_list = self._retry_call(name_func)
             if df_list is None:
                 return
             names = df_list['板块名称'].tolist()
@@ -168,6 +168,36 @@ class StockSectorListCollector(BaseCollector):
         self._fetch_and_save_sector_category(ak.stock_board_industry_name_em, ak.stock_board_industry_cons_em, 'Industry')
         self._fetch_and_save_sector_category(ak.stock_board_concept_name_em, ak.stock_board_concept_cons_em, 'Concept')
 
+    def update_stock_info_industry(self):
+        """同步更新 stock_info 表的 industry 字段"""
+        logger.info("🔄 同步更新 stock_info 表的 industry 字段...")
+
+        for name, engine in self.active_engines:
+            try:
+                with engine.begin() as conn:
+                    # 从 stock_sector_map 获取每只股票的行业（优先使用行业板块）
+                    query = """
+                        SELECT symbol, sector_name
+                        FROM stock_sector_map
+                        WHERE sector_type = 'Industry'
+                        GROUP BY symbol, sector_name
+                    """
+                    df_sector = pd.read_sql(query, engine)
+
+                    if not df_sector.empty:
+                        update_count = 0
+                        for _, row in df_sector.iterrows():
+                            conn.execute(text("""
+                                UPDATE stock_info
+                                SET industry = :industry
+                                WHERE symbol = :symbol
+                            """), {"industry": row['sector_name'], "symbol": row['symbol']})
+                            update_count += 1
+
+                        logger.info(f"✅ [{name}] 已更新 {update_count} 只股票的行业信息")
+            except Exception as e:
+                logger.error(f"❌ [{name}] 更新 stock_info.industry 失败: {e}")
+
     def run(self):
         """统一入口"""
         self.log_collection_start()
@@ -187,6 +217,9 @@ class StockSectorListCollector(BaseCollector):
         self._init_tables()
         self.update_stock_list()
         self.update_sectors()
+
+        # 同步更新 stock_info 表的 industry 字段
+        self.update_stock_info_industry()
 
         logger.info(f"🎉 任务圆满成功 [模式: {settings.APP_ENV}]")
         self.log_collection_end(True, f"完成 [{settings.APP_ENV}] 模式采集")

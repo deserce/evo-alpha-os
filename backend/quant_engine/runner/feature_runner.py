@@ -7,6 +7,7 @@ import os
 import time
 import argparse
 from datetime import date
+from tqdm import tqdm
 
 # 环境路径适配
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -73,13 +74,11 @@ class FeatureRunner:
         logger.info(f"📅 运行模式: {mode}")
         logger.info("=" * 80)
 
-        for name in calculator_names:
+        for name in tqdm(calculator_names, desc="🧮 RPS计算进度", unit="个"):
             calculator = self.calculators[name]
             start_time = time.time()
 
             try:
-                logger.info(f"\n▶️ [{name.upper()}] 开始计算...")
-
                 if mode == 'init':
                     calculator.run_init()
                 else:
@@ -87,12 +86,10 @@ class FeatureRunner:
 
                 elapsed = time.time() - start_time
                 results[name] = {'success': True, 'elapsed': elapsed}
-                logger.info(f"✅ [{name.upper()}] 完成！耗时: {elapsed:.1f}秒")
 
             except Exception as e:
                 elapsed = time.time() - start_time
                 results[name] = {'success': False, 'error': str(e), 'elapsed': elapsed}
-                logger.error(f"❌ [{name.upper()}] 失败: {e}")
 
         # 输出统计
         total_elapsed = time.time() - total_start

@@ -7,8 +7,10 @@ EvoAlpha OS - 数据库管理
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import QueuePool
-from loguru import logger
+import logging
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 from app.core.config import settings
 
 # ================= 1. 引擎初始化函数 =================
@@ -54,7 +56,7 @@ def _create_cloud_engine():
         with engine.connect() as conn:
             conn.execute("SELECT 1")
 
-        logger.success("✅ 云端数据库引擎已创建")
+        logger.info("✅ 云端数据库引擎已创建")
         return engine
 
     except Exception as e:
@@ -156,14 +158,14 @@ def init_database():
     # 本地数据库初始化
     logger.info("📊 正在初始化本地数据库...")
     # 注意：我们使用 SQL 直接创建表，不需要 ORM models
-    logger.success("✅ 本地数据库初始化完成")
+    logger.info("✅ 本地数据库初始化完成")
 
     # 云端数据库初始化（如果配置了）
     if cloud_engine:
         logger.info("📊 正在初始化云端数据库...")
         try:
             Base.metadata.create_all(bind=cloud_engine)
-            logger.success("✅ 云端数据库初始化完成")
+            logger.info("✅ 云端数据库初始化完成")
         except Exception as e:
             logger.error(f"❌ 云端数据库初始化失败: {e}")
 

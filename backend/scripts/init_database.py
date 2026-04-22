@@ -5,7 +5,9 @@ EvoAlpha OS - 数据库初始化脚本（完整版）
 
 import sys
 import os
-from loguru import logger
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 添加项目根目录到 Python 路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -354,13 +356,13 @@ def init_database():
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_boards_symbol ON limit_board_trading (symbol);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_date ON consecutive_boards_stats (trade_date);"))
 
-            logger.success(f"✅ {mode} 数据库初始化完成")
+            logger.info(f"✅ {mode} 数据库初始化完成")
 
         except Exception as e:
             logger.error(f"❌ {mode} 数据库初始化失败: {e}")
             raise
 
-    logger.success("🎉 所有数据库初始化完成！")
+    logger.info("🎉 所有数据库初始化完成！")
 
 
 def drop_database():
@@ -406,7 +408,7 @@ def drop_database():
                 for table in tables:
                     conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE;"))
 
-            logger.success(f"✅ {mode} 数据库表已删除")
+            logger.info(f"✅ {mode} 数据库表已删除")
 
         except Exception as e:
             logger.error(f"❌ {mode} 数据库删除失败: {e}")

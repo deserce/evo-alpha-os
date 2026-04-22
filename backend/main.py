@@ -3,17 +3,22 @@ EvoAlpha OS - 云端后端主入口
 FastAPI 应用启动文件
 """
 
+import logging
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from loguru import logger
-import sys
 
 from app.core.config import settings
 from app.core.cloud_db import init_database
 
 # 配置日志
-logger.remove()
-logger.add(sys.stdout, level=settings.LOG_LEVEL)
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -38,8 +43,13 @@ app.add_middleware(
 async def startup_event():
     """应用启动时的初始化"""
     logger.info("🚀 EvoAlpha OS API 正在启动...")
-    await init_database()
-    logger.info("✅ 数据库连接成功")
+
+    # 只在配置了云端数据库时才初始化
+    if settings.CLOUD_DATABASE_URL:
+        await init_database()
+        logger.info("✅ 数据库连接成功")
+    else:
+        logger.info("⚠️  云端数据库未配置，仅使用本地数据库")
 
 
 @app.on_event("shutdown")
@@ -65,14 +75,19 @@ async def health_check():
     return {"status": "healthy"}
 
 
-# 注册路由（后续添加）
-# from app.api import alpha, stock, sector, etf, report, ai
-# app.include_router(alpha.router, prefix="/api/alpha", tags=["Alpha机会"])
-# app.include_router(stock.router, prefix="/api/stock", tags=["个股"])
-# app.include_router(sector.router, prefix="/api/sector", tags=["板块"])
-# app.include_router(etf.router, prefix="/api/etf", tags=["ETF"])
-# app.include_router(report.router, prefix="/api/report", tags=["日报"])
-# app.include_router(ai.router, prefix="/api/ai", tags=["AI分析"])
+# 注册API v1路由
+from app.api.v1 import api_v1_router
+
+app.include_router(api_v1_router)
+
+# API路由说明：
+# - /api/v1/stock/*  - 个股相关API
+# - /api/v1/sector/* - 板块相关API
+# - /api/v1/etf/*    - ETF相关API
+# - /api/v1/index/*  - 指数相关API
+# - /api/v1/market/* - 市场统计API
+# - /api/v1/alpha/*  - Alpha机会API
+# - /api/v1/report/* - 日报生成API
 
 
 if __name__ == "__main__":

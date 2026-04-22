@@ -9,6 +9,7 @@ import pandas as pd
 import akshare as ak
 from sqlalchemy import text, inspect
 from datetime import timedelta
+from tqdm import tqdm
 
 # 公共工具导入
 from data_job.common import setup_network_emergency_kit, setup_backend_path, setup_logger
@@ -32,9 +33,9 @@ class StockKlineCollector(BaseCollector):
     def __init__(self):
         super().__init__(
             collector_name="stock_kline",
-            request_timeout=30,
-            request_delay=0.01,
-            max_retries=3
+            request_timeout=60,           # 增加超时时间
+            request_delay=0.5,             # 增加延迟到0.5秒，避免频繁请求
+            max_retries=5                  # 增加重试次数到5次
         )
         self.engine = get_engine()
         self.table_name = "stock_daily_prices"
@@ -65,25 +66,27 @@ class StockKlineCollector(BaseCollector):
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_kline_date ON {self.table_name} (trade_date);"))
 
     def get_stock_list(self):
-        """获取股票名单：优先查数据库"""
+        """获取股票名单：直接从数据库获取（禁用缓存）"""
         logger.info("📋 正在获取待更新的股票名单...")
-        # 1. 尝试从【板块映射表】读取
-        try:
-            with self.engine.connect() as conn:
-                df = pd.read_sql(text("SELECT DISTINCT symbol, name FROM stock_sector_map"), conn)
-            if not df.empty:
-                logger.info(f"✅ 从 stock_sector_map 获取到 {len(df)} 只股票")
-                return df[df['symbol'].astype(str).str.match(r'^(00|30|60|68)')].to_dict('records')
-        except Exception:
-            pass
 
-        # 2. 尝试从【基础信息表】读取
+        # 直接从数据库查询（禁用缓存以确保获取所有股票）
+        # 1. 优先从【基础信息表】读取（包含所有股票）
         try:
             with self.engine.connect() as conn:
                 df = pd.read_sql(text("SELECT symbol, name FROM stock_info"), conn)
             if not df.empty:
                 logger.info(f"✅ 从 stock_info 获取到 {len(df)} 只股票")
                 return df.to_dict('records')
+        except Exception:
+            pass
+
+        # 2. 回退到【板块映射表】读取
+        try:
+            with self.engine.connect() as conn:
+                df = pd.read_sql(text("SELECT DISTINCT symbol, name FROM stock_sector_map"), conn)
+            if not df.empty:
+                logger.warning(f"⚠️ stock_info表为空，从 stock_sector_map 获取到 {len(df)} 只股票")
+                return df[df['symbol'].astype(str).str.match(r'^(00|30|60|68)')].to_dict('records')
         except Exception:
             pass
 
@@ -111,13 +114,15 @@ class StockKlineCollector(BaseCollector):
             return {}
 
     def _bulk_save_kline(self, df_list):
-        """批量存入数据库"""
+        """批量存入数据库（优化版：增大chunksize提升性能）"""
         if not df_list:
             return
         try:
             final_df = pd.concat(df_list, ignore_index=True)
             with self.engine.begin() as conn:
-                final_df.to_sql(self.table_name, conn, if_exists='append', index=False, method='multi', chunksize=1000)
+                # 使用更大的chunksize (5000) 提升批量插入性能
+                final_df.to_sql(self.table_name, conn, if_exists='append', index=False,
+                               method='multi', chunksize=5000)
         except Exception as e:
             logger.error(f"❌ 批量写入失败: {e}")
 
@@ -149,9 +154,14 @@ class StockKlineCollector(BaseCollector):
         collected_data = []
         BATCH_SIZE = self.batch_size
 
+        # 统计计数器
+        success_count = 0
+        fail_count = 0
+        skip_count = 0
+
         logger.info(f"📊 准备处理 {total} 只股票...")
 
-        for i, stock in enumerate(stock_list):
+        for i, stock in enumerate(tqdm(stock_list, desc="  K线采集进度", unit="只")):
             code = stock['symbol']
             name = stock['name']
 
@@ -166,9 +176,6 @@ class StockKlineCollector(BaseCollector):
             end_date_str = today.strftime("%Y%m%d")
             if start_date_str > end_date_str:
                 continue
-
-            if i % 10 == 0:
-                print(f"[{i+1}/{total}] 同步进度: {code} {name} ...", end="\r")
 
             try:
                 # 使用基类的重试机制
@@ -202,15 +209,25 @@ class StockKlineCollector(BaseCollector):
                     self._bulk_save_kline(collected_data)
                     collected_data = []
 
+                success_count += 1
+
             except Exception as e:
-                logger.debug(f"采集 {code} 失败: {e}")
-                time.sleep(0.2)
+                fail_count += 1
+                error_msg = str(e)
+                if "Connection" in error_msg or "aborted" in error_msg:
+                    logger.warning(f"  ⚠️  [{i+1}/{total}] {code} {name}: 网络错误")
+                    # 网络错误时增加延迟
+                    time.sleep(1)
+                else:
+                    logger.debug(f"  ❌ [{i+1}/{total}] {code} {name}: {error_msg}")
+                    time.sleep(0.5)
 
         if collected_data:
             self._bulk_save_kline(collected_data)
 
         logger.info(f"\n✅ 个股 K 线同步完成！")
-        self.log_collection_end(True, f"处理 {total} 只股票")
+        logger.info(f"📊 统计: 成功 {success_count}, 失败 {fail_count}, 跳过 {skip_count}, 总计 {total}")
+        self.log_collection_end(True, f"成功 {success_count}/{total} 只股票")
 
 
 if __name__ == "__main__":

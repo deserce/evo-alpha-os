@@ -26,6 +26,7 @@ logger = setup_logger(__name__)
 # 导入所有采集器
 from data_job.collectors import (
     StockKlineCollector,
+    StockKlineCollectorOptimized,  # 优化版K线采集器
     SectorKlineCollector,
     ETFKlineCollector,
     StockValuationCollector,
@@ -58,41 +59,16 @@ class CollectionScheduler:
         logger.info(f"⏰ 开始时间: {date.today()}")
         logger.info("=" * 80)
 
-        collectors = [
-            ('StockKline', StockKlineCollector(), "5-10分钟"),
-            ('SectorKline', SectorKlineCollector(), "2-5分钟"),
-            ('ETFKline', ETFKlineCollector(), "2-5分钟"),
-            ('StockValuation', StockValuationCollector(), "2-3分钟"),
-            ('LimitBoards', LimitBoardsCollector(), "1-2分钟"),
-            ('News', NewsCollector(), "2-3分钟"),
-        ]
+        # 导入每日更新函数
+        from data_job.utils.run_all_collectors import run_daily_update
 
-        success_count = 0
-        failed_count = 0
-        results = []
+        # 调用每日更新（不包含StockSectorList）
+        success = run_daily_update()
 
-        for name, collector, estimated_time in collectors:
-            logger.info(f"\n▶️  正在运行: {name} (预计耗时: {estimated_time})")
-            try:
-                collector.run()
-                success_count += 1
-                results.append((name, "✅ 成功"))
-                logger.info(f"✅ {name} 完成")
-            except Exception as e:
-                failed_count += 1
-                results.append((name, f"❌ 失败: {e}"))
-                logger.error(f"❌ {name} 失败: {e}")
-
-        # 输出结果
-        logger.info("\n" + "=" * 80)
-        logger.info("📊 每日采集任务完成")
-        logger.info(f"✅ 成功: {success_count}/{len(collectors)}")
-        logger.info(f"❌ 失败: {failed_count}/{len(collectors)}")
-
-        if results:
-            logger.info("\n详细结果:")
-            for name, status in results:
-                logger.info(f"  {name}: {status}")
+        if success:
+            logger.info("✅ 每日采集任务全部成功")
+        else:
+            logger.warning("⚠️  部分采集任务失败，请查看日志")
 
         logger.info("=" * 80 + "\n")
 

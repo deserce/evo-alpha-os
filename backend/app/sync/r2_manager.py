@@ -4,10 +4,12 @@ EvoAlpha OS - 同步模块：R2管理器
 """
 
 import boto3
-from loguru import logger
+import logging
 from pathlib import Path
 from typing import List
 import os
+
+logger = logging.getLogger(__name__)
 
 
 class R2Manager:
@@ -68,7 +70,7 @@ class R2Manager:
             # 构建公开URL
             url = f"https://{self.bucket_name}.{self.s3_client._endpoint.host}/{key}"
 
-            logger.success(f"上传成功: {url}")
+            logger.info(f"上传成功: {url}")
             return url
 
         except Exception as e:
@@ -98,7 +100,7 @@ class R2Manager:
                 logger.error(f"上传文件 {file_path} 失败: {e}")
                 continue
 
-        logger.success(f"批量上传完成，共 {len(urls)} 个文件")
+        logger.info(f"批量上传完成，共 {len(urls)} 个文件")
         return urls
 
     def list_objects(self, prefix: str = "") -> List[str]:
@@ -138,7 +140,7 @@ class R2Manager:
 
         try:
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=key)
-            logger.success(f"删除成功: {key}")
+            logger.info(f"删除成功: {key}")
 
         except Exception as e:
             logger.error(f"删除对象失败: {e}")

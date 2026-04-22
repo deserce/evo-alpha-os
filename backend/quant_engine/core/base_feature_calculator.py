@@ -12,6 +12,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 from sqlalchemy import text
+from tqdm import tqdm
 
 # ================= 环境路径适配 =================
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -195,7 +196,7 @@ class BaseFeatureCalculator(ABC):
         # 3. 计算RPS和涨幅
         feature_dfs = []
 
-        for period in self.periods:
+        for period in tqdm(self.periods, desc="  计算周期进度", unit="个"):
             # 涨幅
             chg = df_pivot.pct_change(period)
             # RPS (排名百分比 0-100)
@@ -343,7 +344,14 @@ class BaseFeatureCalculator(ABC):
 
     def run_daily(self):
         """
-        【增量模式】只算最新几天
+        【增量模式】只计算最新一天的数据（真正的增量更新）
+
+        逻辑：
+        1. 检查目标表最后计算的日期
+        2. 获取源表中该日期之后的新数据（通常1天）
+        3. 加载足够的历史数据窗口（用于计算RPS）
+        4. 只计算新数据的RPS
+        5. 只保存新计算的数据
 
         用途：
         - 每日定时任务
@@ -359,37 +367,64 @@ class BaseFeatureCalculator(ABC):
             # 1. 初始化表
             self._init_table()
 
-            # 2. 确定增量窗口
-            cutoff_date = (
-                datetime.now() - timedelta(days=self.config.INCREMENTAL_WINDOW_DAYS)
-            ).strftime("%Y-%m-%d")
+            # 2. 获取目标表最后计算的日期
+            last_calculated_date = self._get_last_calculated_date()
 
-            logger.info(f"📅 增量窗口: {cutoff_date} 至今")
+            if last_calculated_date:
+                logger.info(f"📅 最后计算日期: {last_calculated_date}")
+            else:
+                # 如果没有历史数据，执行初始化
+                logger.info("⚠️  未找到历史数据，执行初始化...")
+                return self.run_init()
 
-            # 3. 加载滑动窗口数据
-            df = self.load_data(start_date=cutoff_date)
+            # 3. 获取源表最新日期
+            last_source_date = self._get_last_source_date()
+            logger.info(f"📅 源表最新日期: {last_source_date}")
+
+            if last_source_date <= last_calculated_date:
+                logger.info("✅ 数据已是最新，无需更新")
+                return
+
+            # 4. 确定需要计算的日期范围（通常只有1天）
+            from datetime import timedelta
+            days_diff = (last_source_date - last_calculated_date).days
+
+            if days_diff > 7:
+                logger.warning(f"⚠️  发现数据缺失: {days_diff}天，执行补齐...")
+                # 缺失数据超过7天，执行更大的初始化
+                return self.run_init(days=min(days_diff + 50, 400))
+
+            logger.info(f"📊 需要计算: {days_diff}天新数据")
+
+            # 5. 加载数据窗口（需要加载足够的历史数据来计算RPS）
+            # 计算RPS需要历史数据，例如250日RPS需要250天历史
+            window_start = last_calculated_date - timedelta(days=self.config.INCREMENTAL_WINDOW_DAYS)
+            logger.info(f"📥 加载数据窗口: {window_start} 至 {last_source_date}")
+
+            df = self.load_data(start_date=window_start.strftime("%Y-%m-%d"))
 
             if df.empty:
-                logger.info("⚠️ 无最新数据需要更新（可能是假期）")
+                logger.warning("⚠️  无法加载数据")
                 return
 
-            # 4. 计算
+            # 6. 计算所有数据的RPS
             result_full = self.compute_features(df)
 
-            # 5. 截取最近几天
-            target_date_threshold = (
-                datetime.now() - timedelta(days=self.config.SAVE_RECENT_DAYS)
-            )
-            result_daily = result_full[result_full['trade_date'] > target_date_threshold].copy()
+            # 7. 只保存新计算的数据（last_calculated_date 之后的数据）
+            # 转换为统一类型进行比较
+            last_calculated_dt = pd.to_datetime(last_calculated_date)
+            result_new = result_full[result_full['trade_date'] > last_calculated_dt].copy()
 
-            if result_daily.empty:
-                logger.info("⚠️ 无最新日期数据需要更新")
+            if result_new.empty:
+                logger.warning("⚠️  没有新数据需要保存")
                 return
 
-            logger.info(f"📅 捕获更新日期: {result_daily['trade_date'].unique()}")
+            new_dates = result_new['trade_date'].unique()
+            logger.info(f"📅 新增日期: {len(new_dates)}个")
+            logger.info(f"   日期范围: {new_dates.min()} 至 {new_dates.max()}")
 
-            # 6. 保存
-            self.save_to_db(result_daily, mode='append')
+            # 8. 保存新数据
+            self.save_to_db(result_new, mode='append')
 
             cost = time.time() - start_time
             logger.info(f"✅ 增量任务完成！耗时: {cost:.1f}秒")
@@ -397,6 +432,32 @@ class BaseFeatureCalculator(ABC):
         except Exception as e:
             logger.error(f"❌ 增量任务失败: {e}")
             raise
+
+    def _get_last_calculated_date(self):
+        """获取目标表最后计算的日期"""
+        try:
+            query = f"SELECT MAX(trade_date) as max_date FROM {self.target_table}"
+            with self.engine.begin() as conn:
+                result = conn.execute(text(query)).fetchone()
+            if result and result[0]:
+                return pd.to_datetime(result[0]).date()
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️  获取最后计算日期失败: {e}")
+            return None
+
+    def _get_last_source_date(self):
+        """获取源表最新日期"""
+        try:
+            query = f"SELECT MAX(trade_date) as max_date FROM {self.source_table}"
+            with self.engine.begin() as conn:
+                result = conn.execute(text(query)).fetchone()
+            if result and result[0]:
+                return pd.to_datetime(result[0]).date()
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️  获取源表最新日期失败: {e}")
+            return None
 
     def run(self, mode='daily'):
         """

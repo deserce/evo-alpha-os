@@ -1,0 +1,174 @@
+"""
+板块K线下载器 - 使用 EFinance
+"""
+
+import sys
+import sqlite3
+import pandas as pd
+from pathlib import Path
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import time
+
+# 添加 backend 到路径
+backend_dir = Path(__file__).parent.absolute()
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
+DB_PATH = "data/local_quant.db"
+
+
+def init_db():
+    """初始化数据库"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sector_daily_prices (
+            sector_name TEXT,
+            trade_date DATE,
+            open FLOAT,
+            close FLOAT,
+            high FLOAT,
+            low FLOAT,
+            volume FLOAT,
+            amount FLOAT,
+            pct_chg FLOAT,
+            PRIMARY KEY (sector_name, trade_date)
+        );
+    """)
+    conn.commit()
+    return conn
+
+
+def download_sector_kline_efinance():
+    """使用 EFinance 下载板块K线"""
+    print("\n" + "=" * 70)
+    print("  下载板块 K线数据 (EFinance)")
+    print("=" * 70)
+
+    try:
+        import efinance as ef
+    except ImportError:
+        print("⚠️  EFinance 未安装，请运行: pip install efinance")
+        return
+
+    conn = init_db()
+
+    # 获取行业板块列表
+    try:
+        # EFinance 获取行业板块
+        df_sectors = ef.stock.get_sector_base()
+        if df_sectors is not None and not df_sectors.empty:
+            # 只保留行业板块
+            df_sectors = df_sectors[df_sectors['板块分类'] == '行业']
+            df_sectors = df_sectors[['板块名称', '板块代码']].copy()
+            df_sectors.columns = ['sector_name', 'sector_code']
+        else:
+            # 回退到数据库
+            df_sectors = pd.read_sql("SELECT sector_name, sector_type FROM sector_list WHERE sector_type = 'Industry'", conn)
+            df_sectors = df_sectors[['sector_name']].copy()
+            df_sectors['sector_code'] = None
+    except Exception as e:
+        print(f"⚠️  获取板块列表失败: {e}，使用数据库")
+        df_sectors = pd.read_sql("SELECT sector_name FROM sector_list WHERE sector_type = 'Industry'", conn)
+        df_sectors['sector_code'] = None
+
+    if df_sectors.empty:
+        print("⚠️  板块列表为空")
+        conn.close()
+        return
+
+    print(f"共 {len(df_sectors)} 个行业板块")
+
+    # 获取已有数据
+    try:
+        df_has = pd.read_sql("SELECT DISTINCT sector_name FROM sector_daily_prices", conn)
+        has_sectors = set(df_has['sector_name'].tolist()) if not df_has.empty else set()
+    except:
+        has_sectors = set()
+
+    pending = df_sectors[~df_sectors['sector_name'].isin(has_sectors)]
+
+    if pending.empty:
+        print("✅ 所有板块数据已下载")
+        conn.close()
+        return
+
+    print(f"需要下载 {len(pending)} 个板块\n")
+
+    success = 0
+    fail = 0
+    errors = []
+
+    # 设置日期范围
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=365*3)).strftime("%Y%m%d")
+
+    for idx, row in tqdm(pending.iterrows(), total=len(pending), desc="下载进度"):
+        sector_name = row['sector_name']
+
+        try:
+            # 使用 EFinance 获取板块历史数据
+            # EFinance 使用板块名称查询
+            df = ef.stock.get_sector_history(
+                sector_name=sector_name,
+                beg=start_date,
+                end=end_date
+            )
+
+            if df is not None and not df.empty:
+                # 字段映射
+                df = df.rename(columns={
+                    '日期': 'trade_date',
+                    '开盘': 'open',
+                    '收盘': 'close',
+                    '最高': 'high',
+                    '最低': 'low',
+                    '成交量': 'volume',
+                    '成交额': 'amount',
+                    '涨跌幅': 'pct_chg'
+                })
+
+                df['sector_name'] = sector_name
+                df['trade_date'] = pd.to_datetime(df['trade_date']).dt.date
+
+                # 数值转换
+                for col in ['open', 'close', 'high', 'low', 'volume', 'amount', 'pct_chg']:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+                # 选择需要的列
+                df_final = df[['sector_name', 'trade_date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'pct_chg']]
+
+                # 保存数据
+                df_final.to_sql('sector_daily_prices_tmp', conn, if_exists='replace', index=False)
+                conn.execute("INSERT OR IGNORE INTO sector_daily_prices SELECT * FROM sector_daily_prices_tmp")
+                conn.execute("DROP TABLE sector_daily_prices_tmp")
+                conn.commit()
+                success += 1
+            else:
+                fail += 1
+                errors.append(f"{sector_name}: 无数据")
+
+        except Exception as e:
+            fail += 1
+            errors.append(f"{sector_name}: {str(e)[:40]}")
+            time.sleep(1)
+
+        time.sleep(0.2)
+
+    conn.close()
+
+    print(f"\n✅ 板块 K线下载完成: 成功 {success}, 失败 {fail}")
+
+    if errors:
+        print(f"\n失败列表 (最多显示10个):")
+        for err in errors[:10]:
+            print(f"  - {err}")
+
+
+if __name__ == "__main__":
+    download_sector_kline_efinance()

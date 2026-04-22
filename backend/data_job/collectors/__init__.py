@@ -6,9 +6,11 @@
 from .stock_valuation_collector import StockValuationCollector
 from .macro_data_collector import MacroDataCollector
 from .limit_boards_collector import LimitBoardsCollector
+from .index_data_collector import IndexDataCollector
 
 # Batch 2: K-line Collectors
 from .stock_kline_collector import StockKlineCollector
+from .stock_kline_collector_optimized import StockKlineCollectorOptimized
 from .sector_kline_collector import SectorKlineCollector
 from .etf_kline_collector import ETFKlineCollector
 
@@ -25,8 +27,10 @@ __all__ = [
     'StockValuationCollector',
     'MacroDataCollector',
     'LimitBoardsCollector',
+    'IndexDataCollector',
     # Batch 2: K-line Collectors
     'StockKlineCollector',
+    'StockKlineCollectorOptimized',  # 优化版K线采集器（可配置）
     'SectorKlineCollector',
     'ETFKlineCollector',
     # Batch 3: Complex Collectors

@@ -42,7 +42,6 @@ python-dateutil==2.9.0
 
 # 工具库
 python-dotenv==1.0.1
-loguru==0.7.2
 requests==2.31.0
 beautifulsoup4==4.12.3
 lxml==5.1.0

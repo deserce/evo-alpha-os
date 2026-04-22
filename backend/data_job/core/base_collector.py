@@ -26,6 +26,7 @@ if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
 from app.core.database import get_engine
+from data_job.core.anti_ban_collector import AntiBanMixin
 
 
 class NetworkError(Exception):
@@ -38,13 +39,15 @@ class ConnectionTimeout(Exception):
     pass
 
 
-class BaseCollector(ABC):
-    """数据采集基类 - 提供通用功能和连接稳定性保障"""
+class BaseCollector(AntiBanMixin, ABC):
+    """数据采集基类 - 提供通用功能和连接稳定性保障（集成防封功能）"""
 
     def __init__(self, collector_name: str,
                  request_timeout: int = 30,
-                 request_delay: float = 0.5,
-                 max_retries: int = 3):
+                 request_delay: float = 1.0,  # 默认延迟改为1秒
+                 max_retries: int = 3,
+                 enable_anti_ban: bool = True,  # 新增：启用防封功能
+                 data_source_manager=None):  # 新增：数据源管理器（支持多数据源）
         """
         初始化采集器
 
@@ -53,15 +56,23 @@ class BaseCollector(ABC):
             request_timeout: 请求超时时间（秒）
             request_delay: 请求间隔（秒）
             max_retries: 最大重试次数
+            enable_anti_ban: 是否启用防封功能
+            data_source_manager: 数据源管理器（可选，用于多数据源支持）
         """
+        # 初始化AntiBanMixin
+        if enable_anti_ban:
+            AntiBanMixin.__init__(self)
+
         self.collector_name = collector_name
         self.engine = get_engine()
+        self.enable_anti_ban = enable_anti_ban
 
-        # 网络请求配置
-        self.request_timeout = request_timeout
-        self.request_delay = request_delay
-        self.max_retries = max_retries
-        self.session = self._create_session()
+        # 新增：数据源管理器（支持多数据源）
+        self._data_source_manager = data_source_manager
+        self._data_source_manager_initialized = False
+
+        # 日志配置（必须在_create_session之前）
+        self.logger = logging.getLogger(f"collector.{collector_name}")
 
         # 进度文件路径
         self.progress_dir = Path(backend_dir) / "data" / "collection_progress"
@@ -71,8 +82,10 @@ class BaseCollector(ABC):
         # 加载进度
         self.progress = self._load_progress()
 
-        # 日志配置
-        self.logger = logging.getLogger(f"collector.{collector_name}")
+        # 网络请求配置
+        self.request_timeout = request_timeout
+        self.request_delay = request_delay
+        self.max_retries = max_retries
 
         # 统计信息
         self.stats = {
@@ -82,20 +95,45 @@ class BaseCollector(ABC):
             "timeout_count": 0
         }
 
+        # 如果启用防封，配置默认代理
+        if enable_anti_ban:
+            self.configure_proxy()  # 使用默认代理配置
+
+        # 最后创建session（因为需要logger和proxy配置）
+        self.session = self._create_session()
+
     def _create_session(self) -> requests.Session:
         """
-        创建带连接池的Session
+        创建带连接池的Session（支持代理和随机User-Agent）
 
         Returns:
             配置好的Session对象
         """
         session = requests.Session()
 
-        # 连接池配置
+        # 代理配置（如果启用防封，使用代理轮换）
+        if self.enable_anti_ban:
+            proxy = self.get_current_proxy()
+            if proxy:
+                session.proxies = proxy
+                self.logger.debug(f"使用代理: {proxy.get('http', 'N/A')}")
+
+        # 设置随机User-Agent
+        if self.enable_anti_ban:
+            headers = self.setup_request_headers(session)
+            self.logger.debug(f"User-Agent: {headers['User-Agent'][:50]}...")
+        else:
+            # 默认headers
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            })
+
+        # 连接池配置（减小连接池以降低并发）
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,  # 连接池数量
-            pool_maxsize=20,      # 每个池的最大连接数
-            max_retries=0         # 禁用自动重试（我们手动控制）
+            pool_connections=5,   # 减少连接池数量
+            pool_maxsize=10,       # 减少最大连接数
+            max_retries=0          # 禁用自动重试（我们手动控制）
         )
         session.mount('http://', adapter)
         session.mount('https://', adapter)
@@ -433,6 +471,104 @@ class BaseCollector(ABC):
         except Exception as e:
             self.logger.error(f"清理旧数据失败: {e}")
             return 0
+
+    def get_data_source_manager(self):
+        """
+        获取数据源管理器（延迟加载）
+
+        如果未提供data_source_manager，则根据环境变量自动创建。
+        这支持向后兼容：不配置多数据源时，仍使用原有方式。
+
+        Returns:
+            DataSourceManager 实例
+        """
+        if self._data_source_manager is None and not self._data_source_manager_initialized:
+            try:
+                # 导入配置和适配器
+                from data_job.core.data_source_config import load_config
+                from data_job.core.data_source import DataSourceManager
+                from data_job.core.akshare_adapter import AKShareAdapter
+
+                # 加载配置
+                config = load_config()
+
+                # 创建数据源列表
+                sources = []
+
+                # 添加AKShare（如果启用）
+                if config.enable_akshare:
+                    sources.append(AKShareAdapter(
+                        priority=config.akshare_priority,
+                        timeout=config.akshare_timeout
+                    ))
+
+                # 添加efinance（如果启用）
+                if hasattr(config, 'enable_efinance') and config.enable_efinance:
+                    try:
+                        from data_job.core.efinance_adapter import EFinanceAdapter
+                        sources.append(EFinanceAdapter(
+                            priority=getattr(config, 'efinance_priority', 8),
+                            timeout=getattr(config, 'efinance_timeout', 30)
+                        ))
+                    except Exception as e:
+                        self.logger.warning(f"efinance初始化失败，将只使用AKShare: {e}")
+
+                # 添加BaoStock（如果启用）
+                if hasattr(config, 'enable_baostock') and config.enable_baostock:
+                    try:
+                        from data_job.core.baostock_adapter import BaoStockAdapter
+                        sources.append(BaoStockAdapter(
+                            priority=getattr(config, 'baostock_priority', 7),
+                            timeout=getattr(config, 'baostock_timeout', 30)
+                        ))
+                        self.logger.info("BaoStock已添加到数据源列表")
+                    except Exception as e:
+                        self.logger.warning(f"BaoStock初始化失败: {e}")
+
+                # 添加掘金量化（如果启用）
+                if hasattr(config, 'enable_gmx') and config.enable_gmx:
+                    try:
+                        from data_job.core.gmx_adapter import GmxAdapter
+                        sources.append(GmxAdapter(
+                            token=getattr(config, 'gmx_token', None),
+                            account_id=getattr(config, 'gmx_account_id', None),
+                            priority=getattr(config, 'gmx_priority', 9),
+                            timeout=getattr(config, 'gmx_timeout', 30)
+                        ))
+                        self.logger.info("掘金量化已添加到数据源列表")
+                    except Exception as e:
+                        self.logger.warning(f"掘金量化初始化失败: {e}")
+
+                # 添加聚宽（如果启用）
+                if hasattr(config, 'enable_joinquant') and config.enable_joinquant:
+                    try:
+                        from data_job.core.joinquant_adapter import JoinQuantAdapter
+                        sources.append(JoinQuantAdapter(
+                            account_id=config.joinquant_account_id,
+                            password=config.joinquant_password,
+                            priority=config.joinquant_priority,
+                            timeout=config.joinquant_timeout
+                        ))
+                    except Exception as e:
+                        self.logger.warning(f"聚宽初始化失败，将只使用AKShare: {e}")
+
+                # 创建管理器
+                if sources:
+                    self._data_source_manager = DataSourceManager(
+                        sources=sources,
+                        strategy=config.strategy
+                    )
+                    self.logger.info(f"数据源管理器已创建: 策略={config.strategy}, 数据源={[s.name for s in sources]}")
+                else:
+                    self.logger.warning("未启用任何数据源")
+
+                self._data_source_manager_initialized = True
+
+            except Exception as e:
+                self.logger.error(f"创建数据源管理器失败: {e}")
+                self._data_source_manager_initialized = True  # 标记为已尝试，避免重复
+
+        return self._data_source_manager
 
     @abstractmethod
     def run(self):

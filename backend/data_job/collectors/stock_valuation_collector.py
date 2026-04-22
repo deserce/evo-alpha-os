@@ -7,6 +7,7 @@ import pandas as pd
 import akshare as ak
 from datetime import date
 from sqlalchemy import text, inspect
+from tqdm import tqdm
 
 # 公共工具导入
 from data_job.common import setup_network_emergency_kit, setup_backend_path, setup_logger
@@ -141,7 +142,27 @@ class StockValuationCollector(BaseCollector):
             # 追加插入
             df.to_sql(self.table_name, conn, if_exists='append', index=False)
 
-        logger.info(f"✅ {date_str} 估值数据入库成功！")
+            # 同步更新 stock_info 表的估值字段
+            logger.info("🔄 同步更新 stock_info 表的估值字段...")
+            update_count = 0
+            for _, row in tqdm(df.iterrows(), total=len(df), desc="  更新估值信息", unit="只"):
+                # total_mv 单位是元，需要转换为亿元
+                market_cap = row['total_mv'] / 100000000 if pd.notna(row['total_mv']) else None
+
+                conn.execute(text("""
+                    UPDATE stock_info
+                    SET pe = :pe, pb = :pb, market_cap = :market_cap
+                    WHERE symbol = :symbol
+                """), {
+                    "pe": row['pe_ttm'],
+                    "pb": row['pb'],
+                    "market_cap": market_cap,
+                    "symbol": row['code']
+                })
+                update_count += 1
+
+            logger.info(f"✅ {date_str} 估值数据入库成功！")
+            logger.info(f"✅ 已同步更新 {update_count} 只股票的估值信息到 stock_info 表")
 
     def run(self):
         """执行估值数据采集"""

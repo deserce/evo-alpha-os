@@ -5,8 +5,10 @@ EvoAlpha OS - 同步模块：云端导入器
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy import text
-from loguru import logger
+import logging
 from typing import List
+
+logger = logging.getLogger(__name__)
 
 
 class CloudImporter:
@@ -58,7 +60,7 @@ class CloudImporter:
                 # 执行导入
                 await conn.execute(text(import_sql))
 
-            logger.success(f"导入完成: {table_name}")
+            logger.info(f"导入完成: {table_name}")
 
         except Exception as e:
             logger.error(f"导入失败: {e}")
@@ -87,7 +89,7 @@ class CloudImporter:
                 logger.error(f"导入表 {config['table']} 失败: {e}")
                 continue
 
-        logger.success("批量导入完成")
+        logger.info("批量导入完成")
 
     async def close(self):
         """关闭连接"""

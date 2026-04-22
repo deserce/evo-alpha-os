@@ -5,10 +5,12 @@ EvoAlpha OS - 同步模块：CSV导出器
 
 import sqlite3
 import pandas as pd
-from loguru import logger
+import logging
 from pathlib import Path
 from typing import List
 import gzip
+
+logger = logging.getLogger(__name__)
 
 
 class CSVExporter:
@@ -62,7 +64,7 @@ class CSVExporter:
                 df.to_csv(output_file, index=False)
 
             file_size = output_file.stat().st_size / 1024 / 1024  # MB
-            logger.success(f"导出完成: {output_file} ({file_size:.2f} MB)")
+            logger.info(f"导出完成: {output_file} ({file_size:.2f} MB)")
 
             return str(output_file)
 
@@ -101,7 +103,7 @@ class CSVExporter:
                 logger.error(f"导出表 {table_name} 失败: {e}")
                 continue
 
-        logger.success(f"导出完成，共 {len(export_files)} 个文件")
+        logger.info(f"导出完成，共 {len(export_files)} 个文件")
         return export_files
 
 

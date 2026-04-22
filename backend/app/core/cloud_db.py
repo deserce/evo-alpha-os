@@ -5,7 +5,9 @@ CockroachDB 连接管理
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from loguru import logger
+import logging
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 
@@ -26,7 +28,7 @@ async def init_database():
     try:
         # 创建异步引擎
         engine = create_async_engine(
-            settings.cloud_db_url,
+            settings.CLOUD_DATABASE_URL,
             echo=settings.APP_DEBUG,
             pool_size=10,
             max_overflow=20,

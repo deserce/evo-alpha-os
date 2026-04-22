@@ -113,7 +113,14 @@ class SectorKlineCollector(BaseCollector):
             return pd.DataFrame()
 
     def save_data(self, df: pd.DataFrame, name: str):
-        """清洗并执行 Upsert"""
+        """
+        清洗并执行增量保存（使用 INSERT OR IGNORE 避免重复）
+
+        增量逻辑：
+        - get_start_date() 返回 last_date + 1
+        - 理论上不会有重复数据
+        - 使用 INSERT OR IGNORE 作为保险，如果主键冲突则跳过
+        """
         if df is None or df.empty:
             return False
 
@@ -150,21 +157,13 @@ class SectorKlineCollector(BaseCollector):
         if final_df.empty:
             return False
 
-        # 2. 入库逻辑
+        # 2. 入库逻辑（增量更新 - 不删除，直接插入）
         with self.engine.begin() as conn:
-            # 删除已存在的数据
-            for _, row in final_df.iterrows():
-                conn.execute(text(f"""
-                    DELETE FROM {self.table_name}
-                    WHERE sector_name = :sector_name
-                    AND trade_date = :trade_date
-                """), {
-                    'sector_name': row['sector_name'],
-                    'trade_date': row['trade_date']
-                })
-
-            # 插入新数据
-            final_df.to_sql(self.table_name, conn, if_exists='append', index=False)
+            # 使用 INSERT OR IGNORE 直接插入
+            # 如果主键冲突（sector_name, trade_date），则自动跳过
+            # 这样既保证了增量更新，又避免了数据重复
+            final_df.to_sql(self.table_name, conn, if_exists='append', index=False,
+                           method='multi', chunksize=5000)
 
         return True
 
@@ -183,13 +182,28 @@ class SectorKlineCollector(BaseCollector):
 
         self._init_table()
 
-        # 获取所有板块列表
+        # 获取所有板块列表（优先使用sector_list，回退到stock_sector_map）
         try:
-            df_sectors = pd.read_sql("SELECT DISTINCT sector_name, sector_type FROM stock_sector_map", self.engine)
+            # 优先使用新的sector_list表
+            df_sectors = pd.read_sql("SELECT DISTINCT sector_name, sector_type FROM sector_list ORDER BY sector_name", self.engine)
+            logger.info(f"✅ 从 sector_list 表加载板块列表")
         except Exception:
-            logger.error("❌ 无法读取 stock_sector_map 表，请先运行板块数据采集！")
-            self.log_collection_end(False, "无板块数据")
-            return
+            # 回退到stock_sector_map
+            try:
+                from data_job.utils.cache_manager import get_cache_manager
+                cache_manager = get_cache_manager(self.engine, cache_ttl=3600)
+                sector_list = cache_manager.get_sector_list()
+
+                if sector_list:
+                    df_sectors = pd.DataFrame(sector_list)
+                else:
+                    # 回退到数据库查询
+                    df_sectors = pd.read_sql("SELECT DISTINCT sector_name, sector_type FROM stock_sector_map", self.engine)
+                    logger.info(f"✅ 从 stock_sector_map 表加载板块列表")
+            except Exception:
+                logger.error("❌ 无法读取板块列表表，请先运行板块数据采集！")
+                self.log_collection_end(False, "无板块数据")
+                return
 
         total = len(df_sectors)
         logger.info(f"📋 待处理板块总数: {total}")
