@@ -1,359 +1,203 @@
 # EvoAlpha OS
 
-> **进化即自由 (Evolution is Freedom)**
+> 进化即自由（Evolution is Freedom）
 
-## 🚧 项目状态
+EvoAlpha OS 是面向 A 股的本地数据与量化研究工作台：采集和校验行情，计算强弱、结构与生命周期，跟踪自选股机会，并管理手工交易账本与持仓风险。
 
-**✅ 自动化交易流水线 v1.0 - 生产就绪！**
+当前主线是 **Next.js 前端 + FastAPI API + SQLite + 本地无大模型调度**。云端数据库、R2 同步与 AI 接口仍保留在代码中，其配置和可用性需单独验证。交易由用户手工执行。
 
-- ✅ 项目框架已搭建
-- ✅ 核心代码已从 EvoQuant OS 移植
-- ✅ **数据采集系统完成**（v2.1.0 - 增量更新与自动化版）
-- ✅ **自动化交易流水线**（v1.0 - 定时调度 + RPS计算 + 策略选股）
-- 🚧 正在整合和调试
-- 🚧 AI Agent 待接入
+最后更新：2026-10-20。
 
-**预计可用时间**：2025年2月
+## 当前能力
 
----
+| 模块 | 当前实现 |
+| --- | --- |
+| 市场与板块 | 指数、成交与市场情绪、涨停梯队、板块强度及成分股分析 |
+| 个股工作台 | 日/周/月线及 30/120 分钟图、量价与指标、信号标记、财务和 F10 资料 |
+| 量化策略 | 个股/板块/ETF RPS、强度、结构健康、生命周期、时机与风险计划、MRGC |
+| Watchlist | 自选分组、规则配置、历史遍历、当日状态、行动箱和已完成 5 分钟柱监控 |
+| Portfolio | 账户与交易记账、截图导入草稿、持仓及可卖数量、收益快照、卖点计划和提醒 |
+| 日报与通知 | 策略日报、低吸日报、盘中提醒、邮件去重与失败重试 |
+| Data Core | 增量采集、单写入锁、质量门、缺失计算补齐、历史健康检查与备份保留 |
 
-## 📖 项目简介
+AI 多代理会诊、完整回测平台、商业订阅和多市场扩展不作为当前已交付能力。页面与 API 的存在也不代表外部数据源始终可用。
 
-EvoAlpha OS 是一个**数据驱动的 Alpha 机会发现平台**，通过**量化筛选做减法**和**AI Agent 做加法**，帮助个人投资者发现市场中的 Alpha 机会。
+## 数据与计算链路
 
-**品牌**：dlab (Evolution Lab)
-
----
-
-## 🎯 核心功能
-
-- **Alpha 机会雷达**：量化筛选个股和板块机会，置信度评分
-- **AI 深度分析**：模拟投资大师（陶博士、简放等）进行智能分析
-- **ETF 全天候配置**：稳健的五类资产配置建议
-- **日报研报系统**：自动生成投资日报和深度研报
-- **量化回测系统**：完整的策略回测和性能分析
-
----
-
-## 🏗️ 技术架构
-
-### 三段式架构
-
-```
-┌─────────────────────────────────────────────────┐
-│  前端 (Next.js) - Vercel                         │
-│  - 公开页面：首页部分机会                        │
-│  - 登录后：完整功能                              │
-└───────────────────┬─────────────────────────────┘
-                      │ REST API
-┌───────────────────▼─────────────────────────────┐
-│  后端 (FastAPI) - 云端 VPS                       │
-│  - API 接口                                      │
-│  - 云端数据库 (CockroachDB)                      │
-│  - AI 分析 (GLM-4)                               │
-└─────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────┐
-│  本地工厂 (MBP)                                   │
-│  - 数据采集 (AkShare)                            │
-│  - 量化计算 (RPS、策略)                          │
-│  - 本地存储 (SQLite)                             │
-│  - 同步云端 (CSV → R2 → IMPORT)                 │
-└─────────────────────────────────────────────────┘
+```text
+TDX / 东方财富 / AKShare 等数据源
+                  ↓
+       Data Core：采集、来源管理、质量门
+                  ↓
+          SQLite 本地行情与资料
+                  ↓
+     RPS → 强度 / 结构 / 生命周期 → 策略
+                  ↓
+       Watch Engine / Portfolio / 日报
+                  ↓
+          FastAPI → Next.js 工作台
 ```
 
-### 技术栈
+- 沪深正式股票日 K 使用 TDX mootdx/pytdx 协议，并在本地计算前复权；原始价与复权价按用途分别使用。
+- 北交所正式日 K 使用 TDX 标准行情 `market=2`，当前按未复权口径写入；扩展行情源用于诊断。
+- 估值、财务、新闻及支撑行情按模块使用补充源与降级逻辑。正式写入权限以 [来源注册表](backend/data_core/source_registry.py) 为准。
+- 日 K 质量门失败时阻断下游计算；支撑数据的失败与正式行情阻断分开处理。
+- 盘中确认使用已完成的 5 分钟柱。历史扫描状态、正式待处理事件与邮件投递分别管理。
 
-**前端**：
-- Next.js 16 + TypeScript
-- TailwindCSS 4
-- ECharts / Recharts
-- Zustand (状态管理)
+## 技术栈与目录
 
-**后端（云端）**：
-- FastAPI + Python 3.10+
-- CockroachDB Serverless
-- GLM-4 API (AI 分析)
+- 前端：Next.js 16、React 19、TypeScript、Tailwind CSS 4、TanStack Query、Zustand、ECharts/Recharts。
+- 后端：FastAPI、Python、SQLAlchemy/SQLite、Pandas/NumPy、APScheduler。
+- 本地调度：macOS LaunchAgent；正式 Data Core 执行器无需模型 API。
 
-**后端（本地）**：
-- Python 3.10+
-- SQLite (本地存储)
-- Pandas / NumPy (量化计算)
-
----
-
-## 📂 项目结构
-
-```
-EvoAlpha-OS/
-├── BLUEPRINT.md              # 📘 技术蓝图（完整系统设计）
-├── README.md                 # 📄 项目说明（本文件）
-├── MIGRATION_PLAN.md         # 📋 代码移植计划
-├── .env                      # 🔐 环境变量配置
-├── .gitignore
-│
-├── backend/                  # 🔧 Python 后端
-│   ├── main.py               # FastAPI 应用入口（云端）
-│   ├── requirements.txt      # Python 依赖
-│   ├── auto_pipeline.py      # 🤖 自动化交易流水线调度器 v1.0 ✅
-│   ├── check_scheduler.sh    # 📊 调度器状态监控脚本
-│   ├── restart_scheduler.sh  # 🔄 调度器重启脚本
-│   ├── run_pipeline.sh       # 🚀 流水线便捷启动脚本
-│   ├── monitor_pipeline.sh   # 📡 流水线监控通知脚本
-│   │
-│   ├── app/                  # ☁️ 云端后端模块
-│   │   ├── core/             # 核心配置（config, database）
-│   │   ├── api/              # API 接口层
-│   │   ├── agents/           # AI Agent 层
-│   │   ├── sync/             # 同步模块
-│   │   └── scheduler/        # 定时任务
-│   │
-│   ├── data_job/             # 📊 数据采集系统 v2.1.0 ✅
-│   │   ├── README.md         # 数据采集系统主文档
-│   │   ├── requirements.txt  # Python 依赖清单
-│   │   │
-│   │   ├── core/             # 核心框架层
-│   │   │   └── base_collector.py
-│   │   ├── common/           # 公共工具层
-│   │   │   ├── network_utils.py
-│   │   │   ├── path_utils.py
-│   │   │   ├── logger_utils.py
-│   │   │   └── exception_utils.py
-│   │   ├── config/           # 配置管理层
-│   │   │   ├── collector_config.py
-│   │   │   └── collection_schedule.yaml
-│   │   ├── collectors/       # 12个数据采集器
-│   │   │   ├── stock_kline_collector.py
-│   │   │   ├── sector_kline_collector.py
-│   │   │   ├── etf_kline_collector.py
-│   │   │   ├── stock_valuation_collector.py
-│   │   │   ├── limit_boards_collector.py
-│   │   │   ├── news_collector.py
-│   │   │   ├── fund_holdings_collector.py
-│   │   │   ├── northbound_holdings_collector.py
-│   │   │   ├── etf_info_collector.py
-│   │   │   ├── finance_summary_collector.py
-│   │   │   ├── macro_data_collector.py
-│   │   │   └── stock_sector_list_collector.py
-│   │   ├── utils/            # 工具脚本
-│   │   │   └── scheduler.py  # 定时调度器
-│   │   ├── scripts/          # 独立脚本
-│   │   │   └── init_data_collection.py
-│   │   ├── docs/             # 数据采集文档
-│   │   │   ├── QUICKSTART.md
-│   │   │   ├── ARCHITECTURE.md
-│   │   │   └── DEVELOPMENT_GUIDE.md
-│   │   └── backup/           # 归档文件
-│   │
-│   ├── init_data.sh          # 🚀 初始化数据采集脚本
-│   ├── start_scheduler.sh    # ⏰ 启动定时调度器
-│   └── run_daily_collection.sh # 📊 每日数据采集
-│   │
-│   ├── quant_engine/         # ⚡ 量化引擎（本地工厂）
-│   │   ├── README.md         # 量化引擎完整文档
-│   │   ├── core/             # 核心工具（tdx_lib）
-│   │   ├── calculators/      # 因子计算器
-│   │   │   ├── stock_rps_calculator.py
-│   │   │   ├── sector_rps_calculator.py
-│   │   │   └── etf_rps_calculator.py
-│   │   ├── strategies/       # 策略执行
-│   │   │   ├── base_strategy.py
-│   │   │   ├── mrgc_strategy.py
-│   │   │   └── select_resonance.py
-│   │   ├── runner/           # 运行器
-│   │   │   ├── feature_runner.py
-│   │   │   └── strategy_runner.py
-│   │   ├── pool/             # 股票池管理
-│   │   └── core/             # 核心工具
-│   │
-│   └── scripts/              # 🔧 实用脚本
-│       └── init_database.py  # 数据库初始化
-│
-└── frontend/                 # 🎨 Next.js 前端
-    ├── package.json
-    ├── next.config.ts
-    ├── tailwind.config.ts
-    │
-    └── src/
-        ├── app/              # 页面路由
-        │   ├── market/       # 市场概览
-        │   ├── stock/        # 个股详情
-        │   ├── sector/       # 板块分析
-        │   ├── quant/        # 量化策略
-        │   └── report/       # 研报系统
-        │
-        ├── components/       # React 组件
-        │   ├── layout/       # 布局组件
-        │   ├── stock/        # 股票组件
-        │   └── ui/           # UI 组件
-        │
-        └── lib/              # 工具库
-            ├── api.ts        # API 客户端
-            └── utils.ts      # 工具函数
+```text
+backend/
+├── main.py                  # FastAPI 入口
+├── app/api/v1/              # 市场、个股、量化、自选与持仓 API
+├── app/notifications/       # 通知支持
+├── data_core/               # 来源、schema、交易日历和质量门
+├── data_job/                # 数据采集与行情适配器
+├── quant_engine/            # 因子、策略、研究与 Watch Engine
+├── portfolio/               # 账本、快照与持仓退出逻辑
+├── scripts/                 # 正式执行器、安装器、迁移与修复工具
+└── tests/                   # 后端回归
+frontend/
+├── src/app/a/               # 工作台路由
+├── src/components/          # 页面、图表和业务组件
+├── src/lib/                 # API、状态与展示逻辑
+└── tests/                   # Node 测试
 ```
 
----
+## 本地启动
 
-## 🗓️ 开发计划
+以下命令以仓库根目录为起点。已有本地环境时优先使用已验证的 Python 环境；Python 依赖包含固定版本，新环境安装仍需验证。前端测试使用支持 TypeScript stripping 的 Node.js 24。
 
-### Phase 1：A股系统（1 个月）
+### 后端
 
-**Week 1**：基础架构 + 数据层 ✅
-- 项目初始化
-- 数据采集（股票、K线、新闻）
-- 量化引擎（RPS、策略）
-- 同步模块（CSV → R2 → 云端）
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+# 正式 TDX 采集还需这些未列入主依赖清单的包
+python -m pip install mootdx pytdx tqdm
+```
 
-**Week 2**：云端后端 + AI Agent 🚧
-- API 接口开发
-- AI Agent 实现（大师 Agent、功能 Agent）
-- GLM-4 集成
+根据需要安装 EFinance 等补充源依赖。`data_job/requirements.txt` 含有标准库 `sqlite3` 条目，不应直接作为完整安装清单。
 
-**Week 3**：前端开发 🚧
-- 首页（Alpha 机会）
-- 个股详情页（K线 + AI 分析）
-- 板块详情页
-- ETF 配置页面
+默认本地数据库为 `backend/data/local_quant.db`，数据库和行情数据不随 Git 仓库发布。环境配置在后端工作目录的 `.env` 中读取，可参考根目录 [.env.example](.env.example) 和邮件模板 [backend/.env.example](backend/.env.example)，按需合并字段；已有 `.env` 时不要覆盖。默认无需配置云端数据库。
 
-**Week 4**：日报 + 回测 + 上线 ⏳
-- 日报生成系统
-- 邮件推送
-- 回测系统
-- 部署上线
+新库需先初始化基础表，再按所需模块应用迁移；以下命令会写数据库，已有库应先备份：
 
-### Phase 2：Web3 系统（后续）
-- 空投机会雷达
-- 鲸鱼监控
-- 机器人集成
+```bash
+# 在 backend/ 中
+mkdir -p data
+python -m data_job.scripts.init_database
+python scripts/migrate_data_core_schema.py
+python scripts/migrate_portfolio_schema.py
+```
 
-### Phase 3：美股系统（可选）
-- 美股 K 线数据
-- 美股财报分析
-- 中概股对比
+建表不等于完成数据初始化。首次历史行情、股票资料、因子和股票池准备需单独执行；日常增量运行入口不能替代完整历史回填。迁移与存量数据口径参见 [Data Core 文档](backend/docs/DATA_CORE_SOURCE_AND_DB_MAP.md)。
 
----
+```bash
+# 在 backend/ 中启动 API；端口占用时选择空闲端口
+APP_DEBUG=false OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
 
-## 🚧 当前进度
+健康检查：`http://127.0.0.1:8000/health`；API 文档：`http://127.0.0.1:8000/api/docs`。
 
-### 已完成 ✅
-- [x] 项目初始化（Git、文档）
-- [x] 技术蓝图设计（BLUEPRINT.md）
-- [x] 从 EvoQuant OS 移植核心代码
-- [x] 双引擎数据库系统（本地 + 云端）
-- [x] **数据采集系统 v2.1.0** ⭐
-  - 13个数据采集器（K线、估值、新闻、财务等）
-  - 增量更新机制（性能提升90%+）
-  - 定时调度系统（每日/每月/每季度自动采集）
-  - 初始化数据采集脚本（7-9小时全量采集）
-  - 完整文档和使用指南
-- [x] **量化引擎系统** ⭐
-  - RPS因子计算（个股、板块、ETF）
-  - MRGC策略选股
-  - 核心股票池维护
-  - 因子计算器和策略运行器
-- [x] **自动化交易流水线 v1.0** ⭐⭐⭐
-  - 定时调度器（每日15:30 / 每季度15号08:00）
-  - 完整自动化流程：数据采集 → RPS计算 → 策略选股
-  - 监控和管理脚本
-  - 桌面通知功能
-- [x] Bug修复和优化
-  - datetime类型转换问题
-  - None类型检查
-  - 网络重试机制优化
-- [x] 前端页面框架
+### 前端
 
-### 进行中 🚧
-- [ ] API 接口开发
-- [ ] 数据库表创建
-- [ ] AI Agent 接入
-- [ ] 前后端联调
+```bash
+cd frontend
+npm ci
+BACKEND_URL=http://127.0.0.1:8000 npm run build
+BACKEND_URL=http://127.0.0.1:8000 npm start -- --port 3000
+```
 
-### 待开始 ⏳
-- [ ] 日报生成系统
-- [ ] 邮件推送
-- [ ] 用户系统
-- [ ] 生产环境部署
+浏览器打开 `http://127.0.0.1:3000`，默认进入 `/a/quant`。`/api/*` 经 Next.js 代理至 `BACKEND_URL`，未设置时默认后端为 `http://127.0.0.1:8000`。自定义端口后，构建与启动时保持代理配置一致。
 
----
+修改代码期间可运行 `npm run dev`。已有生产实例在线时，使用 `NEXT_DIST_DIR=.next-candidate-<版本>` 在独立目录预构建，验收后再切换并保留回滚包；不要在运行中的 `.next` 目录直接重建。
 
-## 🎓 核心理念
+### 常用页面
 
-### 量化筛选做减法
+| 路由 | 用途 |
+| --- | --- |
+| `/a/market` | 市场概览 |
+| `/a/sector` | 板块分析 |
+| `/a/stock`、`/a/stock/[symbol]` | 个股工作台与详情 |
+| `/a/quant`、`/a/strategy` | 量化与策略 |
+| `/a/watchlist` | 自选监控与行动箱 |
+| `/a/portfolio` | 账户、持仓和收益 |
+| `/a/report`、`/a/research` | 日报与研究 |
+| `/a/data` | 数据管理 |
 
-从 5000+ 只股票中，通过 RPS、板块效应、资金流向，每日自动筛选出几十只符合逻辑的"信号股"。
+## 数据更新与调度
 
-### AI Agent 做加法
+正式写库优先使用本地执行器。以下命令在 `backend/` 中运行：
 
-利用本地大模型深度阅读财报与新闻，模拟不同流派大师（如陶博士、巴菲特）进行多维度会诊，提供高质量决策依据。
+```bash
+# 预览日常执行计划
+python scripts/run_local_data_skill.py --mode daily --dry-run
 
----
+# 执行日常更新，或重试缺失任务
+python scripts/run_local_data_skill.py --mode daily
+python scripts/run_local_data_skill.py --mode retry
 
-## 💰 商业模式
+# 健康检查：生成状态报告；深度模式检查历史区间与保留策略
+python scripts/run_local_data_skill.py --mode health
+python scripts/run_local_data_skill.py --mode health --deep-health
 
-| 版本 | 价格 | 权限 |
-|------|------|------|
-| 免费版 | ¥0 | Top 3 机会 + 基础功能 |
-| Pro版 | ¥199/月 | 全部机会 + AI 分析 + 日报推送 |
-| VIP版 | ¥999/季 | Pro 全部 + 1对1 咨询 + 定制策略 |
+# macOS：查看安装计划、安装任务、检查状态
+python scripts/install_local_data_launchd.py install --dry-run
+python scripts/install_local_data_launchd.py install
+python scripts/install_local_data_launchd.py status
+```
 
----
+安装器当前默认时间如下。LaunchAgent 日历触发跟随 macOS 系统时区，使用时应将系统时区设为 `Asia/Shanghai`；实际执行还受交易日与时段检查约束：
 
-## 📞 联系方式
+| 时间 | 任务 |
+| --- | --- |
+| 工作日 09:00 | 有时间预算的近期缺失任务补齐 |
+| 工作日 09:30 | 轻量健康检查 |
+| 工作日 09:35 | 盘中监控；登录时也会检查是否需要补启动 |
+| 工作日 15:30 | 盘后 Data Core 主流程 |
+| 工作日 16:30 | 数据与计算重试 |
+| 工作日 20:00 | 晚间通知兜底 |
+| 工作日 22:30 | 通知失败重试 |
+| 周六 09:15 | 深度健康检查 |
 
-- **品牌**：dlab (Evolution Lab)
-- **Slogan**：进化即自由 (Evolution is Freedom)
+可信盘后结果生成后可立即幂等投递日报，20:00 任务作为兜底。邮件需配置 `ALERT_EMAIL_ENABLED`、SMTP 发件信息、授权码、收件人及 `EVOALPHA_PUBLIC_URL`，详见 [邮件配置模板](backend/.env.example)。
 
----
+LaunchAgent 日志统一写入 `~/Library/Logs/EvoAlpha`；Data Core 状态报告位于 `backend/logs/data_core_status/`。正式执行器提供锁、备份和超时控制，避免同时启动多个写库流程。旧 `auto_pipeline.py`、手工调度器和 LaunchAgent 不应重复启用。
 
-## 📚 文档
+## 验证与已知限制
 
-### 📖 文档导航 ⭐
-- **[文档索引](./DOCS_INDEX.md)** - 完整的文档导航和阅读路径指南
+```bash
+# backend/：使用隔离测试库，确认测试不会写入正式库后运行
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python -m pytest tests
 
-### 核心文档
-- **[README.md](./README.md)** - 项目总览（本文件）
-- **[技术蓝图](./BLUEPRINT.md)** - 完整的系统设计和技术架构
-- **[项目结构](./PROJECT_STRUCTURE.md)** - 详细的目录结构说明
+# frontend/：串行执行，控制测试进程数量
+node --test --test-concurrency=1 tests/*.test.mjs
+```
 
-### 数据采集系统文档 (v2.1.0 ✅ 已完成)
-- **[快速开始](./backend/data_job/docs/QUICKSTART.md)** - 3分钟快速上手数据采集
-- **[系统架构](./backend/data_job/docs/ARCHITECTURE.md)** - v2.1.0 架构设计文档
-- **[开发指南](./backend/data_job/docs/DEVELOPMENT_GUIDE.md)** - 新增采集器开发规范
-- **[主文档](./backend/data_job/README.md)** - 数据采集系统完整说明
-- **[优化报告](./backend/data_job/INCREMENTAL_UPDATE_REPORT.md)** - 增量更新性能报告
-- **[采集规划](./backend/data_job/COLLECTION_SCHEDULE.md)** - 数据采集频率规划
+2026-10-20 仓库同步验收：后端覆盖 1,173 项通过，前端生产构建与 TypeScript 检查通过；前端测试 197 项通过、8 项失败。失败涉及界面源码断言及 Node 对无扩展名导入的解析，尚未在此次同步中修复。完整范围、复核方法与资源数据见 [同步验证记录](docs/REPOSITORY_SYNC_2026-10-20.md)。
 
-### 量化引擎系统文档
-- **[量化引擎文档](./backend/quant_engine/README.md)** - 量化引擎完整说明
-- **[因子计算器](./backend/quant_engine/calculators/)** - RPS因子计算
-- **[策略系统](./backend/quant_engine/strategies/)** - MRGC策略
+这份记录验证的是当前本地环境。新机器的依赖安装、全量数据初始化、云端部署和长期服务负载仍需分别验收。
 
-### 自动化流水线文档 (v1.0 ✅ 已完成)
-- **[自动化流水线文档](./backend/AUTO_PIPELINE_README.md)** - 完整的自动化流程说明
-- **[后端主文档](./backend/README.md)** - 后端系统总览
+## 文档导航
 
-### 开发文档
-- **[开发日志](./CLAUDE.md)** - 开发过程中的经验、问题和解决方案
+- [Data Core 来源与数据库映射](backend/docs/DATA_CORE_SOURCE_AND_DB_MAP.md)
+- [数据管线架构](docs/DATA_PIPELINE_ARCHITECTURE.md)
+- [存储与保留策略](backend/docs/DATA_STORAGE_RETENTION.md)
+- [量化引擎](backend/quant_engine/README.md)
+- [采集系统](backend/data_job/README.md)
+- [结构转折规则 v2](backend/docs/STRUCTURE_TURNING_V2.md)
+- [前端设计系统](FRONTEND_DESIGN_SYSTEM.md)
+- [蓝图 1.0](BLUEPRINT1.0.md)（规划与设计参考，以当前代码为准）
+- [开发约定](AGENTS.md)
 
-### 归档文档
-- **[代码移植计划](./docs/archive/MIGRATION_PLAN.md)** - 从 EvoQuant OS 移植代码（已完成）
-- **[数据分析报告](./docs/archive/DATA_ANALYSIS.md)** - 数据采集模块分析（已完成）
-- **[项目初始化计划](./docs/archive/PROJECT_PLAN.md)** - 项目初始化（已完成）
+部分子模块文档保留历史设计与命令，执行前应与当前入口核对。
 
----
-
-## 🤝 贡献
-
-项目正在开发中，暂不对外开放贡献。
-
----
-
-## 📄 许可证
-
-Copyright © 2025 dlab (Evolution Lab). All rights reserved.
-
----
-
-**项目状态**：🚧 开发中 | 📊 自动化交易流水线 v1.0 已完成
-**最后更新**：2026-01-20
-**预计可用**：2025年2月
+Copyright © 2026 dlab (Evolution Lab). All rights reserved.
