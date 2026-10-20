@@ -100,15 +100,23 @@ class BaseFeatureCalculator(ABC):
         if self.target_table.startswith('quant_feature_'):
             # 标准化的量化因子表结构
             # 前两列（entity_column 和 trade_date）需要特殊类型
-            fields_str = f"    {self.entity_column} TEXT,\n    trade_date TEXT"
+            expected_columns = {
+                self.entity_column: "TEXT",
+                "trade_date": "TEXT",
+            }
 
             # 添加涨幅字段（FLOAT类型）
             for period in self.periods:
-                fields_str += f",\n    chg_{period} FLOAT"
+                expected_columns[f"chg_{period}"] = "FLOAT"
 
             # 添加RPS字段（FLOAT类型）
             for period in self.periods:
-                fields_str += f",\n    rps_{period} FLOAT"
+                expected_columns[f"rps_{period}"] = "FLOAT"
+
+            fields_str = ",\n".join(
+                f"    {column} {column_type}"
+                for column, column_type in expected_columns.items()
+            )
 
             primary_key = f'{self.entity_column}, trade_date'
 
@@ -120,6 +128,18 @@ class BaseFeatureCalculator(ABC):
                     );
                 """))
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.target_table}_date ON {self.target_table} (trade_date);"))
+
+                # 旧初始化脚本创建过精简版 RPS 表，这里做轻量迁移，避免写入 chg_* 等字段时报错。
+                existing_columns = {
+                    row[1]
+                    for row in conn.execute(text(f"PRAGMA table_info({self.target_table})")).fetchall()
+                }
+                for column, column_type in expected_columns.items():
+                    if column not in existing_columns:
+                        conn.execute(text(
+                            f"ALTER TABLE {self.target_table} ADD COLUMN {column} {column_type}"
+                        ))
+                        logger.info(f"   ➕ 补齐字段: {self.target_table}.{column}")
 
             logger.info(f"✅ 表 {self.target_table} 初始化完成")
         else:
@@ -154,7 +174,7 @@ class BaseFeatureCalculator(ABC):
             logger.warning("⚠️ 数据为空")
             return df
 
-        df['trade_date'] = pd.to_datetime(df['trade_date'])
+        df['trade_date'] = pd.to_datetime(df['trade_date'], format='mixed')
 
         # 记录加载统计
         entity_count = df[self.entity_column].nunique()
@@ -189,7 +209,7 @@ class BaseFeatureCalculator(ABC):
             columns=self.entity_column,
             values='close'
         )
-        df_pivot = df_pivot.fillna(method='ffill')  # 填充停牌
+        df_pivot = df_pivot.ffill()  # 填充停牌
 
         logger.info(f"   📊 Pivot表形状: {df_pivot.shape}")
 
@@ -240,6 +260,147 @@ class BaseFeatureCalculator(ABC):
 
         return df_final
 
+    def compute_features_for_dates(
+        self,
+        df: pd.DataFrame,
+        target_dates,
+    ) -> pd.DataFrame:
+        """Compute cross-sectional RPS only for requested output dates."""
+        if df.empty:
+            raise ValidationError("数据为空，无法计算因子")
+
+        df_filtered = self.should_filter(df)
+        pivot = df_filtered.pivot(
+            index="trade_date",
+            columns=self.entity_column,
+            values="close",
+        ).sort_index().ffill()
+        pivot.index = pd.to_datetime(pivot.index).normalize()
+        targets = sorted(
+            {
+                pd.to_datetime(value).normalize()
+                for value in target_dates
+                if pd.notna(value)
+            }
+        )
+        targets = [value for value in targets if value in pivot.index]
+        if not targets:
+            return pd.DataFrame()
+
+        frames: list[pd.DataFrame] = []
+        for target in targets:
+            position = pivot.index.get_loc(target)
+            current = pivot.iloc[position]
+            frame = pd.DataFrame(
+                {
+                    self.entity_column: current.index,
+                    "trade_date": target,
+                }
+            ).set_index(self.entity_column)
+            for period in self.periods:
+                if position < period:
+                    change = pd.Series(np.nan, index=current.index, dtype=float)
+                else:
+                    previous = pivot.iloc[position - period]
+                    change = current.divide(previous).subtract(1.0)
+                    change = change.where(previous.notna() & previous.ne(0))
+                frame[f"chg_{period}"] = change.round(4)
+                frame[f"rps_{period}"] = (
+                    change.rank(pct=True, method="min").mul(100).round(2)
+                )
+            frames.append(frame.reset_index())
+
+        result = pd.concat(frames, ignore_index=True)
+        feature_columns = [
+            column
+            for period in self.periods
+            for column in (f"chg_{period}", f"rps_{period}")
+        ]
+        result = result.dropna(subset=feature_columns, how="all")
+        return result[[self.entity_column, "trade_date", *feature_columns]]
+
+    def _get_missing_target_dates(self, max_days: int = 7):
+        """Return real source dates missing from the target within a bounded window."""
+        try:
+            with self.engine.begin() as conn:
+                source_rows = conn.execute(text(f"""
+                    SELECT trade_date
+                    FROM (
+                        SELECT DISTINCT trade_date
+                        FROM {self.source_table}
+                        WHERE trade_date IS NOT NULL
+                        ORDER BY trade_date DESC
+                        LIMIT :limit
+                    )
+                    ORDER BY trade_date
+                """), {"limit": max(1, int(max_days))}).fetchall()
+                if not source_rows:
+                    return []
+                source_dates = [pd.to_datetime(row[0]).date() for row in source_rows]
+                start_date = source_dates[0].isoformat()
+                target_rows = conn.execute(text(f"""
+                    SELECT DISTINCT trade_date
+                    FROM {self.target_table}
+                    WHERE trade_date >= :start_date
+                """), {"start_date": start_date}).fetchall()
+            existing = {pd.to_datetime(row[0]).date() for row in target_rows}
+            return [value for value in source_dates if value not in existing]
+        except Exception as exc:
+            logger.warning("无法查询内部 RPS 缺口，回退旧增量逻辑: %s", exc)
+            return None
+
+    def _filter_source_target_dates(self, target_dates, missing_only: bool = False) -> list:
+        normalized = sorted({pd.to_datetime(value).date() for value in target_dates})
+        if not normalized:
+            return []
+        placeholders = ", ".join(f":date_{index}" for index in range(len(normalized)))
+        params = {f"date_{index}": value.isoformat() for index, value in enumerate(normalized)}
+        try:
+            with self.engine.begin() as conn:
+                rows = conn.execute(text(f"""
+                    SELECT DISTINCT DATE(trade_date)
+                    FROM {self.source_table}
+                    WHERE DATE(trade_date) IN ({placeholders})
+                    ORDER BY DATE(trade_date)
+                """), params).fetchall()
+                existing_rows = []
+                if missing_only:
+                    existing_rows = conn.execute(text(f"""
+                        SELECT DISTINCT DATE(trade_date)
+                        FROM {self.target_table}
+                        WHERE DATE(trade_date) IN ({placeholders})
+                    """), params).fetchall()
+            source_dates = [pd.to_datetime(row[0]).date() for row in rows]
+            existing_dates = {pd.to_datetime(row[0]).date() for row in existing_rows}
+            return [value for value in source_dates if value not in existing_dates]
+        except Exception as exc:
+            raise DataSourceError(f"查询 RPS 目标日期失败: {exc}") from exc
+
+    def _get_window_start_for_targets(self, target_dates) -> str | None:
+        if not target_dates:
+            return None
+        earliest = min(target_dates).isoformat()
+        required_rows = max(self.periods) + 1
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(text(f"""
+                    SELECT MIN(seed_date)
+                    FROM (
+                        SELECT DISTINCT trade_date AS seed_date
+                        FROM {self.source_table}
+                        WHERE trade_date < DATE(:target_date, '+1 day')
+                        ORDER BY trade_date DESC
+                        LIMIT :required_rows
+                    )
+                """), {
+                    "target_date": earliest,
+                    "required_rows": required_rows,
+                }).fetchone()
+            return str(row[0])[:10] if row and row[0] else None
+        except Exception as exc:
+            logger.warning("无法定位 250 周期种子日，回退自然日窗口: %s", exc)
+            return None
+
     def save_to_db(self, df: pd.DataFrame, mode: str = 'append'):
         """
         保存数据到数据库（幂等性）
@@ -255,46 +416,49 @@ class BaseFeatureCalculator(ABC):
         logger.info(f"💾 正在保存到 {self.target_table} ({len(df)} 行)...")
 
         try:
-            # 幂等性删除：删除当天的数据
-            if mode == 'append':
-                dates = df['trade_date'].unique()
-                date_strs = [pd.to_datetime(d).strftime('%Y-%m-%d') for d in dates]
-                if date_strs:
-                    with self.engine.begin() as conn:
-                        for date_str in date_strs:
-                            # 使用 LIKE 匹配日期（处理带时间戳的日期）
-                            conn.execute(text(f"""
-                                DELETE FROM {self.target_table}
-                                WHERE trade_date LIKE '{date_str}%'
-                            """))
-
             # 去除DataFrame内部的重复记录（保留最后一条）
             original_len = len(df)
             df = df.drop_duplicates(subset=[self.entity_column, 'trade_date'], keep='last')
             if len(df) < original_len:
                 logger.info(f"   🧹 去除重复: {original_len - len(df)} 条")
 
-            # 保存数据
-            df.to_sql(
-                self.target_table,
-                self.engine,
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=self.config.CHUNK_SIZE
-            )
+            if mode not in {'append', 'replace'}:
+                raise CalculationError(f"不支持的保存模式: {mode}")
+
+            with self.engine.begin() as conn:
+                if mode == 'replace':
+                    conn.execute(text(f"DELETE FROM {self.target_table}"))
+                else:
+                    dates = df['trade_date'].unique()
+                    date_strs = [pd.to_datetime(d).strftime('%Y-%m-%d') for d in dates]
+                    for date_str in date_strs:
+                        # 使用 LIKE 匹配日期（处理带时间戳的日期）
+                        conn.execute(text(f"""
+                            DELETE FROM {self.target_table}
+                            WHERE trade_date LIKE '{date_str}%'
+                        """))
+
+                # 删除与写入保持在同一事务中，避免重算失败时暴露空表或半截日期。
+                df.to_sql(
+                    self.target_table,
+                    conn,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=self.config.CHUNK_SIZE
+                )
 
             logger.info(f"   ✅ 保存成功")
 
         except Exception as e:
             raise CalculationError(f"保存失败: {e}")
 
-    def run_init(self, days=400):
+    def run_init(self, days: int | None = None):
         """
-        【全量模式】重算指定天数的数据（默认最近400天）
+        【全量模式】重算历史数据
 
         Args:
-            days: 加载最近N天的数据，默认400天（确保250日RPS计算准确）
+            days: 加载最近N个自然日的数据；None 表示加载源表全历史
 
         用途：
         - 首次初始化
@@ -302,7 +466,8 @@ class BaseFeatureCalculator(ABC):
         - 重算历史数据
         """
         logger.info("=" * 80)
-        logger.info(f"🚀 [{self.__class__.__name__}] 启动全量重算（最近{days}天）...")
+        range_label = "全历史" if days is None else f"最近{days}天"
+        logger.info(f"🚀 [{self.__class__.__name__}] 启动全量重算（{range_label}）...")
         logger.info("=" * 80)
 
         start_time = time.time()
@@ -311,29 +476,31 @@ class BaseFeatureCalculator(ABC):
             # 1. 初始化表
             self._init_table()
 
-            # 2. 清空旧数据
-            logger.info(f"🗑️ 清空表 {self.target_table}...")
-            with self.engine.begin() as conn:
-                conn.execute(text(f"DELETE FROM {self.target_table}"))
+            # 2. 计算起始日期。RPS250 依赖 250 个交易日前的价格，默认 init 必须使用
+            # 源表全历史，避免把早期 rps_250 计算成长期空值。
+            if days is None:
+                cutoff_date = None
+                logger.info("📅 数据范围: 源表全历史")
+            else:
+                last_source_date = self._get_last_source_date()
+                if last_source_date is None:
+                    logger.warning("⚠️ 源表无最新日期，跳过计算")
+                    return
+                cutoff_date = (last_source_date - timedelta(days=days)).strftime("%Y-%m-%d")
+                logger.info(f"📅 数据范围: {cutoff_date} 至 {last_source_date}")
 
-            # 3. 计算起始日期
-            cutoff_date = (
-                datetime.now() - timedelta(days=days)
-            ).strftime("%Y-%m-%d")
-            logger.info(f"📅 数据范围: {cutoff_date} 至今")
-
-            # 4. 加载数据
+            # 3. 加载数据
             df = self.load_data(start_date=cutoff_date)
 
             if df.empty:
                 logger.warning("⚠️ 数据为空，跳过计算")
                 return
 
-            # 5. 计算因子
+            # 4. 计算因子
             result = self.compute_features(df)
 
-            # 6. 保存
-            self.save_to_db(result, mode='append')
+            # 5. 保存：成功计算后再事务性替换，避免失败时清空历史结果。
+            self.save_to_db(result, mode='replace')
 
             cost = time.time() - start_time
             logger.info(f"✅ 全量任务完成！耗时: {cost:.1f}秒")
@@ -342,7 +509,7 @@ class BaseFeatureCalculator(ABC):
             logger.error(f"❌ 全量任务失败: {e}")
             raise
 
-    def run_daily(self):
+    def run_daily(self, target_dates=None, missing_only: bool = False):
         """
         【增量模式】只计算最新一天的数据（真正的增量更新）
 
@@ -372,7 +539,7 @@ class BaseFeatureCalculator(ABC):
 
             if last_calculated_date:
                 logger.info(f"📅 最后计算日期: {last_calculated_date}")
-            else:
+            elif target_dates is None:
                 # 如果没有历史数据，执行初始化
                 logger.info("⚠️  未找到历史数据，执行初始化...")
                 return self.run_init()
@@ -381,43 +548,60 @@ class BaseFeatureCalculator(ABC):
             last_source_date = self._get_last_source_date()
             logger.info(f"📅 源表最新日期: {last_source_date}")
 
-            if last_source_date <= last_calculated_date:
-                logger.info("✅ 数据已是最新，无需更新")
-                return
+            max_daily_backfill_days = getattr(self.config, "DAILY_MAX_BACKFILL_DAYS", 7)
+            fallback_save_after = None
+            if target_dates is not None:
+                pending_dates = self._filter_source_target_dates(
+                    target_dates,
+                    missing_only=missing_only,
+                )[-max_daily_backfill_days:]
+            else:
+                pending_dates = self._get_missing_target_dates(max_daily_backfill_days)
 
-            # 4. 确定需要计算的日期范围（通常只有1天）
-            from datetime import timedelta
-            days_diff = (last_source_date - last_calculated_date).days
+            if pending_dates is None:
+                days_diff = (last_source_date - last_calculated_date).days
+                fallback_save_after = last_calculated_date
+                if days_diff > max_daily_backfill_days:
+                    fallback_save_after = max(
+                        last_calculated_date,
+                        last_source_date - timedelta(days=max_daily_backfill_days),
+                    )
+                window_start = (
+                    fallback_save_after - timedelta(days=self.config.INCREMENTAL_WINDOW_DAYS)
+                ).strftime("%Y-%m-%d")
+            else:
+                if not pending_dates:
+                    logger.info("✅ 最近目标交易日均已计算，无需更新")
+                    return {"success": True, "records": 0, "elapsed": time.time() - start_time}
+                window_start = self._get_window_start_for_targets(pending_dates)
+                if window_start is None:
+                    window_start = (
+                        min(pending_dates) - timedelta(days=self.config.INCREMENTAL_WINDOW_DAYS)
+                    ).strftime("%Y-%m-%d")
 
-            if days_diff > 7:
-                logger.warning(f"⚠️  发现数据缺失: {days_diff}天，执行补齐...")
-                # 缺失数据超过7天，执行更大的初始化
-                return self.run_init(days=min(days_diff + 50, 400))
-
-            logger.info(f"📊 需要计算: {days_diff}天新数据")
-
-            # 5. 加载数据窗口（需要加载足够的历史数据来计算RPS）
-            # 计算RPS需要历史数据，例如250日RPS需要250天历史
-            window_start = last_calculated_date - timedelta(days=self.config.INCREMENTAL_WINDOW_DAYS)
+            logger.info("📊 待计算交易日: %s", pending_dates or "fallback")
             logger.info(f"📥 加载数据窗口: {window_start} 至 {last_source_date}")
 
-            df = self.load_data(start_date=window_start.strftime("%Y-%m-%d"))
+            df = self.load_data(start_date=window_start)
 
             if df.empty:
                 logger.warning("⚠️  无法加载数据")
                 return
 
-            # 6. 计算所有数据的RPS
-            result_full = self.compute_features(df)
+            if pending_dates is None:
+                pending_dates = sorted(
+                    {
+                        value.date()
+                        for value in pd.to_datetime(df["trade_date"])
+                        if value.date() > fallback_save_after
+                    }
+                )[-max_daily_backfill_days:]
 
-            # 7. 只保存新计算的数据（last_calculated_date 之后的数据）
-            # 转换为统一类型进行比较
-            last_calculated_dt = pd.to_datetime(last_calculated_date)
-            result_new = result_full[result_full['trade_date'] > last_calculated_dt].copy()
+            result_new = self.compute_features_for_dates(df, pending_dates)
 
             if result_new.empty:
                 logger.warning("⚠️  没有新数据需要保存")
-                return
+                return {"success": True, "records": 0, "elapsed": time.time() - start_time}
 
             new_dates = result_new['trade_date'].unique()
             logger.info(f"📅 新增日期: {len(new_dates)}个")
@@ -428,6 +612,7 @@ class BaseFeatureCalculator(ABC):
 
             cost = time.time() - start_time
             logger.info(f"✅ 增量任务完成！耗时: {cost:.1f}秒")
+            return {"success": True, "records": len(result_new), "elapsed": cost}
 
         except Exception as e:
             logger.error(f"❌ 增量任务失败: {e}")

@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     RESEND_FROM_EMAIL: str = os.getenv("RESEND_FROM_EMAIL", "")
     RESEND_FROM_NAME: str = os.getenv("RESEND_FROM_NAME", "EvoAlpha OS")
 
+    # Watch Engine 邮件提醒（兼容 QQ SMTP SSL）
+    ALERT_EMAIL_ENABLED: bool = os.getenv("ALERT_EMAIL_ENABLED", "false").lower() == "true"
+    SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.qq.com")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "465"))
+    SMTP_SENDER: str = os.getenv("SMTP_SENDER", "")
+    SMTP_AUTH_CODE: str = os.getenv("SMTP_AUTH_CODE", "")
+    SMTP_RECIPIENTS: str = os.getenv("SMTP_RECIPIENTS", "")
+    SMTP_SUBJECT_PREFIX: str = os.getenv("SMTP_SUBJECT_PREFIX", "[EvoAlpha]")
+    EVOALPHA_PUBLIC_URL: str = os.getenv("EVOALPHA_PUBLIC_URL", "")
+
     # ========== 6. 数据源配置 ==========
     AKSHARE_PROXY: str = os.getenv("AKSHARE_PROXY", "")
     NEWS_SOURCES: str = os.getenv("NEWS_SOURCES", "eastmoney,sina,firstfinancing")

@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 # 通达信服务器配置 (已验证可用)
 TDX_SERVERS = [
+    ("117.34.114.14", 7709),  # 2026-09-22 已验证 5 分钟完成柱
+    ("117.34.114.16", 7709),
     ("218.75.126.9", 7709),    # 招商证券上海 ✅ 已验证
     ("119.147.212.81", 7709),  # 招商证券深圳
     # 华泰证券
@@ -91,48 +93,47 @@ class TdxAdapter:
         """检查适配器是否可用"""
         return self.TdxHq_API is not None and self.connected
 
+    def _invalidate_connection(self) -> None:
+        """Close a failed stream before another transaction can reuse it."""
+        self.connected = False
+        api = getattr(self, "api", None)
+        if api is not None and hasattr(api, "disconnect"):
+            try:
+                api.disconnect()
+            except Exception as exc:
+                logger.debug("TDX disconnect failed: %s", exc)
+
     def _connect(self) -> bool:
-        """连接通达信服务器"""
+        """Rotate endpoints with at most three two-second connection attempts."""
         if self.TdxHq_API is None:
             return False
-
-        # 如果已连接，先断开
-        if self.api:
+        previous = getattr(self, "current_server", None)
+        self._invalidate_connection()
+        servers = list(TDX_SERVERS)
+        if previous in servers:
+            offset = servers.index(previous) + 1
+            servers = servers[offset:] + servers[:offset]
+        for host, port in servers[:3]:
+            self.current_server = (host, port)
             try:
-                self.api.disconnect()
-            except:
-                pass
-
-        # 尝试连接各个服务器
-        for host, port in TDX_SERVERS:
-            try:
-                self.api = self.TdxHq_API()  # pytdx 不支持 timeout 参数
-                if self.api.connect(host, port):
+                self.api = self.TdxHq_API(
+                    heartbeat=False, auto_retry=False, raise_exception=True
+                )
+                if self.api.connect(host, port, time_out=2.0):
                     self.connected = True
-                    self.current_server = (host, port)
-                    logger.info(f"✅ pytdx 已连接到 {host}:{port}")
+                    logger.info("pytdx connected to %s:%s", host, port)
                     return True
-            except Exception as e:
-                logger.debug(f"连接 {host}:{port} 失败: {e}")
-                continue
-
-        logger.error("❌ pytdx 无法连接到任何服务器")
-        self.connected = False
+            except Exception as exc:
+                logger.debug("TDX connection %s:%s failed: %s", host, port, exc)
+            self._invalidate_connection()
+        logger.error("TDX connection attempts exhausted")
         return False
 
     def _ensure_connected(self) -> bool:
-        """确保连接正常，断线重连"""
+        """Use the actual request to check health; never probe the shared stream."""
         if not self.connected or not self.api:
             return self._connect()
-
-        # 简单测试连接
-        try:
-            # 尝试获取上证指数
-            self.api.get_security_quotes([(1, '000001')])
-            return True
-        except:
-            logger.warning("⚠️  pytdx 连接断开，尝试重连...")
-            return self._connect()
+        return True
 
     def _parse_symbol(self, symbol: str) -> Tuple[int, str]:
         """
@@ -265,6 +266,82 @@ class TdxAdapter:
 
             # 尝试重连
             self._connect()
+            return None
+
+    def get_recent_stock_bars(
+        self,
+        symbol: str,
+        period: str = "5min",
+        count: int = 3,
+    ) -> Optional[pd.DataFrame]:
+        """Get a bounded number of the most recent intraday bars.
+
+        Unlike :meth:`get_stock_kline`, this method normally performs one
+        ``get_security_bars`` request.  A genuinely empty response gets one
+        bounded reconnect-and-retry; intraday monitoring must never walk the
+        full history or retry without a limit.
+        """
+        if period not in CATEGORY_MAP or period == "daily":
+            raise ValueError(f"unsupported intraday period: {period}")
+        if not isinstance(count, int) or not 1 <= count <= 800:
+            raise ValueError("count must be between 1 and 800")
+        if not self._ensure_connected():
+            self.fail_count += 1
+            return None
+
+        try:
+            market, code = self._parse_symbol(symbol)
+            data = None
+            for attempt in range(2):
+                try:
+                    data = self.api.get_security_bars(
+                        CATEGORY_MAP[period], market, code, 0, count
+                    )
+                except Exception as exc:
+                    logger.warning("TDX %s %s request failed: %s", symbol, period, exc)
+                    data = None
+                if data:
+                    break
+                self.fail_count += 1
+                self._invalidate_connection()
+                if attempt == 0:
+                    logger.warning("TDX %s %s empty/failed; rotating endpoint once", symbol, period)
+                    if self._connect():
+                        continue
+                return None
+
+            frame = pd.DataFrame(data).rename(
+                columns={
+                    "datetime": "bar_time",
+                    "vol": "volume",
+                }
+            )
+            frame["bar_time"] = pd.to_datetime(frame["bar_time"], errors="coerce")
+            frame = frame.dropna(subset=["bar_time"])
+            if frame.empty:
+                self.fail_count += 1
+                return None
+            frame["symbol"] = str(symbol).zfill(6)
+            frame = frame.sort_values("bar_time").drop_duplicates(
+                subset=["bar_time"], keep="last"
+            )
+            columns = [
+                "symbol",
+                "bar_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+            ]
+            frame = frame[[column for column in columns if column in frame.columns]]
+            self.success_count += 1
+            return frame.reset_index(drop=True)
+        except Exception as exc:
+            logger.warning("pytdx 获取 %s 最近%s K线失败: %s", symbol, period, exc)
+            self.fail_count += 1
+            self._invalidate_connection()
             return None
 
     def get_index_kline(
@@ -510,6 +587,11 @@ def get_tdx_adapter() -> Optional[TdxAdapter]:
 
     if _tdx_instance is None:
         _tdx_instance = TdxAdapter()
+    elif not _tdx_instance.is_available():
+        try:
+            _tdx_instance._ensure_connected()
+        except Exception as exc:
+            logger.warning("pytdx 单例重连失败 (%s)", type(exc).__name__)
 
     return _tdx_instance if _tdx_instance.is_available() else None
 

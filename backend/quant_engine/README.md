@@ -216,7 +216,7 @@ stock_daily_prices / sector_daily_prices / etf_daily_prices
    ↓
 RPS计算器 (BaseFeatureCalculator)
    ↓
-quant_feature_stock_rps / quant_feature_sector_rps / quant_feature_etf_rps
+quant_feature_rps / quant_feature_sector_rps / quant_feature_etf_rps
    ↓
 策略选股 (BaseStrategy)
    ↓
@@ -503,7 +503,7 @@ python3 -m quant_engine.runner.feature_runner --mode init
 **解决方案**: 表会自动创建（`CREATE TABLE IF NOT EXISTS`），如需重置：
 
 ```sql
-DROP TABLE IF EXISTS quant_feature_stock_rps;
+DROP TABLE IF EXISTS quant_feature_rps;
 ```
 
 然后重新运行计算器。

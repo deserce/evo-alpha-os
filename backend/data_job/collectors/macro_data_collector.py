@@ -7,7 +7,6 @@ import time
 import pandas as pd
 import akshare as ak
 from sqlalchemy import text
-from datetime import datetime
 
 # 公共工具导入
 from data_job.common import setup_network_emergency_kit, setup_backend_path, setup_logger
@@ -37,6 +36,13 @@ class MacroDataCollector(BaseCollector):
         )
         self.engines = get_active_engines()
         self.table_name = "macro_indicators"
+
+    @staticmethod
+    def _parse_chinese_month(period_series: pd.Series) -> pd.Series:
+        """将 2026年03月份 统一转换成月初日期。"""
+        parts = period_series.astype(str).str.extract(r"(?P<year>\d{4})年(?P<month>\d{1,2})月")
+        normalized = parts["year"] + "-" + parts["month"].str.zfill(2) + "-01"
+        return pd.to_datetime(normalized, errors="coerce")
 
     def _init_table(self):
         """初始化宏观指标表"""
@@ -93,7 +99,8 @@ class MacroDataCollector(BaseCollector):
             df['period'] = df['period'].str.replace('年第1-4季度', '-Q4').str.replace('年第1-3季度', '-Q3').str.replace('年第1-2季度', '-Q2').str.replace('年第1季度', '-Q1')
 
             # 转换为日期（季度末）
-            df['publish_date'] = pd.to_datetime(df['period'], format='%Y-Q%m') + pd.offsets.QuarterEnd(0)
+            quarter_period = pd.PeriodIndex(df['period'], freq='Q')
+            df['publish_date'] = quarter_period.to_timestamp(how='end').date
 
             df = df[['indicator_name', 'indicator_code', 'period', 'value', 'forecast_value', 'previous_value', 'unit', 'publish_date']]
             logger.info(f"  ✅ GDP: {len(df)} 条数据")
@@ -107,21 +114,23 @@ class MacroDataCollector(BaseCollector):
         """获取CPI数据"""
         try:
             # 使用基类的重试机制
-            df = self._retry_call(ak.macro_china_cpi_yearly)
+            df = self._retry_call(ak.macro_china_cpi)
             if df.empty:
                 return None
 
-            # 数据清洗：映射实际字段
+            # 东方财富月度 CPI 更稳定，这里保存全国同比作为核心指标。
             df = df.rename(columns={
-                '商品': 'indicator_name',
-                '日期': 'publish_date',
-                '今值': 'value',
-                '预测值': 'forecast_value',
-                '前值': 'previous_value'
+                '月份': 'period',
+                '全国-同比增长': 'value',
             })
-            df['indicator_code'] = 'CPI'
+            df['indicator_name'] = 'CPI同比'
+            df['indicator_code'] = 'CPI_YOY'
             df['unit'] = '%'
-            df['period'] = pd.to_datetime(df['publish_date']).dt.strftime('%Y-%m-%d')
+            df['forecast_value'] = None
+            df['previous_value'] = df['value'].shift(-1)
+            parsed_date = self._parse_chinese_month(df['period'])
+            df['period'] = parsed_date.dt.strftime('%Y-%m')
+            df['publish_date'] = parsed_date.dt.date
 
             # 删除重复数据（保留最新的）
             df = df.drop_duplicates(subset=['period'], keep='last')
@@ -153,7 +162,8 @@ class MacroDataCollector(BaseCollector):
             })
             df['indicator_code'] = 'PMI'
             df['unit'] = '%'
-            df['period'] = pd.to_datetime(df['publish_date']).dt.strftime('%Y-%m-%d')
+            df['publish_date'] = pd.to_datetime(df['publish_date'], format='%Y-%m-%d', errors='coerce')
+            df['period'] = df['publish_date'].dt.strftime('%Y-%m-%d')
 
             # 删除重复数据（保留最新的）
             df = df.drop_duplicates(subset=['period'], keep='last')
@@ -165,6 +175,35 @@ class MacroDataCollector(BaseCollector):
 
         except Exception as e:
             logger.error(f"❌ PMI数据获取失败: {e}")
+            return None
+
+    def fetch_ppi(self):
+        """获取PPI数据（工业生产者出厂价格指数）"""
+        try:
+            df = self._retry_call(ak.macro_china_ppi)
+            if df.empty:
+                return None
+
+            df = df.rename(columns={
+                '月份': 'period',
+                '当月同比增长': 'value',
+            })
+            df['indicator_name'] = 'PPI同比'
+            df['indicator_code'] = 'PPI_YOY'
+            df['unit'] = '%'
+            df['forecast_value'] = None
+            df['previous_value'] = df['value'].shift(-1)
+            parsed_date = self._parse_chinese_month(df['period'])
+            df['period'] = parsed_date.dt.strftime('%Y-%m')
+            df['publish_date'] = parsed_date.dt.date
+
+            df = df.drop_duplicates(subset=['period'], keep='last')
+            df = df[['indicator_name', 'indicator_code', 'period', 'value', 'forecast_value', 'previous_value', 'unit', 'publish_date']]
+            logger.info(f"  ✅ PPI: {len(df)} 条数据")
+            return df
+
+        except Exception as e:
+            logger.error(f"❌ PPI数据获取失败: {e}")
             return None
 
     def save_macro_data(self, all_data):
@@ -243,6 +282,14 @@ class MacroDataCollector(BaseCollector):
         pmi_data = self.fetch_pmi()
         if pmi_data is not None:
             all_data.append(pmi_data)
+
+        time.sleep(1)
+
+        # PPI
+        logger.info("📊 采集 PPI 数据...")
+        ppi_data = self.fetch_ppi()
+        if ppi_data is not None:
+            all_data.append(ppi_data)
 
         # 保存数据
         if all_data:

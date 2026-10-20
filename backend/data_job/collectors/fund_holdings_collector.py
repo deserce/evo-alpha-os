@@ -6,7 +6,7 @@ EvoAlpha OS - 基金持股数据采集器
 import time
 import pandas as pd
 import akshare as ak
-from datetime import date, timedelta, datetime
+from datetime import date
 from sqlalchemy import text
 
 # 公共工具导入
@@ -60,14 +60,30 @@ class FundHoldingsCollector(BaseCollector):
             except Exception as e:
                 logger.error(f"❌ 创建基金持仓表失败: {e}")
 
-    def update_fund_holdings(self):
+    @staticmethod
+    def _build_target_quarters(years: int = 4) -> list[str]:
+        """生成最近若干年的已到期基金持仓报告期。"""
+        today_str = date.today().strftime("%Y%m%d")
+        curr_year = date.today().year
+        quarters = ["1231", "0930", "0630", "0331"]
+        target_quarters = []
+        for year in range(curr_year, curr_year - years, -1):
+            for quarter in quarters:
+                report_date = f"{year}{quarter}"
+                if report_date <= today_str:
+                    target_quarters.append(report_date)
+        return target_quarters
+
+    @staticmethod
+    def _filter_a_share_codes(df: pd.DataFrame) -> pd.DataFrame:
+        """过滤掉 B 股等非 A 股代码，保持和股票 K 线主体一致。"""
+        return df[df["symbol"].astype(str).str.match(r"^(00|30|60|68|83|87|43|92)\d{4}$")].copy()
+
+    def update_fund_holdings(self, years: int = 4):
         """采集基金持仓季度数据"""
         logger.info("🚀 开始采集基金持仓数据...")
 
-        target_quarters = [
-            "20241231", "20240930", "20240630", "20240331",
-            "20231231", "20230930", "20230630", "20230331"
-        ]
+        target_quarters = self._build_target_quarters(years=years)
 
         success_count = 0
         fail_count = 0
@@ -77,12 +93,12 @@ class FundHoldingsCollector(BaseCollector):
 
             try:
                 with self.engine.connect() as conn:
-                    exists = conn.execute(text("""
-                        SELECT 1 FROM finance_fund_holdings
+                    row_count = conn.execute(text("""
+                        SELECT COUNT(*) FROM finance_fund_holdings
                         WHERE report_date = :report_date LIMIT 1
                     """), {"report_date": report_date}).scalar()
 
-                if exists:
+                if row_count and row_count >= 1000:
                     logger.info(f"⏭️  {report_date} 数据已存在，跳过")
                     success_count += 1
                     continue
@@ -121,6 +137,7 @@ class FundHoldingsCollector(BaseCollector):
                           'hold_value', 'hold_change', 'change_value', 'change_ratio']
                 df_save = df_processed[columns].copy()
                 df_save = df_save.dropna(subset=['symbol', 'report_date'])
+                df_save = self._filter_a_share_codes(df_save)
 
                 if df_save.empty:
                     logger.warning(f"⚠️  {report_date} 清理后无有效数据")

@@ -34,6 +34,7 @@ from data_job.collectors import (
     NewsCollector,
     LimitBoardsCollector,
     IndexDataCollector,
+    BSEIndexCollector,  # 北交所板块指数采集器
 )
 
 # 导入市场统计计算器
@@ -309,6 +310,7 @@ def run_daily_update():
     # 只运行需要每日更新的采集器
     daily_collectors = [
         ('IndexData', IndexDataCollector()),
+        ('BSEIndex', BSEIndexCollector()),  # 北交所板块指数
         ('StockValuation', StockValuationCollector()),
         ('MacroData', MacroDataCollector()),
         ('StockKline', StockKlineCollectorOptimized(**kline_config)),

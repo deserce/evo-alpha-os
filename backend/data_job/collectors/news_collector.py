@@ -1,9 +1,8 @@
-"""
-EvoAlpha OS - 新闻舆情数据采集器
-采集财经新闻并进行股票关联和情绪分析
-"""
+"""EvoAlpha OS - 新闻舆情数据采集器。"""
 
+import argparse
 import time
+import hashlib
 import pandas as pd
 import akshare as ak
 from sqlalchemy import text
@@ -39,6 +38,19 @@ class NewsCollector(BaseCollector):
         self.engines = get_active_engines()
         self.articles_table = "news_articles"
         self.relation_table = "news_stock_relation"
+
+    @staticmethod
+    def _parse_date(value):
+        if value is None:
+            return None
+        if isinstance(value, date):
+            return value
+        return pd.to_datetime(value, errors="raise").date()
+
+    @staticmethod
+    def _stable_article_id(url: str) -> str:
+        digest = hashlib.sha1(str(url).encode("utf-8")).hexdigest()[:16]
+        return f"NEWS_{digest}"
 
     def _init_tables(self):
         """初始化新闻相关表"""
@@ -77,37 +89,47 @@ class NewsCollector(BaseCollector):
                 logger.error(f"❌ [{mode}] 创建新闻表失败: {e}")
 
     def fetch_news_em(self, date_str=None):
-        """从东方财富获取新闻"""
+        """从可用资讯源获取市场新闻。
+
+        stock_news_em 默认只返回单只股票的新闻，这里改用财新数据通最新资讯流，
+        避免把 603777 的个股新闻误当成全市场新闻。
+        """
         try:
-            # 使用基类的重试机制
-            df = self._retry_call(ak.stock_news_em)
+            df = self._retry_call(ak.stock_news_main_cx)
 
             if df.empty:
                 logger.warning(f"⚠️  无新闻数据")
                 return None
 
             df = df.rename(columns={
-                '新闻标题': 'title',
-                '新闻内容': 'content',
-                '文章来源': 'source',
-                '发布时间': 'publish_time',
-                '新闻链接': 'url',
+                'tag': 'title',
+                'summary': 'content',
             })
+            df['source'] = '财新数据通'
+            publish_date = df['url'].astype(str).str.extract(r"/(\d{4}-\d{2}-\d{2})/", expand=False)
+            df['publish_time'] = pd.to_datetime(publish_date, errors='coerce')
+            df = df.dropna(subset=['publish_time', 'url'])
+            if date_str:
+                target_date = pd.to_datetime(date_str, format="%Y%m%d", errors="coerce").date()
+                df = df[df['publish_time'].dt.date == target_date]
 
-            df['article_id'] = df['url'].apply(lambda x: f"EM_{hash(x) % 10000000000:08d}")
-            df['publish_time'] = pd.to_datetime(df['publish_time'])
+            if df.empty:
+                logger.warning(f"⚠️  {date_str or 'latest'} 无新闻数据")
+                return None
+
+            df['article_id'] = df['url'].apply(self._stable_article_id)
             df['sentiment_type'] = 'neutral'
 
-            logger.info(f"  ✅ 东方财富: {len(df)} 条新闻")
+            logger.info(f"  ✅ 财新数据通: {len(df)} 条新闻")
             return df
 
         except Exception as e:
-            logger.error(f"❌ 东方财富新闻采集失败: {e}")
+            logger.error(f"❌ 新闻采集失败: {e}")
             return None
 
     def extract_stock_symbols(self, text):
         """从文本中提取股票代码"""
-        pattern = r'\b(00|30|60|68)\d{4}\b'
+        pattern = r'\b(?:00|30|60|68)\d{4}\b'
         matches = re.findall(pattern, text)
         symbols = list(set(matches))
         return symbols
@@ -142,11 +164,12 @@ class NewsCollector(BaseCollector):
                 with engine.begin() as conn:
                     articles_df = df[['article_id', 'title', 'content', 'source', 'publish_time', 'url', 'sentiment_type']]
 
-                    article_ids = "', '".join([str(aid) for aid in articles_df['article_id']])
-                    conn.execute(text(f"""
-                        DELETE FROM {self.articles_table}
-                        WHERE article_id IN ('{article_ids}')
-                    """))
+                    article_ids = [str(aid) for aid in articles_df['article_id']]
+                    for article_id in article_ids:
+                        conn.execute(text(f"""
+                            DELETE FROM {self.articles_table}
+                            WHERE article_id = :article_id
+                        """), {"article_id": article_id})
 
                     articles_df.to_sql(self.articles_table, conn, if_exists='append', index=False)
 
@@ -165,10 +188,11 @@ class NewsCollector(BaseCollector):
                     if relations:
                         relations_df = pd.DataFrame(relations)
 
-                        conn.execute(text(f"""
-                            DELETE FROM {self.relation_table}
-                            WHERE article_id IN ('{article_ids}')
-                        """))
+                        for article_id in article_ids:
+                            conn.execute(text(f"""
+                                DELETE FROM {self.relation_table}
+                                WHERE article_id = :article_id
+                            """), {"article_id": article_id})
 
                         relations_df.to_sql(self.relation_table, conn, if_exists='append', index=False)
 
@@ -200,13 +224,15 @@ class NewsCollector(BaseCollector):
 
         return None
 
-    def run(self, days=None):
+    def run(self, days=None, start=None, end=None):
         """
         执行新闻采集（增量更新）
 
         Args:
             days: 采集最近几天的新闻（仅用于首次采集或手动指定）
                    None 表示增量更新（只采集缺失的日期）
+            start: 显式起始日期（YYYY-MM-DD），优先于 days
+            end: 显式结束日期（YYYY-MM-DD），优先于今天
         """
         self.log_collection_start()
         logger.info("🚀 开始采集新闻舆情数据...")
@@ -221,9 +247,20 @@ class NewsCollector(BaseCollector):
         self._init_tables()
 
         # 确定采集日期范围
-        if days is not None:
+        start_target = self._parse_date(start)
+        end_target = self._parse_date(end)
+        if start_target or end_target:
+            if start_target is None:
+                start_target = end_target
+            if end_target is None:
+                end_target = start_target
+            start_date = start_target
+            today = end_target
+            logger.info(f"📅 目标日期模式：采集 {start_date} 至 {today} 新闻")
+        elif days is not None:
             # 手动指定天数
             start_date = date.today() - timedelta(days=days-1)
+            today = date.today()
             logger.info(f"📅 手动模式：采集最近 {days} 天新闻")
         else:
             # 增量更新模式：获取最后采集日期
@@ -237,7 +274,7 @@ class NewsCollector(BaseCollector):
                 start_date = date.today() - timedelta(days=2)
                 logger.info(f"🆕 首次采集：采集最近3天新闻")
 
-        today = date.today()
+            today = date.today()
 
         # 检查是否需要更新
         if start_date > today:
@@ -284,5 +321,10 @@ class NewsCollector(BaseCollector):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Collect market news")
+    parser.add_argument("--start", help="start date, e.g. 2026-06-04")
+    parser.add_argument("--end", help="end date, e.g. 2026-06-04")
+    parser.add_argument("--days", type=int, default=3, help="fallback recent-day window")
+    args = parser.parse_args()
     collector = NewsCollector()
-    collector.run(days=3)
+    collector.run(days=args.days, start=args.start, end=args.end)

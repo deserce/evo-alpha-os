@@ -34,7 +34,7 @@ class BaseStrategy(ABC):
         # 1. 股票池 (New)
         self.pool_table = "quant_stock_pool"
         # 2. 因子表 (New) - 个股RPS表
-        self.rps_table = "quant_feature_stock_rps"
+        self.rps_table = "quant_feature_rps"
         # 3. 预选结果表（New）- 区分预选和买点
         self.preselect_table = "quant_preselect_results"  # 预选结果表
 
@@ -92,6 +92,54 @@ class BaseStrategy(ABC):
             logger.error(f"❌ 获取因子数据失败: {e}")
             return pd.DataFrame()
 
+    def _ensure_preselect_table(self, conn):
+        """Ensure the preselect result table exists."""
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {self.preselect_table} (
+                strategy_name VARCHAR(50),
+                strategy_display_name VARCHAR(100),
+                strategy_description TEXT,
+                strategy_logic TEXT,
+                filter_criteria TEXT,
+                result_type VARCHAR(20),
+                trade_date DATE,
+                symbol VARCHAR(20),
+                signal_type VARCHAR(10),
+                meta_info TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (strategy_name, trade_date, symbol, result_type)
+            )
+        """))
+        conn.execute(text(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.preselect_table}_date "
+            f"ON {self.preselect_table} (trade_date);"
+        ))
+
+    def clear_results_for_dates(self, dates):
+        """Clear existing preselect rows for one or more dates."""
+        date_strs = [pd.to_datetime(item).strftime('%Y-%m-%d') for item in dates if item]
+        if not date_strs:
+            return 0
+
+        deleted = 0
+        try:
+            with self.engine.begin() as conn:
+                self._ensure_preselect_table(conn)
+                for date_str in date_strs:
+                    result = conn.execute(text(f"""
+                        DELETE FROM {self.preselect_table}
+                        WHERE strategy_name = :strategy_name
+                          AND trade_date LIKE :trade_date
+                    """), {
+                        "strategy_name": self.strategy_name,
+                        "trade_date": f"{date_str}%",
+                    })
+                    deleted += result.rowcount or 0
+            return deleted
+        except Exception as e:
+            logger.error(f"❌ 清理预选结果失败: {e}")
+            return 0
+
     def save_results(self, df_results):
         """
         保存预选结果到quant_preselect_results表
@@ -101,7 +149,7 @@ class BaseStrategy(ABC):
         """
         if df_results.empty:
             logger.info(f"🏁 [{self.strategy_display_name}] 预选结果为空，无需保存。")
-            return
+            return 0
 
         logger.info(f"💾 [{self.strategy_display_name}] 正在保存 {len(df_results)} 条【预选结果】...")
 
@@ -128,24 +176,7 @@ class BaseStrategy(ABC):
 
         try:
             with self.engine.begin() as conn:
-                # 创建表（如果不存在）
-                conn.execute(text(f"""
-                    CREATE TABLE IF NOT EXISTS {self.preselect_table} (
-                        strategy_name VARCHAR(50),
-                        strategy_display_name VARCHAR(100),
-                        strategy_description TEXT,
-                        strategy_logic TEXT,
-                        filter_criteria TEXT,
-                        result_type VARCHAR(20),
-                        trade_date DATE,
-                        symbol VARCHAR(20),
-                        signal_type VARCHAR(10),
-                        meta_info TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (strategy_name, trade_date, symbol, result_type)
-                    )
-                """))
-                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.preselect_table}_date ON {self.preselect_table} (trade_date);"))
+                self._ensure_preselect_table(conn)
 
                 # 幂等性删除：删除当天的数据
                 dates = df_save['trade_date'].unique()
@@ -154,16 +185,22 @@ class BaseStrategy(ABC):
                     for date_str in date_strs:
                         conn.execute(text(f"""
                             DELETE FROM {self.preselect_table}
-                            WHERE trade_date LIKE '{date_str}%'
-                        """))
+                            WHERE strategy_name = :strategy_name
+                              AND trade_date LIKE :trade_date
+                        """), {
+                            "strategy_name": self.strategy_name,
+                            "trade_date": f"{date_str}%",
+                        })
 
                 # 写入新数据
                 df_save.to_sql(self.preselect_table, conn, if_exists='append', index=False)
 
             logger.info(f"✅ 【预选结果】已入库！表: {self.preselect_table}, 日期: {dates[0] if len(dates) > 0 else 'Unknown'}")
+            return len(df_save)
 
         except Exception as e:
             logger.error(f"❌ 保存失败: {e}")
+            return 0
 
     @abstractmethod
     def run(self, trade_date=None):

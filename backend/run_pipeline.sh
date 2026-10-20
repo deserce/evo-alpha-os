@@ -42,20 +42,20 @@ echo ""
 
 case $MODE in
     schedule)
-        echo -e "${GREEN}🚀 启动定时调度器...${NC}"
+        echo -e "${GREEN}🚀 启动生产定时调度器...${NC}"
         echo -e "${YELLOW}💡 提示: 按 Ctrl+C 停止调度器${NC}"
         echo ""
-        python3 auto_pipeline.py --mode schedule
+        python3 scripts/schedule_daily_data_workflow.py
         ;;
     daily)
-        echo -e "${GREEN}🚀 立即运行每日自动化流水线...${NC}"
+        echo -e "${GREEN}🚀 立即运行每日生产流水线...${NC}"
         echo ""
-        python3 auto_pipeline.py --mode daily
+        python3 scripts/run_daily_data_workflow.py
         ;;
     quarterly)
-        echo -e "${GREEN}🚀 立即运行季度自动化流水线...${NC}"
+        echo -e "${GREEN}🚀 立即运行季度增强生产流水线...${NC}"
         echo ""
-        python3 auto_pipeline.py --mode quarterly
+        python3 scripts/run_daily_data_workflow.py --include-quarterly
         ;;
     *)
         echo -e "${RED}❌ 错误: 未知的模式 '$MODE'${NC}"

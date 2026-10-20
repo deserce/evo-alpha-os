@@ -9,8 +9,8 @@ echo ""
 # 进入backend目录
 cd "$(dirname "$0")" || exit 1
 
-# 运行每日采集任务
-python -m data_job.utils.scheduler --mode daily
+# 运行唯一生产入口：采集 + RPS + P0 强度/结构/生命周期
+python scripts/run_daily_data_workflow.py
 
 echo ""
 echo "✅ 每日数据采集完成"

@@ -181,7 +181,8 @@ class MrgcStrategy(BaseStrategy):
         pool_df = self.get_stock_pool(pool_name='core_pool')
         if pool_df.empty:
             print("⚠️ 股票池为空")
-            return
+            self.clear_results_for_dates([trade_date])
+            return 0
         target_symbols = pool_df['symbol'].tolist()
         
         # 2. 获取 RPS
@@ -205,11 +206,13 @@ class MrgcStrategy(BaseStrategy):
             kline_all = pd.read_sql(sql_kline, self.engine)
         except Exception as e:
             print(f"❌ K线读取失败: {e}")
-            return
+            self.clear_results_for_dates([trade_date])
+            return 0
 
         if kline_all.empty:
             print("⚠️ K线为空")
-            return
+            self.clear_results_for_dates([trade_date])
+            return 0
             
         # 4. 遍历计算
         results = []
@@ -243,7 +246,14 @@ class MrgcStrategy(BaseStrategy):
 
         print(f"\n✅ 发现 {len(results)} 个信号")
         if results:
-            self.save_results(pd.DataFrame(results))
+            saved_count = self.save_results(pd.DataFrame(results))
+            from data_job.auto_f10 import enqueue_symbols
+
+            if saved_count:
+                enqueue_symbols([row['symbol'] for row in results], engine=self.engine)
+        else:
+            self.clear_results_for_dates([trade_date])
+        return len(results)
 
 if __name__ == "__main__":
     MrgcStrategy().run()

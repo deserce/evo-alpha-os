@@ -7,6 +7,7 @@ import sys
 import os
 import pandas as pd
 from datetime import datetime
+from sqlalchemy import text
 
 # ================= 环境路径适配 =================
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +59,86 @@ class SectorRPSCalculator(BaseFeatureCalculator):
         """返回计算周期"""
         return [5, 10, 20, 50, 120, 250]
 
+    def _has_sector_list(self) -> bool:
+        """判断是否存在可用的行业宇宙表。"""
+        try:
+            with self.engine.begin() as conn:
+                result = conn.execute(text("""
+                    SELECT COUNT(*)
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'sector_list'
+                """)).scalar()
+                if not result:
+                    return False
+                count = conn.execute(text("""
+                    SELECT COUNT(*)
+                    FROM sector_list
+                    WHERE sector_type = 'Industry'
+                """)).scalar()
+                return bool(count)
+        except Exception:
+            return False
+
+    def load_data(self, start_date=None):
+        """
+        加载行业指数数据。
+
+        若存在 sector_list，则只对行业宇宙计算RPS，避免历史残留的概念/指数名称混进排名。
+        """
+        condition = "WHERE p.close > 0"
+        params = {}
+        if start_date:
+            condition += " AND p.trade_date >= :start_date"
+            params["start_date"] = start_date
+
+        if self._has_sector_list():
+            query = f"""
+                SELECT p.{self.entity_column}, p.trade_date, p.close
+                FROM {self.source_table} p
+                JOIN sector_list s
+                  ON p.{self.entity_column} = s.sector_name
+                {condition}
+                  AND s.sector_type = 'Industry'
+                ORDER BY p.trade_date
+            """
+            source = "sector_list 行业宇宙"
+        else:
+            query = f"""
+                SELECT {self.entity_column}, trade_date, close
+                FROM {self.source_table} p
+                {condition}
+                ORDER BY trade_date
+            """
+            source = "sector_daily_prices 全量"
+
+        logger.info(
+            f"📥 正在读取板块数据 ({source}, Start: {start_date if start_date else 'All'})..."
+        )
+
+        try:
+            df = pd.read_sql(text(query), self.engine, params=params)
+        except Exception as e:
+            from quant_engine.common.exception_utils import DataSourceError
+            raise DataSourceError(f"读取板块数据失败: {e}")
+
+        if df.empty:
+            logger.warning("⚠️ 板块数据为空")
+            return df
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="mixed")
+        df[self.entity_column] = df[self.entity_column].astype(str).str.strip()
+        df = df[
+            (df[self.entity_column] != "")
+            & ~df[self.entity_column].str.contains(r"[\x00-\x1f]", regex=True, na=False)
+        ]
+
+        entity_count = df[self.entity_column].nunique()
+        date_range = f"{df['trade_date'].min().date()} 至 {df['trade_date'].max().date()}"
+        logger.info(f"   ✅ 加载完成: {len(df)} 行, {entity_count} 个板块, {date_range}")
+
+        return df
+
     def should_filter(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         数据过滤逻辑 - 过滤干扰板块
@@ -65,6 +146,10 @@ class SectorRPSCalculator(BaseFeatureCalculator):
         黑名单规则：
         - 包含"昨日"、"连板"、"涨停"、"ST"等关键字的板块
         """
+        if self._has_sector_list():
+            logger.info("🧹 已使用 sector_list 行业宇宙，跳过关键词黑名单二次过滤")
+            return df
+
         blacklist = CalculatorConfig.SECTOR_BLACKLIST
 
         logger.info(f"🧹 正在过滤干扰板块 (规则: {blacklist})...")

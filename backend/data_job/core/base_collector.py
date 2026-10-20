@@ -21,7 +21,8 @@ from contextlib import contextmanager
 
 # ================= 环境路径适配 =================
 current_dir = os.path.dirname(os.path.abspath(__file__))
-backend_dir = os.path.abspath(os.path.join(current_dir, ".."))
+data_job_dir = os.path.abspath(os.path.join(current_dir, ".."))
+backend_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
@@ -75,7 +76,7 @@ class BaseCollector(AntiBanMixin, ABC):
         self.logger = logging.getLogger(f"collector.{collector_name}")
 
         # 进度文件路径
-        self.progress_dir = Path(backend_dir) / "data" / "collection_progress"
+        self.progress_dir = Path(data_job_dir) / "data" / "collection_progress"
         self.progress_dir.mkdir(parents=True, exist_ok=True)
         self.progress_file = self.progress_dir / f"{collector_name}.json"
 
@@ -95,10 +96,6 @@ class BaseCollector(AntiBanMixin, ABC):
             "timeout_count": 0
         }
 
-        # 如果启用防封，配置默认代理
-        if enable_anti_ban:
-            self.configure_proxy()  # 使用默认代理配置
-
         # 最后创建session（因为需要logger和proxy配置）
         self.session = self._create_session()
 
@@ -110,13 +107,8 @@ class BaseCollector(AntiBanMixin, ABC):
             配置好的Session对象
         """
         session = requests.Session()
-
-        # 代理配置（如果启用防封，使用代理轮换）
-        if self.enable_anti_ban:
-            proxy = self.get_current_proxy()
-            if proxy:
-                session.proxies = proxy
-                self.logger.debug(f"使用代理: {proxy.get('http', 'N/A')}")
+        session.trust_env = False
+        session.proxies.clear()
 
         # 设置随机User-Agent
         if self.enable_anti_ban:

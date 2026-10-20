@@ -4,7 +4,7 @@ EvoAlpha OS - 数据库管理
 支持本地 SQLite + 云端 CockroachDB 双引擎
 """
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import QueuePool
 import logging
@@ -16,8 +16,13 @@ from app.core.config import settings
 # ================= 1. 引擎初始化函数 =================
 
 def _create_local_engine():
-    """创建本地 SQLite 引擎（Factory - MBP）"""
-    # 确保 data 目录存在
+    """创建本地 SQLite 引擎（Factory - MBP）
+
+    性能优化：
+    - 启用 WAL 模式（读写不互锁，并发读不被写阻塞）
+    - synchronous=NORMAL（WAL 下安全且更快）
+    - cache_size 64MB + mmap 256MB（减少磁盘 IO）
+    """
     import os
     data_dir = os.path.dirname(settings.LOCAL_DB_PATH)
     os.makedirs(data_dir, exist_ok=True)
@@ -27,7 +32,18 @@ def _create_local_engine():
         connect_args={"check_same_thread": False},
         echo=settings.APP_DEBUG,
     )
-    logger.info(f"✅ 本地数据库引擎已创建: {settings.LOCAL_DB_PATH}")
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=-64000")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA mmap_size=268435456")
+        cursor.close()
+
+    logger.info(f"✅ 本地数据库引擎已创建: {settings.LOCAL_DB_PATH} (WAL mode)")
     return engine
 
 

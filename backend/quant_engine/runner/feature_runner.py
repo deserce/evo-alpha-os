@@ -19,7 +19,14 @@ if backend_dir not in sys.path:
 from quant_engine.common import setup_quant_path, setup_logger
 from quant_engine.calculators.stock_rps_calculator import StockRPSCalculator
 from quant_engine.calculators.sector_rps_calculator import SectorRPSCalculator
+from quant_engine.calculators.sector_composite_rps_calculator import SectorCompositeRPSCalculator
 from quant_engine.calculators.etf_rps_calculator import ETFRPSCalculator
+from quant_engine.calculators.strength_calculator import StrengthCalculator
+from quant_engine.calculators.structure_health_calculator import StructureHealthCalculator
+from quant_engine.calculators.lifecycle_state_calculator import LifecycleStateCalculator
+from quant_engine.calculators.timing_signal_calculator import TimingSignalCalculator
+from quant_engine.calculators.risk_plan_calculator import RiskPlanCalculator
+from quant_engine.research.research_pool import ResearchPoolManager
 
 # 路径初始化
 setup_quant_path()
@@ -36,10 +43,24 @@ class FeatureRunner:
         self.calculators = {
             'stock': StockRPSCalculator(),
             'sector': SectorRPSCalculator(),
-            'etf': ETFRPSCalculator()
+            'sector_composite': SectorCompositeRPSCalculator(),
+            'etf': ETFRPSCalculator(),
+            'strength': StrengthCalculator(),
+            'structure': StructureHealthCalculator(),
+            'lifecycle': LifecycleStateCalculator(),
+            'timing': TimingSignalCalculator(),
+            'risk': RiskPlanCalculator(),
+            'research': ResearchPoolManager(),
         }
 
-    def run(self, calculator_names=None, mode='daily'):
+    def run(
+        self,
+        calculator_names=None,
+        mode='daily',
+        init_days: int | None = None,
+        target_dates: list[str] | None = None,
+        missing_only: bool = False,
+    ):
         """
         运行指定的计算器
 
@@ -49,6 +70,7 @@ class FeatureRunner:
             mode: 运行模式
                   - 'daily': 增量更新（只算最近几天）
                   - 'init': 全量初始化（重算所有历史数据）
+            init_days: init 模式下可选的最近自然日窗口；None 表示全历史
 
         Returns:
             dict: 运行结果统计
@@ -69,9 +91,11 @@ class FeatureRunner:
         total_start = time.time()
 
         logger.info("=" * 80)
-        logger.info(f"🚀 开始批量计算RPS因子")
+        logger.info(f"🚀 开始批量计算量化因子")
         logger.info(f"📋 计算器列表: {calculator_names}")
         logger.info(f"📅 运行模式: {mode}")
+        if mode == 'init':
+            logger.info(f"📅 初始化范围: {'全历史' if init_days is None else f'最近{init_days}天'}")
         logger.info("=" * 80)
 
         for name in tqdm(calculator_names, desc="🧮 RPS计算进度", unit="个"):
@@ -80,12 +104,32 @@ class FeatureRunner:
 
             try:
                 if mode == 'init':
-                    calculator.run_init()
+                    result = calculator.run_init(days=init_days)
+                elif name in {"stock", "sector", "sector_composite", "etf"}:
+                    result = calculator.run_daily(
+                        target_dates=target_dates,
+                        missing_only=missing_only,
+                    )
+                elif name in {"strength", "structure", "lifecycle"}:
+                    result = calculator.run_daily(
+                        target_dates=target_dates,
+                        missing_only=missing_only,
+                    )
                 else:
-                    calculator.run_daily()
+                    # Daily analytics only need the latest completed target. Their
+                    # own loaders still read the historical seed window they require.
+                    result = calculator.run_daily(days=1 if target_dates else 3)
 
                 elapsed = time.time() - start_time
-                results[name] = {'success': True, 'elapsed': elapsed}
+                if isinstance(result, dict):
+                    results[name] = {
+                        'success': result.get('success', True),
+                        'elapsed': result.get('elapsed', elapsed),
+                        'records': result.get('records', 0),
+                        'error': result.get('error'),
+                    }
+                else:
+                    results[name] = {'success': True, 'elapsed': elapsed, 'records': 0}
 
             except Exception as e:
                 elapsed = time.time() - start_time
@@ -118,6 +162,9 @@ def main():
   # 只运行个股和板块RPS
   python -m quant_engine.runner.feature_runner --calculators stock sector
 
+  # 运行 P0 计算链路
+  python -m quant_engine.runner.feature_runner --calculators strength structure lifecycle timing risk research
+
   # 全量初始化所有计算器
   python -m quant_engine.runner.feature_runner --mode init
 
@@ -128,13 +175,19 @@ def main():
   stock   - 个股RPS
   sector  - 板块RPS
   etf     - ETF RPS
+  strength  - 市场/行业强度
+  structure - 结构健康评分
+  lifecycle - S0-S7生命周期状态机
+  timing    - 四类买点信号
+  risk      - 风控交易计划
+  research  - 研究池每日快照
         """
     )
 
     parser.add_argument(
         '--calculators', '-c',
         nargs='+',
-        choices=['stock', 'sector', 'etf'],
+        choices=['stock', 'sector', 'sector_composite', 'etf', 'strength', 'structure', 'lifecycle', 'timing', 'risk', 'research'],
         help='指定要运行的计算器（默认运行所有）'
     )
 
@@ -145,11 +198,34 @@ def main():
         help='运行模式：daily=增量更新（默认），init=全量初始化'
     )
 
+    parser.add_argument(
+        '--init-days',
+        type=int,
+        default=None,
+        help='init 模式下仅重算最近N个自然日；默认重算源表全历史'
+    )
+    parser.add_argument(
+        '--target-dates',
+        nargs='+',
+        help='daily 模式明确待计算交易日，RPS 最多处理最近7个日期',
+    )
+    parser.add_argument(
+        '--missing-only',
+        action='store_true',
+        help='只计算目标表尚未生成的明确目标日期',
+    )
+
     args = parser.parse_args()
 
     # 运行
     runner = FeatureRunner()
-    results = runner.run(calculator_names=args.calculators, mode=args.mode)
+    results = runner.run(
+        calculator_names=args.calculators,
+        mode=args.mode,
+        init_days=args.init_days,
+        target_dates=args.target_dates,
+        missing_only=args.missing_only,
+    )
 
     # 返回退出码
     if all(r.get('success') for r in results.values()):

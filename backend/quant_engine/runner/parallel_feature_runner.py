@@ -20,6 +20,12 @@ from quant_engine.common import setup_quant_path, setup_logger
 from quant_engine.calculators.stock_rps_calculator import StockRPSCalculator
 from quant_engine.calculators.sector_rps_calculator import SectorRPSCalculator
 from quant_engine.calculators.etf_rps_calculator import ETFRPSCalculator
+from quant_engine.calculators.strength_calculator import StrengthCalculator
+from quant_engine.calculators.structure_health_calculator import StructureHealthCalculator
+from quant_engine.calculators.lifecycle_state_calculator import LifecycleStateCalculator
+from quant_engine.calculators.timing_signal_calculator import TimingSignalCalculator
+from quant_engine.calculators.risk_plan_calculator import RiskPlanCalculator
+from quant_engine.research.research_pool import ResearchPoolManager
 
 # 路径初始化
 setup_quant_path()
@@ -36,7 +42,13 @@ class ParallelFeatureRunner:
         self.calculators = {
             'stock': StockRPSCalculator(),
             'sector': SectorRPSCalculator(),
-            'etf': ETFRPSCalculator()
+            'etf': ETFRPSCalculator(),
+            'strength': StrengthCalculator(),
+            'structure': StructureHealthCalculator(),
+            'lifecycle': LifecycleStateCalculator(),
+            'timing': TimingSignalCalculator(),
+            'risk': RiskPlanCalculator(),
+            'research': ResearchPoolManager(),
         }
 
     def run(self, calculator_names=None, mode='daily', max_workers=3):
@@ -101,9 +113,12 @@ class ParallelFeatureRunner:
                 else:
                     raise ValueError(f"未知的运行模式: {mode}")
 
-                success = result.get('success', False)
-                error = result.get('error')
-                records = result.get('records', 0)
+                if isinstance(result, dict):
+                    success = result.get('success', True)
+                    error = result.get('error')
+                    records = result.get('records', 0)
+                else:
+                    success = True
 
             except Exception as e:
                 error = str(e)

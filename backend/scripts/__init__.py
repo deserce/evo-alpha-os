@@ -1,4 +1,1 @@
-"""
-EvoAlpha OS - 自动化脚本模块
-包含数据采集、量化计算、策略选股的自动化脚本
-"""
+"""Backend operational scripts package."""

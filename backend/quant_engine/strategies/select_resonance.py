@@ -27,11 +27,19 @@ class ResonanceStrategy(BaseStrategy):
     def get_strong_sectors(self, trade_date):
         """1. 找出当日 RPS > 90 的强势板块"""
         print(f"   📊 正在筛选强势板块 ({trade_date})...")
-        
-        # 我们用 quant_feature_sector_rps 表
+
+        # Prefer the versioned RPS derived from the equal-weight composite;
+        # the legacy table remains a read-only migration fallback only.
+        with self.engine.connect() as conn:
+            table_row = conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                "('quant_feature_sector_rps_v2', 'quant_feature_sector_rps') "
+                "ORDER BY CASE name WHEN 'quant_feature_sector_rps_v2' THEN 0 ELSE 1 END LIMIT 1"
+            )).fetchone()
+        sector_rps_table = str(table_row[0]) if table_row else "quant_feature_sector_rps_v2"
         query = text(f"""
             SELECT sector_name, rps_20 
-            FROM quant_feature_sector_rps 
+            FROM {sector_rps_table}
             WHERE trade_date = '{trade_date}' 
               AND rps_20 > {self.SECTOR_RPS_THRESHOLD}
         """)

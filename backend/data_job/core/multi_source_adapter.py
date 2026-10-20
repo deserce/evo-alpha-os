@@ -427,16 +427,70 @@ class TdxAdapter(DataSourceAdapter):
             return None
 
 
+class MootdxAdapterWrapper(DataSourceAdapter):
+    """
+    mootdx 数据源适配器包装类
+    mootdx 是 pytdx 的增强版，具有更好的服务器池管理
+    """
+
+    def __init__(self):
+        super().__init__("mootdx")
+        try:
+            import sys
+            import os
+            from pathlib import Path
+
+            current_dir = Path(__file__).parent.absolute()
+            if str(current_dir) not in sys.path:
+                sys.path.insert(0, str(current_dir))
+
+            from data_job.core.mootdx_adapter import MootdxAdapter
+            self.client = MootdxAdapter()
+            logger.info("✅ mootdx初始化成功")
+        except Exception as e:
+            logger.warning(f"⚠️  mootdx初始化失败: {e}")
+            self.client = None
+
+    def is_available(self) -> bool:
+        """检查是否可用"""
+        return self.client is not None and self.client.is_available()
+
+    def get_stock_kline(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = 'qfq'
+    ) -> Optional[pd.DataFrame]:
+        """获取股票K线数据"""
+        if not self.is_available():
+            return None
+
+        try:
+            df = self.client.get_stock_kline(symbol, start_date, end_date)
+            if df is not None and not df.empty:
+                self.success_count += 1
+                return df
+            else:
+                self.fail_count += 1
+                return None
+        except Exception as e:
+            logger.warning(f"mootdx获取{symbol}失败: {e}")
+            self.fail_count += 1
+            return None
+
+
 class MultiSourceAdapter:
     """
     多数据源适配器
 
     优先级：
     1. pytdx (通达信协议，K线数据首选)
-    2. Tushare (最稳定，需token)
-    3. EFinance (免费稳定)
-    4. AKShare (免费但限制多)
-    5. BaoStock (免费但慢)
+    2. mootdx (pytdx增强版，更好的服务器管理)
+    3. Tushare (最稳定，需token)
+    4. EFinance (免费稳定)
+    5. AKShare (免费但限制多)
+    6. BaoStock (免费但慢)
     """
 
     def __init__(
@@ -459,8 +513,8 @@ class MultiSourceAdapter:
         if sources is None:
             # 根据数据类型设置默认优先级
             if data_type == "kline":
-                # K线数据：pytdx 优先
-                sources = ['pytdx', 'efinance', 'akshare', 'baostock']
+                # K线数据：pytdx优先，mootdx作为备用
+                sources = ['pytdx', 'mootdx', 'efinance', 'akshare', 'baostock']
             elif data_type == "finance":
                 # 财务数据：efinance 优先
                 sources = ['efinance', 'akshare']
@@ -470,6 +524,10 @@ class MultiSourceAdapter:
         for source_name in sources:
             if source_name == 'pytdx':
                 adapter = TdxAdapter()
+                if adapter.is_available():
+                    self.sources.append(adapter)
+            elif source_name == 'mootdx':
+                adapter = MootdxAdapterWrapper()
                 if adapter.is_available():
                     self.sources.append(adapter)
             elif source_name == 'tushare' and tushare_token:

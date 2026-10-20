@@ -15,6 +15,9 @@ class CalculatorConfig:
     # 增量更新窗口大小（天数）
     INCREMENTAL_WINDOW_DAYS = 400  # 计算250日RPS，往前推400天
 
+    # 日常任务最多补最近多少个自然日的 RPS 缺口；更早历史缺口走专项修复
+    DAILY_MAX_BACKFILL_DAYS = 7
+
     # 保存时保留的最新天数
     SAVE_RECENT_DAYS = 3
 

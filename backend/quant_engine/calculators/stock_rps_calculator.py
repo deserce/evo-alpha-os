@@ -33,7 +33,7 @@ class StockRPSCalculator(BaseFeatureCalculator):
 
     数据表：
     - 源表: stock_daily_prices
-    - 目标表: quant_feature_stock_rps
+    - 目标表: quant_feature_rps
     """
 
     def get_source_table(self) -> str:
@@ -42,7 +42,7 @@ class StockRPSCalculator(BaseFeatureCalculator):
 
     def get_target_table(self) -> str:
         """返回目标表名"""
-        return "quant_feature_stock_rps"
+        return "quant_feature_rps"
 
     def get_entity_column(self) -> str:
         """返回标的列名"""

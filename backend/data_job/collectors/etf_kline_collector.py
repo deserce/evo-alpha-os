@@ -4,6 +4,7 @@ EvoAlpha OS - ETF K线数据采集器
 """
 
 import time
+import argparse
 import pandas as pd
 import akshare as ak
 from sqlalchemy import text
@@ -14,6 +15,8 @@ from data_job.common import setup_network_emergency_kit, setup_backend_path, set
 
 # 基类导入
 from data_job.core.base_collector import BaseCollector
+from data_job.core.mootdx_adapter import MootdxAdapter
+from data_core.market_calendar import is_a_share_session
 
 from app.core.database import get_active_engines
 
@@ -23,6 +26,19 @@ setup_network_emergency_kit()
 
 # Logger配置
 logger = setup_logger(__name__)
+
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
+
+
+def latest_completed_trading_date(now: datetime | None = None):
+    current = now or datetime.now()
+    candidate = current.date()
+    if (current.hour, current.minute) < (MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE):
+        candidate -= timedelta(days=1)
+    while not is_a_share_session(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
 
 
 class ETFKlineCollector(BaseCollector):
@@ -37,6 +53,8 @@ class ETFKlineCollector(BaseCollector):
         )
         self.engines = get_active_engines()
         self.table_name = "etf_daily_prices"
+        self.http_failure_count = 0
+        self.http_circuit_threshold = 3
 
     def _init_table(self):
         """初始化 ETF K线表"""
@@ -114,9 +132,72 @@ class ETFKlineCollector(BaseCollector):
 
         return last_dates
 
-    def fetch_etf_kline(self, symbol, start_date=None, end_date=None):
+    def _normalize_etf_kline(
+        self,
+        symbol,
+        df,
+        save_start=None,
+        save_end=None,
+    ):
+        """统一 ETF K 线字段，先计算涨跌幅再裁剪保存窗口。"""
+        if df is None or df.empty:
+            return None
+
+        df = df.copy()
+        df = df.rename(columns={
+            '日期': 'trade_date',
+            '开盘': 'open',
+            '收盘': 'close',
+            '最高': 'high',
+            '最低': 'low',
+            '成交量': 'volume',
+            '成交额': 'amount',
+            '涨跌幅': 'pct_chg',
+        })
+
+        if "trade_date" not in df.columns:
+            logger.warning(f"⚠️  ETF {symbol} 缺少 trade_date 字段")
+            return None
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        df["symbol"] = symbol
+        for col in ["open", "high", "low", "close", "volume", "amount", "pct_chg"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last")
+        if "pct_chg" not in df.columns or df["pct_chg"].isna().all():
+            df["pct_chg"] = df["close"].pct_change() * 100
+
+        if save_start:
+            df = df[df["trade_date"] >= pd.to_datetime(save_start)]
+        if save_end:
+            df = df[df["trade_date"] <= pd.to_datetime(save_end)]
+
+        columns = ['symbol', 'trade_date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+        df = df[[c for c in columns if c in df.columns]]
+        if df.empty:
+            return None
+        return df.reset_index(drop=True)
+
+    def _fetch_from_tdx(self, adapter, symbol, start_date=None, end_date=None, max_bars=None):
+        if adapter is None or not adapter.is_available():
+            return None
+
+        df = adapter.get_etf_kline(
+            symbol,
+            start_date=start_date.strftime("%Y-%m-%d") if start_date else None,
+            end_date=end_date.strftime("%Y-%m-%d") if end_date else None,
+            period="daily",
+            max_bars=max_bars,
+        )
+        if df is None or df.empty:
+            return None
+        return df
+
+    def _fetch_from_eastmoney(self, symbol, start_date=None, end_date=None):
         """
-        获取单个 ETF 的K线数据
+        使用 Eastmoney/AkShare HTTP 获取单个 ETF 的K线数据。
 
         Args:
             symbol: ETF 代码
@@ -126,6 +207,12 @@ class ETFKlineCollector(BaseCollector):
         Returns:
             DataFrame: K线数据
         """
+        if self.http_failure_count >= self.http_circuit_threshold:
+            logger.warning(
+                f"⚠️  HTTP ETF源熔断，跳过 {symbol}: failures={self.http_failure_count}"
+            )
+            return None
+
         try:
             if end_date is None:
                 end_date = datetime.now()
@@ -136,43 +223,62 @@ class ETFKlineCollector(BaseCollector):
             start_str = start_date.strftime('%Y%m%d')
             end_str = end_date.strftime('%Y%m%d')
 
-            # 使用基类的重试机制
             df = self._retry_call(
                 ak.fund_etf_hist_em,
+                max_retries=2,
                 symbol=symbol, period="daily", start_date=start_str, end_date=end_str
             )
 
-            if df.empty:
+            if df is None or df.empty:
+                self.http_failure_count += 1
                 logger.warning(f"⚠️  ETF {symbol} 无K线数据")
                 return None
-
-            # 数据清洗：中文字段映射
-            df = df.rename(columns={
-                '日期': 'trade_date',
-                '开盘': 'open',
-                '收盘': 'close',
-                '最高': 'high',
-                '最低': 'low',
-                '成交量': 'volume',
-                '成交额': 'amount',
-                '涨跌幅': 'pct_chg'
-            })
-
-            # 转换日期
-            df['trade_date'] = pd.to_datetime(df['trade_date'])
-
-            # 添加 symbol 列
-            df['symbol'] = symbol
-
-            # 选择需要的列
-            df = df[['symbol', 'trade_date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']]
 
             logger.info(f"  ✅ {symbol}: {len(df)} 条K线数据")
             return df
 
         except Exception as e:
+            self.http_failure_count += 1
             logger.error(f"❌ 获取 ETF {symbol} K线失败: {e}")
             return None
+
+    def fetch_etf_kline(
+        self,
+        symbol,
+        start_date=None,
+        end_date=None,
+        save_start=None,
+        save_end=None,
+        max_bars=None,
+        tdx_adapter=None,
+    ):
+        """获取单个 ETF K 线，TDX 优先，HTTP 源只做降级。"""
+        df = self._fetch_from_tdx(
+            tdx_adapter,
+            symbol,
+            start_date=start_date,
+            end_date=end_date,
+            max_bars=max_bars,
+        )
+        if df is not None and not df.empty:
+            normalized = self._normalize_etf_kline(
+                symbol,
+                df,
+                save_start=save_start,
+                save_end=save_end,
+            )
+            if normalized is not None and not normalized.empty:
+                logger.info(f"  ✅ {symbol}: TDX采集 {len(normalized)} 条K线数据")
+                return normalized
+
+        logger.warning(f"  ⚠️  ETF {symbol} TDX无数据，回退 HTTP 源")
+        df = self._fetch_from_eastmoney(symbol, start_date=start_date, end_date=end_date)
+        return self._normalize_etf_kline(
+            symbol,
+            df,
+            save_start=save_start,
+            save_end=save_end,
+        )
 
     def save_etf_kline(self, symbol, df):
         """
@@ -183,26 +289,46 @@ class ETFKlineCollector(BaseCollector):
             df: K线数据
         """
         if df is None or df.empty:
-            return
+            return False
+
+        save_df = df.copy()
+        save_df["trade_date"] = pd.to_datetime(save_df["trade_date"]).dt.strftime("%Y-%m-%d")
+        start_date = save_df["trade_date"].min()
+        end_date = save_df["trade_date"].max()
+        saved = False
 
         for mode, engine in self.engines:
             try:
                 with engine.begin() as conn:
-                    # 删除旧数据
+                    # 只覆盖本次返回的日期区间，避免增量更新误删历史数据。
                     conn.execute(text(f"""
                         DELETE FROM {self.table_name}
                         WHERE symbol = :symbol
-                    """), {"symbol": symbol})
+                          AND DATE(trade_date) BETWEEN DATE(:start_date) AND DATE(:end_date)
+                    """), {
+                        "symbol": symbol,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    })
 
                     # 插入新数据（使用 chunksize 避免 SQLite 变量限制）
-                    df.to_sql(self.table_name, conn, if_exists='append', index=False,
-                             method='multi', chunksize=100)
+                    save_df.to_sql(
+                        self.table_name,
+                        conn,
+                        if_exists='append',
+                        index=False,
+                        method='multi',
+                        chunksize=100,
+                    )
 
-                logger.debug(f"✅ [{mode}] {symbol} 保存 {len(df)} 条K线")
+                saved = True
+                logger.debug(f"✅ [{mode}] {symbol} 保存 {len(save_df)} 条K线")
             except Exception as e:
                 logger.error(f"❌ [{mode}] 保存 {symbol} K线失败: {e}")
 
-    def run(self, symbols=None, days=1095):
+        return saved
+
+    def run(self, symbols=None, days=1095, start=None, end=None, max_bars=None):
         """
         执行 ETF K线采集
 
@@ -219,7 +345,7 @@ class ETFKlineCollector(BaseCollector):
         except Exception as e:
             logger.error(f"❌ 健康检查失败: {e}")
             self.log_collection_end(False, str(e))
-            return
+            return False
 
         # 初始化表
         self._init_table()
@@ -231,58 +357,153 @@ class ETFKlineCollector(BaseCollector):
         if not symbols:
             logger.error("❌ 未找到 ETF 列表，请先运行 etf_info_collector.py")
             self.log_collection_end(False, "无ETF列表")
-            return
+            return False
 
         # 获取增量更新进度
         last_dates = self.get_last_dates()
-        today = date.today()
+        target_end = pd.to_datetime(end).date() if end else latest_completed_trading_date()
+        explicit_start = pd.to_datetime(start).date() if start else None
+        tdx_adapter = MootdxAdapter(max_retries=2, timeout=8)
 
         # 采集每个 ETF 的K线
         success_count = 0
         skipped_count = 0
+        fail_count = 0
         for i, symbol in enumerate(symbols, 1):
             logger.info(f"[{i}/{len(symbols)}] 采集 {symbol}...")
 
             try:
                 # 增量更新：检查最后日期
                 last_date = last_dates.get(symbol)
-                start_date = None
+                start_date = explicit_start
+                save_start = explicit_start
 
-                if last_date:
+                if explicit_start:
+                    start_date = explicit_start - timedelta(days=10)
+                    logger.info(f"  📅 指定窗口: {explicit_start} 至 {target_end}")
+                elif last_date:
                     # 如果已有数据，检查是否需要更新
-                    if last_date >= today:
+                    if last_date >= target_end:
                         logger.info(f"  ⏭️  {symbol} 数据已是最新 (最后日期: {last_date})")
                         skipped_count += 1
                         continue
                     else:
-                        # 从最后日期+1天开始采集
-                        start_date = last_date + timedelta(days=1)
-                        logger.info(f"  📅 增量更新: {start_date} 至今")
+                        # 多取一个历史窗口，先算 pct_chg，再只保存新日期。
+                        save_start = last_date + timedelta(days=1)
+                        start_date = max(last_date - timedelta(days=10), date(1990, 1, 1))
+                        logger.info(f"  📅 增量更新: {save_start} 至 {target_end}")
                 else:
                     # 首次采集，采集最近3年数据
-                    start_date = today - timedelta(days=1095)
-                    logger.info(f"  🆕 首次采集: 从 {start_date} 至今")
+                    start_date = target_end - timedelta(days=days)
+                    save_start = start_date
+                    logger.info(f"  🆕 首次采集: 从 {start_date} 至 {target_end}")
 
-                df = self.fetch_etf_kline(symbol, start_date=start_date, end_date=datetime.now())
+                effective_max_bars = max_bars
+                if effective_max_bars is None:
+                    effective_max_bars = 60 if last_date else days + 30
+
+                df = self.fetch_etf_kline(
+                    symbol,
+                    start_date=start_date,
+                    end_date=datetime.combine(target_end, datetime.min.time()),
+                    save_start=save_start,
+                    save_end=target_end,
+                    max_bars=effective_max_bars,
+                    tdx_adapter=tdx_adapter,
+                )
                 if df is not None and not df.empty:
-                    self.save_etf_kline(symbol, df)
-                    success_count += 1
-                    logger.info(f"  ✅ {symbol} 采集成功: {len(df)} 条记录")
+                    if self.save_etf_kline(symbol, df):
+                        success_count += 1
+                        logger.info(f"  ✅ {symbol} 采集成功: {len(df)} 条记录")
+                    else:
+                        fail_count += 1
+                        logger.error(f"  ❌ {symbol} 保存失败")
                 elif df is not None and df.empty:
                     logger.info(f"  ℹ️  {symbol} 无新数据")
                     skipped_count += 1
+                else:
+                    fail_count += 1
 
                 # 避免请求过快
                 time.sleep(self.request_delay)
 
             except Exception as e:
                 logger.error(f"❌ {symbol} 采集失败: {e}")
+                fail_count += 1
                 continue
 
-        logger.info(f"🎉 ETF K线采集完成，成功 {success_count}/{len(symbols)}，跳过 {skipped_count}")
-        self.log_collection_end(True, f"成功 {success_count}/{len(symbols)}，跳过 {skipped_count}")
+        logger.info(
+            f"🎉 ETF K线采集完成，成功 {success_count}/{len(symbols)}，"
+            f"跳过 {skipped_count}，失败 {fail_count}"
+        )
+        if success_count == 0 and skipped_count == 0:
+            message = f"无成功 ETF，失败 {fail_count}/{len(symbols)}"
+            self.log_collection_end(False, message)
+            return False
+
+        stale_count = self._count_missing_target_rows(symbols, target_end)
+        if stale_count:
+            message = f"目标日 {target_end} 缺失 ETF 数={stale_count}"
+            logger.error(f"❌ {message}")
+            self.log_collection_end(False, message)
+            return False
+
+        if fail_count:
+            message = f"ETF 保存/采集失败 {fail_count}/{len(symbols)}"
+            logger.error(f"❌ {message}")
+            self.log_collection_end(False, message)
+            return False
+
+        self.log_collection_end(
+            True,
+            f"成功 {success_count}/{len(symbols)}，跳过 {skipped_count}，失败 {fail_count}",
+        )
+        return True
+
+    def _count_missing_target_rows(self, symbols, target_date):
+        """统计目标日仍缺失的 ETF 数量。"""
+        if not symbols:
+            return 0
+
+        missing = len(symbols)
+        for _mode, engine in self.engines:
+            try:
+                unique_symbols = sorted(set(symbols))
+                placeholders = ", ".join(f":symbol_{i}" for i, _symbol in enumerate(unique_symbols))
+                params = {
+                    "target_date": target_date.strftime("%Y-%m-%d"),
+                    **{f"symbol_{i}": symbol for i, symbol in enumerate(unique_symbols)},
+                }
+                with engine.connect() as conn:
+                    row = conn.execute(text(f"""
+                        SELECT COUNT(DISTINCT symbol)
+                        FROM {self.table_name}
+                        WHERE DATE(trade_date) = DATE(:target_date)
+                          AND symbol IN ({placeholders})
+                    """), params).fetchone()
+                    present = int(row[0]) if row else 0
+                    missing = len(unique_symbols) - present
+                    break
+            except Exception as e:
+                logger.warning(f"⚠️  ETF 目标日缺失检查失败: {e}")
+        return missing
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Collect ETF daily K-lines")
+    parser.add_argument("--start", help="start date, e.g. 2026-06-03")
+    parser.add_argument("--end", help="end date, e.g. 2026-06-04")
+    parser.add_argument("--max-bars", type=int, default=None, help="max recent TDX bars")
+    parser.add_argument("--symbols", help="comma separated ETF symbols")
+    args = parser.parse_args()
+
+    symbols = [item.strip() for item in args.symbols.split(",") if item.strip()] if args.symbols else None
     collector = ETFKlineCollector()
-    collector.run()
+    raise SystemExit(
+        0 if collector.run(
+            symbols=symbols,
+            start=args.start,
+            end=args.end,
+            max_bars=args.max_bars,
+        ) else 1
+    )

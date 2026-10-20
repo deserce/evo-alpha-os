@@ -4,6 +4,7 @@
 
 # Batch 1: Simple Collectors
 from .stock_valuation_collector import StockValuationCollector
+from .stock_enrichment_collector import StockEnrichmentCollector
 from .macro_data_collector import MacroDataCollector
 from .limit_boards_collector import LimitBoardsCollector
 from .index_data_collector import IndexDataCollector
@@ -21,10 +22,12 @@ from .etf_info_collector import ETFInfoCollector
 from .finance_summary_collector import FinanceSummaryCollector
 from .news_collector import NewsCollector
 from .stock_sector_list_collector import StockSectorListCollector
+from .bse_index_collector import BSEIndexCollector
 
 __all__ = [
     # Batch 1: Simple Collectors
     'StockValuationCollector',
+    'StockEnrichmentCollector',
     'MacroDataCollector',
     'LimitBoardsCollector',
     'IndexDataCollector',
@@ -40,4 +43,5 @@ __all__ = [
     'FinanceSummaryCollector',
     'NewsCollector',
     'StockSectorListCollector',
+    'BSEIndexCollector',
 ]

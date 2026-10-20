@@ -4,7 +4,7 @@ import sys
 import os
 import traceback
 import pandas as pd
-from datetime import datetime, date
+from datetime import date
 from sqlalchemy import text
 
 # ================= 环境路径适配 =================
@@ -18,42 +18,126 @@ from app.core.database import get_engine
 # ================= 配置 =================
 # 筛选逻辑配置
 # 只要符合以下任一条件即可入选核心股票池
-FUND_RATIO_THRESHOLD = 5.0   # 基金持仓: 基金持股数/总股本 > 5%（最近3季度任意满足）
+FUND_RATIO_THRESHOLD = 5.0   # 基金持仓: 基金持股数/流通股本 > 5%（最近3季度任意满足）
 NORTH_MIN_VALUE = 100000000  # 北向持仓: 持股市值 > 1亿元 (单位: 元)
+NORTH_STALE_WARNING_DAYS = 31  # 北向数据超过该天数时继续参与，但必须提示旧数据风险
 
 class StockPoolMaintainer:
     def __init__(self):
         self.engine = get_engine()
         self.target_table = "quant_stock_pool"  # 标准化后的表名
 
+    def _table_exists(self, table_name: str) -> bool:
+        sql = text("""
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = :table_name
+            LIMIT 1
+        """)
+        with self.engine.connect() as conn:
+            return conn.execute(sql, {"table_name": table_name}).first() is not None
+
+    def _scalar(self, sql: str):
+        with self.engine.connect() as conn:
+            return conn.execute(text(sql)).scalar()
+
+    def _ensure_target_table(self) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {self.target_table} (
+                    pool_name VARCHAR(50),
+                    symbol VARCHAR(20),
+                    name VARCHAR(50),
+                    add_date DATE,
+                    reason TEXT,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    PRIMARY KEY (pool_name, symbol, add_date)
+                )
+            """))
+
     def refresh_pool(self):
         print("🏊‍♂️ 开始清洗 [核心股票池] (基本面筛选)...")
         print(f"   💡 筛选标准（符合任一即可）:")
         print(f"      1. 基金持股比例 ≥ {FUND_RATIO_THRESHOLD}%（最近3季度任意满足）")
         print(f"      2. 北向资金持仓 ≥ 1亿元")
+        self._ensure_target_table()
 
         # 使用 SQLite 兼容的语法
-        # 基金持股比例 = 基金持股数 / 总股本 × 100%
-        # 总股本 = 总市值 / 收盘价
+        # 基金持股比例 = 基金持股数 / 流通股本 × 100%
+        # 流通股本 = 流通市值 / 收盘价
         # 北向持仓：直接使用hold_value（单位：元）
 
-        # 获取最近日期作为基准
-        max_fund_date = pd.read_sql(
-            "SELECT MAX(report_date) as max_date FROM finance_fund_holdings",
-            self.engine
-        ).iloc[0]['max_date']
+        if not self._table_exists("finance_fund_holdings"):
+            print("⚠️ finance_fund_holdings 表不存在，无法重建核心股票池。")
+            return
+        if not self._table_exists("stock_valuation_daily"):
+            print("⚠️ stock_valuation_daily 表不存在，无法计算基金持股比例。")
+            return
+
+        max_fund_date = self._scalar("SELECT MAX(report_date) FROM finance_fund_holdings")
+        max_valuation_date = self._scalar("SELECT MAX(trade_date) FROM stock_valuation_daily")
+        if not max_fund_date or not max_valuation_date:
+            print("⚠️ 基金持仓或估值表为空，无法重建核心股票池。")
+            return
 
         # 计算9个月前的日期（最近3个季度）
         max_date_obj = pd.to_datetime(max_fund_date)
         cutoff_date = (max_date_obj - pd.DateOffset(months=9)).strftime('%Y-%m-%d')
 
         print(f"   📅 基金数据范围: {cutoff_date} 至 {max_fund_date}（最近3季度）")
+        print(f"   📅 估值基准日: {max_valuation_date}")
+
+        use_northbound = False
+        max_north_date = None
+        if self._table_exists("stock_northbound_holdings"):
+            max_north_date = self._scalar("SELECT MAX(hold_date) FROM stock_northbound_holdings")
+            if max_north_date:
+                stale_days = (
+                    pd.to_datetime(max_valuation_date) - pd.to_datetime(max_north_date)
+                ).days
+                use_northbound = True
+                print(f"   📅 北向基准日: {max_north_date}")
+                if stale_days > NORTH_STALE_WARNING_DAYS:
+                    print(f"   ⚠️ 北向数据已陈旧 {stale_days} 天，仍按最后可得数据参与筛选。")
+
+        if not use_northbound:
+            print("   ℹ️ 北向数据缺失或不可用，本次降级为基金持仓筛选。")
+
+        latest_north_cte = """
+        LatestNorth AS (
+            SELECT symbol, hold_value
+            FROM stock_northbound_holdings
+            WHERE hold_date = (SELECT MAX(hold_date) FROM stock_northbound_holdings)
+        ),
+        """ if use_northbound else """
+        LatestNorth AS (
+            SELECT NULL AS symbol, 0.0 AS hold_value
+            WHERE 0
+        ),
+        """
+
+        reason_case = f"""
+                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD}
+                     AND COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE} THEN '基金+北向双重符合'
+                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD} THEN '基金重仓'
+                WHEN COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE} THEN '北向重仓'
+        """ if use_northbound else f"""
+                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD} THEN '基金重仓'
+        """
+
+        north_where = (
+            f"OR COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE}"
+            if use_northbound
+            else ""
+        )
 
         sql_filter = text(f"""
         WITH LatestValuation AS (
-            SELECT code, total_mv, price
+            SELECT code, circ_mv, price
             FROM stock_valuation_daily v1
             WHERE trade_date = (SELECT MAX(trade_date) FROM stock_valuation_daily)
+              AND COALESCE(circ_mv, 0) > 0
+              AND COALESCE(price, 0) > 0
         ),
         FundLast3Quarters AS (
             SELECT DISTINCT
@@ -66,16 +150,13 @@ class StockPoolMaintainer:
         FundRatio AS (
             SELECT
                 f.symbol,
-                MAX(CAST(f.hold_count AS REAL) / (v.total_mv / v.price) * 100.0) as max_fund_ratio
+                MAX(CAST(f.hold_count AS REAL) / (v.circ_mv / v.price) * 100.0) as max_fund_ratio
             FROM FundLast3Quarters f
             JOIN LatestValuation v ON f.symbol = v.code
+            WHERE COALESCE(f.hold_count, 0) > 0
             GROUP BY f.symbol
         ),
-        LatestNorth AS (
-            SELECT symbol, hold_value
-            FROM stock_northbound_holdings n1
-            WHERE hold_date = (SELECT MAX(hold_date) FROM stock_northbound_holdings)
-        ),
+        {latest_north_cte}
         BasicInfo AS (
             SELECT symbol, name FROM stock_info
         )
@@ -84,17 +165,14 @@ class StockPoolMaintainer:
             b.name,
             'core_pool' as pool_name,
             CASE
-                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD}
-                     AND COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE} THEN '基金+北向双重符合'
-                WHEN COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD} THEN '基金重仓'
-                WHEN COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE} THEN '北向重仓'
+{reason_case}
             END as reason
         FROM BasicInfo b
         LEFT JOIN FundRatio fr ON b.symbol = fr.symbol
         LEFT JOIN LatestNorth n ON b.symbol = n.symbol
         WHERE
             COALESCE(fr.max_fund_ratio, 0) >= {FUND_RATIO_THRESHOLD}
-            OR COALESCE(n.hold_value, 0) >= {NORTH_MIN_VALUE}
+            {north_where}
         """)
         
         try:
@@ -119,19 +197,6 @@ class StockPoolMaintainer:
             # 这样不会误删其他策略（比如人工精选）的池子
             
             with self.engine.begin() as conn:
-                # 先初始化表（如果不存在）
-                conn.execute(text(f"""
-                    CREATE TABLE IF NOT EXISTS {self.target_table} (
-                        pool_name VARCHAR(50),
-                        symbol VARCHAR(20),
-                        name VARCHAR(50),
-                        add_date DATE,
-                        reason TEXT,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        PRIMARY KEY (pool_name, symbol, add_date)
-                    )
-                """))
-                
                 # 清除旧的 'core_pool' 数据
                 conn.execute(text(f"DELETE FROM {self.target_table} WHERE pool_name = 'core_pool'"))
                 

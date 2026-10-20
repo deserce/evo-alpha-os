@@ -12,7 +12,7 @@
 
 | 表名 | 说明 |
 |------|------|
-| `quant_feature_stock_rps` | 个股RPS数据 |
+| `quant_feature_rps` | 个股RPS数据 |
 | `quant_feature_sector_rps` | 板块RPS数据 |
 | `stock_daily_prices` | 个股行情 |
 | `stock_info` | 股票基本信息 |

@@ -39,6 +39,21 @@ class StockRPSQuery:
             self.conn.close()
             self.conn = None
 
+    def _sector_rps_table(self) -> str:
+        """Return the canonical sector RPS table when it is installed.
+
+        The table name comes only from SQLite metadata, never from a caller,
+        so the interpolated identifier remains safe while old databases can
+        still be inspected during the additive migration.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('quant_feature_sector_rps_v2', 'quant_feature_sector_rps') "
+            "ORDER BY CASE name WHEN 'quant_feature_sector_rps_v2' THEN 0 ELSE 1 END"
+        ).fetchall()
+        return str(rows[0][0]) if rows else "quant_feature_sector_rps_v2"
+
     def query_stock_rps(
         self,
         symbol: str,
@@ -73,7 +88,7 @@ class StockRPSQuery:
             SELECT symbol, trade_date,
                    rps_5, rps_10, rps_20, rps_50, rps_120, rps_250,
                    chg_5, chg_10, chg_20, chg_50, chg_120, chg_250
-            FROM quant_feature_stock_rps
+            FROM quant_feature_rps
             WHERE symbol = ? AND trade_date LIKE ?
         """
 
@@ -133,7 +148,7 @@ class StockRPSQuery:
         # 1. 查询个股RPS
         stock_rps = pd.read_sql("""
             SELECT rps_20, rps_50, rps_120, rps_250
-            FROM quant_feature_stock_rps
+            FROM quant_feature_rps
             WHERE symbol = ? AND trade_date LIKE ?
         """, conn, params=[symbol, f'{trade_date}%'])
 
@@ -208,7 +223,7 @@ class StockRPSQuery:
         # 1. 查询个股RPS
         stock_rps = pd.read_sql("""
             SELECT rps_5, rps_10, rps_20, rps_50, rps_120, rps_250
-            FROM quant_feature_stock_rps
+            FROM quant_feature_rps
             WHERE symbol = ? AND trade_date LIKE ?
         """, conn, params=[symbol, f'{trade_date}%'])
 
@@ -238,9 +253,10 @@ class StockRPSQuery:
             placeholders = ','.join(['?' for _ in sector_names])
 
             # 查询这些概念板块的RPS数据
+            sector_rps_table = self._sector_rps_table()
             sector_rps = pd.read_sql(f"""
                 SELECT sr.sector_name, sr.rps_5, sr.rps_10, sr.rps_20, sr.rps_50, sr.rps_120, sr.rps_250
-                FROM quant_feature_sector_rps sr
+                FROM {sector_rps_table} sr
                 WHERE sr.trade_date LIKE ? AND sr.sector_name IN ({placeholders})
                 ORDER BY sr.rps_20 DESC
             """, conn, params=[f'{trade_date}%'] + sector_names)
@@ -296,7 +312,7 @@ class StockRPSQuery:
         # 查询个股RPS
         stock_rps = pd.read_sql("""
             SELECT rps_20, rps_50, rps_120, rps_250
-            FROM quant_feature_stock_rps
+            FROM quant_feature_rps
             WHERE symbol = ? AND trade_date LIKE ?
         """, conn, params=[symbol, f'{trade_date}%'])
 
@@ -313,9 +329,10 @@ class StockRPSQuery:
             result['stock_name'] = stock_info.iloc[0]['name']
 
         # 获取板块RPS排名
-        sector_rps = pd.read_sql("""
+        sector_rps_table = self._sector_rps_table()
+        sector_rps = pd.read_sql(f"""
             SELECT s.sector_name, sr.rps_20, sr.rps_50, sr.rps_120, sr.rps_250
-            FROM quant_feature_sector_rps sr
+            FROM {sector_rps_table} sr
             JOIN sector_list s ON sr.sector_name = s.sector_name
             WHERE sr.trade_date LIKE ?
             ORDER BY sr.rps_20 DESC

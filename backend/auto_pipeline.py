@@ -484,20 +484,21 @@ class AutoTradingPipeline:
 
 
 def main():
-    """主函数"""
+    """兼容旧命令，实际转发到唯一生产入口。"""
     import argparse
+    import subprocess
 
     parser = argparse.ArgumentParser(
-        description="EvoAlpha OS 自动化交易流水线调度器",
+        description="EvoAlpha OS 自动化交易流水线调度器（兼容入口，已转发到生产入口）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 架构说明:
   data_job/      → 数据层（采集）
   quant_engine/  → 量化层（计算+选股）
-  auto_pipeline  → 调度层（编排）
+  scripts/run_daily_data_workflow.py  → 唯一生产入口
 
 示例:
-  # 启动定时调度（推荐用于生产环境）
+  # 启动定时调度
   python auto_pipeline.py --mode schedule
 
   # 立即运行每日流水线
@@ -507,8 +508,8 @@ def main():
   python auto_pipeline.py --mode quarterly
 
 流水线说明:
-  每日流水线: 数据采集 → RPS计算 → 策略选股
-  季度流水线: 数据采集 → 更新股票池 → RPS计算 → 策略选股
+  每日流水线: 采集 → RPS → 强度 → 结构 → 股票池 → 生命周期
+  季度流水线: 每日流水线 + 季度财务/基金数据
         """
     )
 
@@ -521,24 +522,16 @@ def main():
 
     args = parser.parse_args()
 
-    pipeline = AutoTradingPipeline()
-
+    logger.warning("auto_pipeline.py 已归档为兼容入口；生产入口是 scripts/run_daily_data_workflow.py")
     if args.mode == 'schedule':
-        # 定时调度模式
-        pipeline.setup_jobs()
-        pipeline.start()
-
-    elif args.mode == 'daily':
-        # 立即运行每日流水线
-        logger.info("🚀 手动模式：立即运行每日自动化交易流水线")
-        success = pipeline.run_daily_pipeline()
-        sys.exit(0 if success else 1)
-
+        command = [sys.executable, "scripts/schedule_daily_data_workflow.py"]
     elif args.mode == 'quarterly':
-        # 立即运行季度流水线
-        logger.info("🚀 手动模式：立即运行季度自动化交易流水线")
-        success = pipeline.run_quarterly_pipeline()
-        sys.exit(0 if success else 1)
+        command = [sys.executable, "scripts/run_daily_data_workflow.py", "--include-quarterly"]
+    else:
+        command = [sys.executable, "scripts/run_daily_data_workflow.py"]
+
+    completed = subprocess.run(command, cwd=Path(__file__).parent)
+    sys.exit(completed.returncode)
 
 
 if __name__ == "__main__":
