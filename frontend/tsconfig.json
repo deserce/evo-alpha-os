@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2017",
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
@@ -19,7 +23,9 @@
       }
     ],
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": [
+        "./src/*"
+      ]
     }
   },
   "include": [
@@ -28,7 +34,29 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts"
+    "**/*.mts",
+    ".next-stage/types/**/*.ts",
+    ".next-stage/dev/types/**/*.ts",
+    ".next-structure-20260922/types/**/*.ts",
+    ".next-structure-20260922/dev/types/**/*.ts",
+    ".next-structure-r2-20260922/types/**/*.ts",
+    ".next-structure-r2-20260922/dev/types/**/*.ts",
+    ".next-ui-20261003/types/**/*.ts",
+    ".next-ui-20261003/dev/types/**/*.ts",
+    ".next-ui-final-20261003/types/**/*.ts",
+    ".next-ui-final-20261003/dev/types/**/*.ts",
+    ".next-ui-check-20261003/types/**/*.ts",
+    ".next-ui-check-20261003/dev/types/**/*.ts",
+    ".next-ui-ready-20261003/types/**/*.ts",
+    ".next-ui-ready-20261003/dev/types/**/*.ts",
+    ".next-portfolio-one-screen-20261003/types/**/*.ts",
+    ".next-portfolio-one-screen-20261003/dev/types/**/*.ts",
+    ".next-portfolio-one-screen-v2-20261003/types/**/*.ts",
+    ".next-portfolio-one-screen-v2-20261003/dev/types/**/*.ts",
+    ".next-finance-six-year-20261003/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    "src/components/_backup"
+  ]
 }

@@ -23,8 +23,8 @@ export default function SectorMatrix() {
     queryFn: () => marketApi.getRpsMatrix(period),
   });
 
-  if (isLoading) return <div className="h-[1500px] w-full bg-[#111417] flex items-center justify-center text-[#8a8d91] animate-pulse border border-[#1e2226] rounded">数据加载中...</div>;
-  if (!data || !data.data || data.data.length === 0) return <div className="h-[1500px] w-full bg-[#111417] flex items-center justify-center text-[#8a8d91] border border-[#1e2226] rounded text-xs font-mono">NO DATA AVAILABLE</div>;
+  if (isLoading) return <div className="h-[600px] w-full bg-bg-secondary flex items-center justify-center text-text-secondary animate-pulse border border-border-primary rounded">数据加载中...</div>;
+  if (!data || !data.data || data.data.length === 0) return <div className="h-[600px] w-full bg-bg-secondary flex items-center justify-center text-text-secondary border border-border-primary rounded text-xs font-mono">NO DATA AVAILABLE</div>;
 
   const option = {
     backgroundColor: 'transparent',
@@ -82,17 +82,17 @@ export default function SectorMatrix() {
   };
 
   return (
-    <div className="w-full bg-[#111417] border border-[#1e2226] flex flex-col overflow-hidden">
+    <div className="w-full bg-bg-secondary border border-border-primary flex flex-col overflow-hidden">
       {/* 头部：模仿 Webull 侧边栏标题栏 */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e2226] bg-[#1c2127]/30">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border-primary bg-[#1c2127]/30">
         <div className="flex items-center gap-2">
           <div className="w-1 h-3 bg-[#1861ff]"></div>
-          <h3 className="text-[#d1d1d1] text-xs font-bold uppercase tracking-wider">Sector RPS Matrix</h3>
-          <span className="text-[10px] text-[#8a8d91] ml-2 font-mono">Top 50 Sectors</span>
+          <h3 className="text-text-primary text-xs font-bold uppercase tracking-wider">Sector RPS Matrix</h3>
+          <span className="text-[10px] text-text-secondary ml-2 font-mono">Top 50 Sectors</span>
         </div>
 
         {/* 仿微牛 Segmented Control 按钮组 */}
-        <div className="flex bg-[#080a0d] p-0.5 rounded border border-[#1e2226]">
+        <div className="flex bg-[#080a0d] p-0.5 rounded border border-border-primary">
           {RPS_OPTIONS.map((opt) => (
             <button
               key={opt.value}
@@ -100,8 +100,8 @@ export default function SectorMatrix() {
               className={clsx(
                 "px-3 py-1 text-[10px] font-bold transition-all",
                 period === opt.value
-                  ? "bg-[#1861ff] text-white rounded-[3px]"
-                  : "text-[#8a8d91] hover:text-white"
+                  ? "bg-[#1861ff] text-text-primary rounded-[3px]"
+                  : "text-text-secondary hover:text-text-primary"
               )}
             >
               {opt.label}
@@ -110,7 +110,7 @@ export default function SectorMatrix() {
         </div>
       </div>
 
-      <div className="h-[1500px] w-full px-2">
+      <div className="h-[600px] w-full px-2">
         <ReactECharts option={option} style={{ height: '100%', width: '100%' }} notMerge={true} />
       </div>
     </div>

@@ -1,18 +1,21 @@
 'use client';
-import { useGlobalStore } from '@/lib/store';
-import Sidebar from './Sidebar';
-import Topbar from './Topbar';
 
-export default function MainLayout({ children }: { children: React.ReactNode }) {
+import { ReactNode } from 'react';
+import TopNavigation from './TopNavigation';
+import { CommandPalette } from './CommandPalette';
+
+interface MainLayoutProps {
+  children: ReactNode;
+}
+
+export default function MainLayout({ children }: MainLayoutProps) {
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#080a0d]">
-      <Sidebar />
-      <div className="flex-1 flex flex-col min-w-0 h-full relative">
-        <Topbar />
-        <main className="flex-1 overflow-hidden relative bg-[#080a0d]">
-          {children}
-        </main>
-      </div>
+    <div className="min-h-screen flex flex-col">
+      <TopNavigation />
+      <main className="flex-1 min-w-0">
+        {children}
+      </main>
+      <CommandPalette />
     </div>
   );
 }
