@@ -12,6 +12,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+!frontend/src/lib/
+!frontend/src/lib/**
 parts/
 sdist/
 var/
@@ -51,6 +53,17 @@ backend/data_job/data/collection_progress/*.json
 # Collection Data
 backend/data/
 
+# Frontend generated artifacts
+node_modules/
+frontend/.next/
+frontend/.next-candidate-*/
+frontend/.next-rollback-*/
+frontend/tmp/
+*.tsbuildinfo
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Isolated frontend build and rollback artifacts
+frontend/.next-*/

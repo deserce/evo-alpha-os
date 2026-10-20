@@ -1,411 +1,406 @@
-# EvoAlpha OS - 开发日志
+# CLAUDE.md
 
-> **文档用途**：记录开发过程中的经验、问题和解决方案
-> **创建时间**：2025-01-18
-> **项目路径**：/Users/dreserce/Desktop/EvoAlpha-OS
+# CLAUDE.md - 项目核心宪法（10x Engineer Mode - 基于Boris Cherny & 社区编译）
 
----
+## 核心原则（永远遵守）
+- 简单第一：避免过度工程化，优先最小可行实现。
+- 无懒惰：找到根因，不要打补丁。
+- 最小改动：只碰必须改的文件，避免引入新bug。
+- 防御式：所有输入校验、错误处理、边界case全覆盖。
+- 学习型：每次我纠正你，立即在末尾添加规则到本文件（并建议commit）。
+- 中文回复
 
-## 📋 目录
+## 工作流编排（必须的思考顺序）
+1. 复杂任务 → 强制Plan模式：先完整描述方案、文件列表、风险、步骤，等我批准。
+2. 如果>3文件改动 → 拆成小任务，逐个完成。
+3. 执行前 → 确认上下文干净（必要时 /clear 或总结旧上下文）。
+4. 写代码后 → 列出可能破坏点 + 建议测试。
+5. Bug修复 → 先写 failing test → 修到通过 → 再写 regression test。
+6. 任务结束前 → 验证闭环：运行测试/命令/截图/日志，证明成功。
 
-- [一、数据库初始化经验](#一数据库初始化经验)
-- [二、数据采集脚本测试](#二数据采集脚本测试)
-- [三、开源集成方向](#三开源集成方向)
-- [四、后续工作计划](#四后续工作计划)
+## 子代理策略（Subagent）
+- 遇到重负载（如研究、测试、大文件分析）→ 召唤子代理：e.g. "Spawn a subagent to verify this" 或用 parallel worktree。
+- 子代理类型示例：code-reviewer, test-writer, security-auditor, simplifier。
+- 主代理只协调，别自己干脏活。
 
----
+## 自我提升循环（Self-Improvement Loop）
+- 每次出错/我反馈 → 你自己写："Lesson learned: [描述] Rule: [新规则]" → 加到本文件末尾。
+- 定期审视：/summarize lessons → 精简重复规则。
+- 目标：用时越长，Claude 越像你的资深搭档。
 
-## 一、数据库初始化经验
+## 自主修复 & 安全
+- Bug时：自己debug → 贴日志给我看过程 → 修好前别说完成。
+- 安全检查：扫描硬编码secret、SQL injection、路径穿越等。
+- 从不：console.log 生产、any类型、全局变量、忽略错误。
 
-### 1.1 遇到的问题和解决方案
+## 项目特定（你来填）
+- 技术栈： [e.g. Next.js 14 + TypeScript + Tailwind]
+- 命名规范：camelCase 函数，PascalCase 组件
+- 测试要求：每个新功能至少3个测试（happy + edge + error）
+- 其他：...
 
-#### 问题1：数据库连接错误
+Last updated: [2/23] - 继续迭代！
 
-**错误**：
-```
-ModuleNotFoundError: No module named 'app'
-```
+## Project Overview
 
-**原因**：脚本使用相对路径导入 `from app.core.database`，但当前工作目录不对。
+EvoAlpha OS is a data-driven quantitative Alpha opportunity discovery platform for A-share (Chinese) stocks. The system combines quantitative screening (RPS factors, technical strategies) with AI agent analysis to identify trading opportunities.
 
-**解决方案**：
-1. 检查当前工作目录（确保在 `/Users/derecere/Desktop/EvoAlpha-OS/backend`）
-2. 脚本中添加路径自适应代码：
+**Tech Stack:**
+- **Backend**: FastAPI + Python 3.10+, SQLite (local) + PostgreSQL/CockroachDB (cloud)
+- **Frontend**: Next.js 16 + TypeScript + TailwindCSS 4
+- **Data Source**: Multi-source architecture (pytdx, EFinance, AKShare, Tushare)
+- **Scheduling**: APScheduler
+- **Quantitative Computing**: Pandas, NumPy, SciPy, TA-Lib
+
+## Data Source Architecture (v2.0 - 2026/03/08)
+
+### Multi-Source Priority System
+
+| Data Type | Primary | Fallback 1 | Fallback 2 |
+|-----------|---------|-----------|-----------|
+| **K-line** | pytdx (通达信协议) | EFinance | AKShare |
+| **Financial** | EFinance | AKShare | - |
+| **Fund Holdings** | EFinance | AKShare | - |
+| **Limit Boards** | AKShare (独有) | EFinance | - |
+| **News** | AKShare (独有) | - | - |
+
+### Key Changes from v1.0
+
+1. **pytdx (通达信协议) added as primary K-line source**
+   - Stability: ~99% (binary protocol, rarely banned)
+   - Speed: Fast (0.01s delay)
+   - Platform: Pure Python, perfect Mac support
+
+2. **Automatic source fallback**
+   - Primary source failure → auto-switch to next
+   - Success rate tracking for each source
+
+3. **New files added:**
+   - `data_job/core/tdx_adapter.py` - pytdx adapter
+   - `data_job/collectors/multi_source_kline_collector.py` - Multi-source K-line collector
+   - `DATA_SOURCE_ARCHITECTURE.md` - Design document
+   - `DATA_SOURCE_UPGRADE_REPORT.md` - Implementation report
+
+### Using Multi-Source Adapters
+
 ```python
-# 环境路径适配
-current_dir = os.path.dirname(os.path.abspath(__file__))
-backend_dir = os.path.abspath(os.path.join(current_dir, ".."))
-if backend_dir not in sys.path:
-    sys.path.insert(0, backend_dir)
+# K-line data (pytdx priority)
+from data_job.core.multi_source_adapter import MultiSourceAdapter
+adapter = MultiSourceAdapter(data_type='kline')
+df = adapter.get_stock_kline('600519', '2024-01-01', '2024-03-08')
+
+# Or use collector directly
+from data_job.collectors.multi_source_kline_collector import StockKlineCollectorV2
+collector = StockKlineCollectorV2()
+collector.run()
 ```
 
-#### 问题2：数据库表不存在错误
+### Dependencies
 
-**错误**：
-```
-sqlite3.OperationalError: database is locked
-```
-
-**原因**：SQLite 不支持并发写入，多个进程同时访问数据库。
-
-**解决方案**：
-1. 确保所有 Python 进程都已终止
-2. 使用事务保证原子性
-3. 增加重试机制
-
----
-
-## 二、数据采集脚本测试
-
-### 2.1 测试结果汇总
-
-| 脚本名 | 状态 | 说明 |
-|----------|------|------|
-| update_stock_list.py | ✅ 成功 | 获取 5472 只股票 + 86 个板块 |
-| update_stock_kline.py | ✅ 成功 | 数据库中有 374 万条 K 线数据 |
-| update_sector_kline.py | 待测试 | 需要验证板块数据 |
-| update_stock_sector_list.py | 待测试 | 需要验证板块映射关系 |
-
-### 2.2 重要发现
-
-#### 📊 数据验证 - 个股K线数据
-
-**验证结果**：
-- 数据总量：**3,742,487** 条 K线记录
-- 数据格式：open, high, low, close, volume 完整
-- 最新数据：2026-01-16 (今天)
-- 股票覆盖：5472 只股票
-
-**数据示例**（平安银行 000001）：
-```
-trade_date  | open  | high  low  | close  volume
-2026-01-16 | 11.34|11.37|11.16|11.19|1119473.00|1257713579.29|-1.06|  0.58
-2026-01-15 | 11.33|11.37|11.31|884960.00|1002514946.79|-0.44|  0.66
-2026-01-14 | 11.47|11.54|11.44|1061541.00|1219755568.52|-0.09|  0.55
-2026-01-13 | 11.45|11.49|11.42|855213.00| 979700148.21|0.17|  0.44
-2026-01-12 | 11.45|11.49|11.42| 855213.00| 979700148.21|0.17|  0.44
-```
-
-**数据质量**：✅ 完全符合预期，字段完整，数据准确。
-
----
-
-## 三、代码规范化问题
-
-### 3.1 已修复的问题
-
-#### 问题1：logger.success() 不存在
-
-**错误**：
-```
-AttributeError: 'Logger' object has no attribute 'success'
-```
-
-**影响脚本**：
-- update_etf_info.py
-- update_etfickline.py
-- update_limit_boards.py
-- update_macro_data.py
-- update_news.py
-- update_sector_constituents.py
-- 其他所有使用 logger.success() 的脚本
-
-**解决方案**：
-```python
-# 旧代码（有问题）
-logger.success(f"✅ {table} 创建成功")
-
-# 新代码（正确）
-logger.info(f"✅ {table} 创建成功")
-```
-
-**批量修复**：
 ```bash
-# 批量替换所有脚本中的 logger.success()
-for file in data_job/*.py; do
-  sed -i '' 's/logger\.success/logger.info/g' "$file" && echo "✅ 修复 $file"
-done
+# Install pytdx
+pip install pytdx
 ```
 
-#### 问题2：SQLAlchemy 列名映射错误
+### Verified pytdx Servers
 
-**错误**：
+- `218.75.126.9:7709` - 招商证券上海 ✅
+- `119.147.212.81:7709` - 招商证券深圳
+- `101.71.170.10:7709` - 华泰证券
+
+## Architecture
+
+### Three-Layer Design
+
 ```
-sqlite3.OperationalError: database is locked
+┌─────────────────────────────────────────────────┐
+│  Orchestration Layer (调度层)                     │
+│  auto_pipeline.py - Unified scheduler           │
+│  - Daily flow: Collection → RPS → Strategy      │
+│  - Quarterly flow: Collection → Pool → RPS      │
+└───────────────────┬─────────────────┬───────────┘
+                    │                 │
+        ┌───────────▼─────────┐  ┌───▼──────────────┐
+        │  Data Layer (数据层) │  │  Quant Layer     │
+        │  data_job/          │  │  quant_engine/   │
+        │  - 13 collectors    │  │  - RPS calc      │
+        │  - Scheduling       │  │  - Strategies    │
+        │  - Incremental      │  │  - Stock pool    │
+        └─────────────────────┘  └──────────────────┘
 ```
 
-**原因**：
-1. SQLite 不支持并发写入
-2. 同一时间有多个进程在访问数据库
+### Key Modules
 
-**解决方案**：
+**data_job/** - Data collection system with 13 collectors:
+- Stock/Sector/ETF K-lines (daily OHLCV)
+- Valuation metrics, limit boards, news
+- Fund holdings, financial summaries
+- All inherit from `BaseCollector` with retry/progress tracking
+
+**quant_engine/** - Quantitative analysis engine:
+- RPS (Relative Price Strength) calculators for stocks/sectors/ETFs
+- Strategy execution (MRGC pattern strategy)
+- Stock pool maintenance (filters by fund/northbound holdings)
+- All calculators inherit from `BaseFeatureCalculator`
+
+**auto_pipeline.py** - Main orchestrator:
+- Runs daily pipeline (weekdays 15:30): data → RPS → stock selection
+- Runs quarterly pipeline: quarterly data → stock pool update → RPS → selection
+- Scheduling via APScheduler with cron triggers
+
+## Common Commands
+
+### Backend Development
+
+```bash
+# Navigate to backend
+cd backend
+
+# Install dependencies
+pip3 install -r requirements.txt
+
+# Run FastAPI development server
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Run daily data collection only
+python3 -m data_job.utils.scheduler --mode daily
+
+# Run RPS calculation only (incremental - last 3 days)
+python3 -m quant_engine.runner.feature_runner --mode daily
+
+# Run RPS calculation (full - last 400 days)
+python3 -m quant_engine.runner.feature_runner --mode init
+
+# Run strategy selection
+python3 -m quant_engine.runner.strategy_runner --strategy mrgc
+
+# Run complete automated pipeline (data → RPS → strategy)
+python3 auto_pipeline.py --mode daily  # Run once immediately
+python3 auto_pipeline.py --mode schedule  # Start scheduler
+
+# Monitor scheduler status
+./check_scheduler.sh
+```
+
+### Database Operations
+
+```bash
+# Initialize database tables
+python3 -c "from app.core.database import init_db; init_db()"
+
+# Full data initialization (7-9 hours for historical data)
+./init_data.sh
+```
+
+### Frontend Development
+
+```bash
+# Navigate to frontend
+cd frontend
+
+# Install dependencies
+npm install
+
+# Run development server
+npm run dev
+
+# Build for production
+npm run build
+
+# Start production server
+npm start
+
+# Run linting
+npm run lint
+```
+
+## Path Adaptation Pattern
+
+**CRITICAL**: Python scripts must add backend to sys.path:
+
 ```python
-# 确保事务正确
-with engine.begin() as conn:
-    # 执行操作
-    conn.execute("...")
-    # 保存数据
-    conn.commit()  # 提交事务
+# At the top of scripts in backend/ subdirectories
+import sys
+import os
+from pathlib import Path
+
+backend_dir = Path(__file__).parent.parent.absolute()
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
 ```
 
----
+This is already done in existing scripts - maintain this pattern when creating new scripts.
 
-## 四、代码规范要求
+## Database Considerations
 
-### 4.1 数据采集脚本规范
+**SQLite Limitations**:
+- No concurrent writes - ensure only one process writes at a time
+- Use transactions for atomic operations
+- Kill existing Python processes if database is locked
 
-#### 要求1：日志报告（重要！）
-
-**正确示例**：
-```python
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# 在脚本关键位置添加日志
-logger.info("开始采集...")
-logger.info(f"正在处理 {symbol}...")
-logger.info(f"✅ 完成：采集了 {len(df)} 条数据")
+```bash
+# Find and kill Python processes accessing the database
+ps aux | grep python
+pkill -f python
 ```
 
-#### 要求2：进度条显示
+## Adding New Collectors
 
-**正确示例**：
+1. Create file in `backend/data_job/collectors/new_collector.py`
+2. Inherit from `BaseCollector`:
+
 ```python
-import tqdm
+from data_job.core.base_collector import BaseCollector
 
-# 添加进度条
-for i, symbol in enumerate(symbols):
-    print(f"[{i}/{len(symbols)}] 正在处理 {symbol}...")
-    # 执行操作
-```
-
-**进阶（推荐使用 tqdm）**：
-```python
-from tqdm import tqdm
-
-for symbol in tqdm(symbols):
-    # 执行操作
-    pass
-```
-
-#### 要求3：计算类脚本规范
-
-**正确示例**：
-```python
-import pandas as pd
-
-def calculate_rps(df):
-    """计算 RPS 因子"""
-    # 1. 先确认数据库表结构
-    print("数据库表结构确认...")
-    engine = get_engine()
-    inspector_result = engine.execute("SELECT * FROM stock_daily_prices LIMIT 1")
-    columns = [row[0] for row in inspector_result]
-    print(f"数据库表字段：{columns}")
-
-    # 2. 读取数据
-    df = pd.read_sql("SELECT * FROM stock_daily_prices WHERE symbol = '000001' ORDER BY trade_date DESC LIMIT 100", engine)
-
-    # 3. 数据预览
-    print(f"读取数据：{df.shape}")
-    print(df.head())
-
-    # 4. 执行计算
-    result = df.copy()
-    # ... 计算逻辑 ...
-
-    # 5. 保存结果
-    result.to_sql('calc_rps_results', engine, if_exists='replace')
-    print("✅ 计算完成！")
-```
-
----
-
-## 五、开源集成方向
-
-### 5.1 量化框架集成
-
-#### Qlib（强烈推荐）
-
-**优势**：
-- 成熟的量化回测框架
-- 模块化设计
-- 社区有大量策略模板
-- 支实时的可回测研究
-
-**集成方式**：
-```python
-# 使用 Qlib 的回测框架
-import qlbacktest as qbt
-
-# 定义回测策略
-class MRGCStrategy(qt.Strategy):
+class NewCollector(BaseCollector):
     def __init__(self):
-        # RPS > 90
-        机构持仓 > 5%
-        口袋支点形态
-        趋势确立
+        super().__init__(
+            collector_name="new_collector",
+            request_delay=1.0,
+            max_retries=3
+        )
+
+    def collect(self):
+        # Implement collection logic
+        # Use self.engine for database
+        # Use self.logger for logging
+        pass
 ```
 
-### 5.2 新闻舆情开源工具
+3. Add to `backend/data_job/collectors/__init__.py`
+4. Register in `CollectionScheduler` if needed
 
-#### Gensim（推荐用于情绪分析）
+## Adding New RPS Calculators
 
-**优势**：
-- 中文情感分析包
-- 支持金融领域
-- 准确率高，对金融词汇敏感
+1. Create file in `backend/quant_engine/calculators/new_rps_calculator.py`
+2. Inherit from `BaseFeatureCalculator`:
 
-**集成方式**：
 ```python
-import jieba
-import snownlp
+from quant_engine.core.base_feature_calculator import BaseFeatureCalculator
 
-# 情感分析
-def sentiment_score(text):
-    s = SnowNLP('financial_comments')
-    return s.polarity(text)  # [-1, 1] 负面 → 正面
+class NewRPSCalculator(BaseFeatureCalculator):
+    def get_source_table(self) -> str:
+        return "source_kline_table"
+
+    def get_target_table(self) -> str:
+        return "quant_feature_new_rps"
+
+    def get_entity_column(self) -> str:
+        return "symbol"  # or "sector_name"
+
+    def get_periods(self) -> list[int]:
+        return [5, 10, 20, 50, 120, 250]
 ```
 
-### 5.3 LLM Agent 框架
+3. Register in `FeatureRunner`
 
-#### LangChain + Llama 3（本地运行）
+## Logging Requirements
 
-**优势**：
-- 本地运行，无 API 成本
-- 数据隐私保护
-- 可以用更强大的模型
+**Use standard logging only** - NOT loguru:
 
-**集成方式**：
-```python
-from langchain.agents import initialize_llm
-from langchain_community.tools import Tool
-
-# 本地 LLM 推理
-llm = init_llm(model_name="llama3", temperature=0.7)
-
-# 创建工具
-@tool
-def analyze_stock(stock_code: str) -> str:
-    # AI 分析逻辑
-    return f"分析 {stock_code}..."
-```
-
----
-
-## 六、后续工作计划
-
-### Phase 1：基础数据验证（30分钟）
-
-**目标**：验证所有基础数据是否正确采集
-
-1. ✅ **update_stock_list.py** - 已验证成功（5472只股票）
-2. ✅ **update_stock_kline.py** - 已验证成功（374万条K线数据）
-3. ⏰ **update_sector_kline.py** - 待测试
-4. ⏰ **update_stock_sector_list.py** - 待测试
-
-**验证内容**：
-- 每个脚本的数据条数
-- 数据格式是否正确
-- 是否有数据缺失
-- 字段是否完整
-
----
-
-## 七、代码规范化检查清单
-
-### 7.1 数据采集脚本检查
-
-**每个脚本都需要包含的要素**：
-
-#### 1. 日志报告
 ```python
 import logging
 
-# 日志配置
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Correct
 logger = logging.getLogger(__name__)
+logger.info("Message")
+logger.warning("Warning message")
+logger.error("Error message")
 
-# 必要的日志点：
-- 脚本开始：`logger.info("开始采集...")`
-- 进度报告：`logger.info(f"正在处理 {symbol} ({i}/{total})...")`
-- 错误信息：`logger.error(f"采集失败: {e}")`
-- 完成信息：`logger.info(f"✅ 完成：共 {len(df)} 条数据")`
+# WRONG - logger.success() doesn't exist in standard logging
+# logger.success("Message")  # ❌ Don't use
 ```
 
-#### 2. 数据库连接检查
+## Incremental Update Pattern
+
+Data collectors support incremental updates:
 
 ```python
-# 在计算类脚本中，先确认表结构
-def check_table_schema():
-    """确认数据库表结构"""
-    engine = get_engine()
-    try:
-        # 查询表结构
-        inspector_result = engine.execute("SELECT * FROM stock_daily_prices LIMIT 1")
-        columns = [row[0] for row in inspector_result]
-        print(f"表结构：{columns}")
-    except Exception as e:
-        print(f"表结构错误：{e}")
-        raise
+# In BaseCollector subclasses
+# Get last update date from progress file
+last_date = self.progress.get("last_date")
+
+# Fetch only new data
+df = ak.stock_zh_a_daily(symbol="000001", start_date=last_date)
+
+# Save with automatic deduplication
+self._save_to_db(df, table_name)
 ```
 
-#### 3. 数据预览
+## Environment Configuration
 
-```python
-# 在执行计算前，先预览数据
-df = pd.read_sql("SELECT * FROM stock_daily_prices LIMIT 5", engine)
-print("数据预览：")
-print(df[['symbol', 'trade_date', 'close', 'volume']])
-print(f"数据范围：{df['trade_date'].min()} 到 {df['success}/{total} 个脚本运行成功")
-print(f"\n⚠️  {total - success} 个脚本有问题，请检查日志修复")
+Key environment variables in `backend/.env`:
 
-if success == 0:
-    print("\n⚠️  所有脚本都无法运行，请检查依赖配置！")
-    print("建议运行：pip install akshare pandas sqlalchemy loguru")
-else:
-    print("\n✅ 所有数据采集脚本已验证完成！")
+```bash
+# Database
+LOCAL_DB_PATH=data/local_quant.db
+CLOUD_DB_HOST=localhost
+CLOUD_DB_PORT=5433
+
+# Data collection
+AKSHARE_PROXY=          # Optional proxy
+FORCE_SYNC_KLINE=false  # Whether to sync K-line to cloud
+
+# Scheduler
+SCHEDULER_TIMEZONE=Asia/Shanghai
+DAILY_JOB_TIME=15:30
 ```
 
-## 🧪 现在开始逐个测试脚本
+## File Locations
 
-我准备好逐个测试这 13 个脚本了。
+- Database: `backend/data/local_quant.db`
+- Progress tracking: `backend/data/collection_progress/*.json`
+- Logs: Check stdout/stderr or configure file logging
+- Static data: `backend/data/`
+
+## Common Issues
+
+1. **Database locked**: Multiple processes accessing SQLite
+   - Kill other Python processes: `pkill -f python`
+
+2. **Module not found**: Wrong working directory
+   - Ensure you're in `backend/` directory or use path adaptation
+
+3. **No data in tables**: Missing initial data collection
+   - Run: `./init_data.sh` or `python3 auto_pipeline.py --mode daily`
+
+4. **RPS calculation fails**: Missing source data
+   - Run data collection first: `python3 -m data_job.utils.scheduler --mode daily`
+
+## Code Style Notes
+
+- Use 4 spaces for indentation
+- Max line length: 100
+- Follow PEP 8 for Python code
+- Use type hints where appropriate
+- Add docstrings for classes and public methods
+- Use f-strings for string formatting
+
+## Testing
+
+```bash
+# Backend tests
+cd backend
+pytest
+
+# Run specific test file
+pytest tests/test_base_collector.py
+
+# Frontend tests
+cd frontend
+npm test
+```
+
+## Documentation References
+
+- Main README: `README.md`
+- Backend: `backend/README.md`
+- Data collection: `backend/data_job/README.md`
+- Quant engine: `backend/quant_engine/README.md`
+- Auto pipeline: `backend/AUTO_PIPELINE_README.md`
+- Data source architecture: `backend/DATA_SOURCE_ARCHITECTURE.md` ⭐ NEW
+- Data source upgrade: `backend/DATA_SOURCE_UPGRADE_REPORT.md` ⭐ NEW
 
 ---
 
-## 📋 测试脚本列表
-
-### 第一批：基础数据采集（必须验证）
-1. ✅ **update_stock_list.py** - 股票名单
-2. ⏰ **update_stock_kline.py** - 个股K线
-3. ⏰ **update_sector_kline.py** - 板块K线
-4. ⏰ **update_stock_sector_list.py** - 股票-板块映射
-
-### 第二批：增强数据采集
-5. ⏰ **update_capital_flow.py** - 资金流向
-6. ⷰ **update_finance_summary.py** - 脚务摘要
-7. ⏰ **update_stock_valuation.py** - 估值数据
-
-### 第三批：新增数据采集
-8. ⏰ **update_etf_info.py** - ETF基础信息
-9. ⏰ **update_etf_kline.py** - ETF K线
-10. ⏰ **update_news.py** - 新闻舆情
-11. ⏰ **update_limit_boards.py** - 连板数据
-12. ⏰ **update_sector_constituents.py** - 板块成分股
-13 ⏰ **update_macro_data.py** - 宏观数据
-
----
-
-## 📌 下一步行动
-
-现在开始逐个测试这 13 个脚本。
-
-**想先测试哪个脚本？**
-
-我的建议优先级：
-1. **板块K线和板块映射**（因为这些是核心基础数据）
-2. 增强数据（资金流向、财务摘要）
-3. 新增数据（ETF、连板、新闻、宏观）
-
-告诉我你想先测试哪个？我们开始！🚀
+Last updated: 2026/03/08 - 数据源架构升级 v2.0
