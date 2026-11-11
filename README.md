@@ -6,7 +6,7 @@ EvoAlpha OS 是面向 A 股的本地数据与量化研究工作台：采集和�
 
 当前主线是 **Next.js 前端 + FastAPI API + SQLite + 本地无大模型调度**。云端数据库、R2 同步与 AI 接口仍保留在代码中，其配置和可用性需单独验证。交易由用户手工执行。
 
-最后更新：2026-10-20。
+最后更新：2026-11-11。
 
 ## 当前能力
 
@@ -18,6 +18,7 @@ EvoAlpha OS 是面向 A 股的本地数据与量化研究工作台：采集和�
 | Watchlist | 自选分组、规则配置、历史遍历、当日状态、行动箱和已完成 5 分钟柱监控 |
 | Portfolio | 账户与交易记账、截图导入草稿、持仓及可卖数量、收益快照、卖点计划和提醒 |
 | 日报与通知 | 策略日报、低吸日报、盘中提醒、邮件去重与失败重试 |
+| Research | 研报列表、个股研报和每日更新状态 |
 | Data Core | 增量采集、单写入锁、质量门、缺失计算补齐、历史健康检查与备份保留 |
 
 AI 多代理会诊、完整回测平台、商业订阅和多市场扩展不作为当前已交付能力。页面与 API 的存在也不代表外部数据源始终可用。
@@ -58,6 +59,7 @@ backend/
 ├── data_core/               # 来源、schema、交易日历和质量门
 ├── data_job/                # 数据采集与行情适配器
 ├── quant_engine/            # 因子、策略、研究与 Watch Engine
+├── research/                # 研报导入、查询和更新
 ├── portfolio/               # 账本、快照与持仓退出逻辑
 ├── scripts/                 # 正式执行器、安装器、迁移与修复工具
 └── tests/                   # 后端回归
@@ -116,7 +118,7 @@ BACKEND_URL=http://127.0.0.1:8000 npm run build
 BACKEND_URL=http://127.0.0.1:8000 npm start -- --port 3000
 ```
 
-浏览器打开 `http://127.0.0.1:3000`，默认进入 `/a/quant`。`/api/*` 经 Next.js 代理至 `BACKEND_URL`，未设置时默认后端为 `http://127.0.0.1:8000`。自定义端口后，构建与启动时保持代理配置一致。
+浏览器打开 `http://127.0.0.1:3000`，默认进入 `/a/dashboard`。`/api/*` 经 Next.js 代理至 `BACKEND_URL`，未设置时默认后端为 `http://127.0.0.1:8000`。自定义端口后，构建与启动时保持代理配置一致。
 
 修改代码期间可运行 `npm run dev`。已有生产实例在线时，使用 `NEXT_DIST_DIR=.next-candidate-<版本>` 在独立目录预构建，验收后再切换并保留回滚包；不要在运行中的 `.next` 目录直接重建。
 
@@ -124,6 +126,7 @@ BACKEND_URL=http://127.0.0.1:8000 npm start -- --port 3000
 
 | 路由 | 用途 |
 | --- | --- |
+| `/a/dashboard` | 总览 |
 | `/a/market` | 市场概览 |
 | `/a/sector` | 板块分析 |
 | `/a/stock`、`/a/stock/[symbol]` | 个股工作台与详情 |
@@ -184,20 +187,11 @@ node --test --test-concurrency=1 tests/*.test.mjs
 
 2026-10-20 仓库同步验收：后端覆盖 1,173 项通过，前端生产构建与 TypeScript 检查通过；前端测试 197 项通过、8 项失败。失败涉及界面源码断言及 Node 对无扩展名导入的解析，尚未在此次同步中修复。完整范围、复核方法与资源数据见 [同步验证记录](docs/REPOSITORY_SYNC_2026-10-20.md)。
 
-这份记录验证的是当前本地环境。新机器的依赖安装、全量数据初始化、云端部署和长期服务负载仍需分别验收。
+这份记录对应 2026-10-20 的仓库和本地环境。新机器的依赖安装、全量数据初始化、云端部署和长期服务负载仍需分别验收。
 
 ## 文档导航
 
-- [Data Core 来源与数据库映射](backend/docs/DATA_CORE_SOURCE_AND_DB_MAP.md)
-- [数据管线架构](docs/DATA_PIPELINE_ARCHITECTURE.md)
-- [存储与保留策略](backend/docs/DATA_STORAGE_RETENTION.md)
-- [量化引擎](backend/quant_engine/README.md)
-- [采集系统](backend/data_job/README.md)
-- [结构转折规则 v2](backend/docs/STRUCTURE_TURNING_V2.md)
-- [前端设计系统](FRONTEND_DESIGN_SYSTEM.md)
-- [蓝图 1.0](BLUEPRINT1.0.md)（规划与设计参考，以当前代码为准）
-- [开发约定](AGENTS.md)
-
-部分子模块文档保留历史设计与命令，执行前应与当前入口核对。
+- [技术蓝图](BLUEPRINT.md)
+- [文档索引](DOCS_INDEX.md)
 
 Copyright © 2026 dlab (Evolution Lab). All rights reserved.
