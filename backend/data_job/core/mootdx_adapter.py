@@ -5,10 +5,15 @@ mootdx 是对 pytdx 的增强版本，具有更好的服务器池管理和稳定
 
 import json
 import logging
+import math
 import os
+import struct
+from copy import copy
 from pathlib import Path
+from threading import RLock
 import time
-from typing import Optional, List
+import zlib
+from typing import Callable, Optional, List
 from datetime import datetime, timedelta
 import pandas as pd
 
@@ -58,8 +63,8 @@ class MootdxAdapter:
     mootdx 数据源适配器
 
     优点：
-    - 内置服务器池管理
-    - 自动选择最快服务器
+    - 有界服务器候选轮换与共享健康状态
+    - 真实行情验证与故障冷却
     - 更好的并发处理
     - 支持多种市场数据
     - 相比 pytdx 更稳定的服务器连接
@@ -71,6 +76,9 @@ class MootdxAdapter:
 
     # 通达信服务器列表（备用）
     SERVERS = [
+        # 2026-10-25 verified with SH/SZ/BSE bars through 2026-10-23.
+        ("139.9.52.158", 7709, "国泰君安深圳"),
+        ("103.251.85.94", 7709, "国泰君安上海"),
         # 2026-09-14 实测可返回日线，置于旧节点之前。
         ("59.36.5.11", 7709, "安信"),
         ("117.34.114.14", 7709, "国泰君安1"),
@@ -96,17 +104,64 @@ class MootdxAdapter:
         / "collection_progress"
         / "tdx_server_state.json"
     )
+    MAX_CANDIDATES = 6
+    VALIDATION_BUDGET_SECONDS = 30.0
+    INITIAL_COOLDOWN_SECONDS = 600
+    _health_lock = RLock()
+    _health_states: dict[str, dict] = {}
+    _instance = None
+    _instance_lock = RLock()
 
-    def __init__(self, max_retries: int = 3, timeout: int = 10):
+    class _DeadlineSocket:
+        """Apply one synchronous deadline to every setup/probe socket operation."""
+
+        def __init__(self, sock, timeout: float, deadline: float):
+            self.sock = sock
+            self.timeout = timeout
+            self.deadline: float | None = deadline
+
+        def _prepare(self):
+            timeout = self.timeout
+            if self.deadline is not None:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("TDX validation budget exhausted")
+                timeout = min(timeout, remaining)
+            self.sock.settimeout(timeout)
+
+        def recv(self, *args, **kwargs):
+            self._prepare()
+            return self.sock.recv(*args, **kwargs)
+
+        def send(self, *args, **kwargs):
+            self._prepare()
+            return self.sock.send(*args, **kwargs)
+
+        def sendall(self, *args, **kwargs):
+            self._prepare()
+            return self.sock.sendall(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.sock, name)
+
+    def __init__(
+        self, max_retries: int = 3, timeout: int = 10,
+        *, connection_deadline: float | None = None, managed_recovery: bool = False,
+    ):
         """
         初始化 mootdx 适配器
 
         Args:
-            max_retries: 最大重试次数
+            max_retries: 兼容旧调用；每个业务最多额外重试一次
             timeout: 连接超时时间(秒)
+            connection_deadline: 可选的单次启动总预算截止时间（monotonic）
         """
-        self.max_retries = max_retries
-        self.timeout = timeout
+        if not math.isfinite(float(timeout)) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
+        self.max_retries = 1  # Retained for callers; retries are bounded per business operation.
+        self.timeout = min(float(timeout), self.VALIDATION_BUDGET_SECONDS)
+        self._connection_deadline = connection_deadline
+        self._pool_managed = managed_recovery
         self.api = None
         self.connected = False
         self.current_server = None
@@ -115,223 +170,514 @@ class MootdxAdapter:
         self.fail_count = 0
         self.last_failure_kind: str | None = None
         self.Quotes = None
+        self._active_server: tuple[str, int, str] | None = None
 
         # 尝试导入 mootdx
         try:
             from mootdx.quotes import Quotes
             self.Quotes = Quotes
-            self._connect()
         except ImportError:
             logger.warning("⚠️  mootdx 未安装，请运行: pip install mootdx")
-            self._connect_pytdx()
-        except Exception as e:
-            logger.warning(f"⚠️  mootdx 初始化失败: {e}")
-            self._connect_pytdx()
+        self._connect()
 
     def is_available(self) -> bool:
         """检查适配器是否可用"""
         return self.connected and self.api is not None
 
     def _connect(self) -> bool:
-        """
-        优先用 mootdx 连接已验证节点，再降级到自动选服和 pytdx。
-        """
+        """One discovery round, shared by both backends; never use mootdx bestip."""
+        self._discard_connection()
+        self._round_deadline = time.monotonic() + self.VALIDATION_BUDGET_SECONDS
+        external = getattr(self, "_connection_deadline", None)
+        self._connection_deadline = None
+        if external is not None:
+            self._round_deadline = min(self._round_deadline, external)
+        self._round_attempts = 0
+        self._active_server = None
         if getattr(self, "Quotes", None) is not None:
             if self._connect_manual():
-                return True
-            if self._connect_mootdx_auto():
                 return True
         return self._connect_pytdx()
 
     def _connect_mootdx_auto(self) -> bool:
-        if getattr(self, "Quotes", None) is None:
-            return False
-
-        try:
-            # 使用 factory 方法创建客户端
-            # market='std' 使用标准市场服务器
-            self.api = self.Quotes.factory(
-                market='std',
-                timeout=self.timeout,
-                heartbeat=False,
-                auto_retry=False,
-                raise_exception=False,
-            )
-
-            # 测试连接
-            test_data = self.api.bars(symbol='600519', market=MARKET_SH, start=0, offset=1)
-
-            if test_data is not None and not test_data.empty:
-                self.connected = True
-                self.backend = "mootdx"
-                self.current_server = "auto"
-                self._save_server_state(
-                    host="auto",
-                    port=0,
-                    name="mootdx_auto",
-                    backend="mootdx",
-                )
-                logger.info("✅ mootdx 已连接 (自动选择服务器)")
-                return True
-            else:
-                logger.warning("mootdx 自动连接失败")
-                if hasattr(self.api, "close"):
-                    self.api.close()
-                self.api = None
-                return False
-
-        except Exception as e:
-            logger.debug(f"mootdx 自动连接失败: {e}")
-            return False
+        """Compatibility entry point: automatic rotation of explicit candidates only."""
+        return self._connect_manual()
 
     def _load_server_state(self) -> dict[str, object]:
+        path = self.SERVER_STATE_PATH
         try:
-            payload = json.loads(self.SERVER_STATE_PATH.read_text(encoding="utf-8"))
-            return payload if isinstance(payload, dict) else {}
+            if path.stat().st_size > 65536:
+                return {}
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return {}
+            nodes = payload.get("nodes", {})
+            allowed = {f"{host}:{port}" for host, port, _ in self.SERVERS}
+            payload["nodes"] = {
+                key: value for key, value in nodes.items()
+                if key in allowed and isinstance(value, dict)
+            } if isinstance(nodes, dict) else {}
+            return payload
         except (OSError, ValueError, TypeError):
             return {}
 
-    def _save_server_state(
-        self,
-        *,
-        host: str,
-        port: int,
-        name: str,
-        backend: str,
-    ) -> None:
+    def _health_state(self) -> dict:
+        """Called under _health_lock. Keep a bounded shared registry if disk is read-only."""
+        key = str(self.SERVER_STATE_PATH)
+        read_only = getattr(self, "_read_only_health", False)
+        signature = None
+        if read_only:
+            key += ":minute"
+            try:
+                stat = self.SERVER_STATE_PATH.stat()
+                signature = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                pass
+        states = self._health_states
+        if (key not in states or (
+                read_only and states[key].get("_source_signature") != signature)):
+            local_failures = states.get(key, {}).get("_local_failures", {}) if read_only else {}
+            if key not in states and len(states) >= 8:
+                states.pop(next(iter(states)))
+            states[key] = self._load_server_state()
+            if read_only:
+                # Observe external daily node recovery without polling the DB;
+                # minute-only failures must not alter daily persistence throttles.
+                local_failures = {
+                    node: health for node, health in local_failures.items()
+                    if health["cooldown_until"] > time.time()
+                }
+                states[key]["_local_failures"] = local_failures
+                nodes = states[key].setdefault("nodes", {})
+                for node, health in local_failures.items():
+                    disk_until = nodes.get(node, {}).get("cooldown_until", 0)
+                    if (not isinstance(disk_until, (int, float)) or not math.isfinite(disk_until)
+                            or health["cooldown_until"] > disk_until):
+                        nodes[node] = health
+                states[key]["_source_signature"] = signature
+        return states[key]
+
+    def _write_server_state(self, payload: dict) -> None:
         path = self.SERVER_STATE_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "host": host,
-            "port": int(port),
-            "name": name,
-            "backend": backend,
-            "last_success_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
         temp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:
-            temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             temp_path.replace(path)
-        except OSError:
-            temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("TDX health state write failed: %s", exc)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("TDX temporary health state cleanup failed: %s", exc)
+
+    def _save_server_state(
+        self, *, host: str, port: int, name: str, backend: str, persist: bool = True,
+    ) -> None:
+        """Only a completed, nonempty business request may promote a concrete endpoint."""
+        if (host, port) not in {(item[0], item[1]) for item in self.SERVERS}:
+            return
+        with self._health_lock:
+            state = self._health_state()
+            previous = (state.get("host"), state.get("port"), state.get("backend"))
+            state.update(host=host, port=int(port), name=name, backend=backend)
+            # At most one small disk write per minute on a continuously healthy node.
+            now = time.time()
+            last_write = state.get("success_epoch", 0)
+            if previous == (host, port, backend) and isinstance(last_write, (int, float)):
+                if now - last_write < 60:
+                    return
+            state["success_epoch"] = now
+            state["last_success_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            nodes = state.setdefault("nodes", {})
+            health = nodes.get(f"{host}:{port}", {})
+            until = health.get("cooldown_until", 0)
+            if not isinstance(until, (int, float)) or until <= now:
+                nodes.pop(f"{host}:{port}", None)
+            if persist:
+                self._write_server_state(state)
+
+    def _mark_server_failure(
+        self, server: tuple[str, int, str], *, persist: bool = True,
+    ) -> None:
+        with self._health_lock:
+            state = self._health_state()
+            nodes = state.get("nodes")
+            if not isinstance(nodes, dict):
+                nodes = {}
+            allowed = {f"{host}:{port}" for host, port, _ in self.SERVERS}
+            nodes = {key: value for key, value in nodes.items() if key in allowed}
+            key = f"{server[0]}:{server[1]}"
+            old = nodes.get(key, {})
+            now = time.time()
+            until = old.get("cooldown_until", 0) if isinstance(old, dict) else 0
+            if isinstance(until, (int, float)) and math.isfinite(until) and until > now:
+                return
+            failures = old.get("failures", 0) if isinstance(old, dict) else 0
+            failures = min(4, max(0, failures) + 1) if isinstance(failures, int) else 1
+            nodes[key] = {
+                "failures": failures,
+                "cooldown_until": now + self.INITIAL_COOLDOWN_SECONDS * 2 ** (failures - 1),
+            }
+            state["nodes"] = nodes
+            if getattr(self, "_read_only_health", False):
+                state.setdefault("_local_failures", {})[key] = nodes[key]
+            if persist:
+                self._write_server_state(state)
 
     def _ordered_servers(self) -> list[tuple[str, int, str]]:
-        state = self._load_server_state()
-        cached_host = str(state.get("host") or "")
-        try:
-            cached_port = int(state.get("port") or 0)
-        except (TypeError, ValueError):
-            cached_port = 0
-        cached = [
-            server
-            for server in self.SERVERS
-            if server[0] == cached_host and int(server[1]) == cached_port
-        ]
-        return [*cached, *(server for server in self.SERVERS if server not in cached)]
+        with self._health_lock:
+            state = self._health_state()
+            nodes = state.get("nodes", {})
+            nodes = nodes if isinstance(nodes, dict) else {}
+            cursor = state.get("cursor", 0)
+            cursor = cursor % len(self.SERVERS) if isinstance(cursor, int) and self.SERVERS else 0
+            rotated = [*self.SERVERS[cursor:], *self.SERVERS[:cursor]]
+            eligible = []
+            now = time.time()
+            for server in rotated:
+                health = nodes.get(f"{server[0]}:{server[1]}", {})
+                until = health.get("cooldown_until", 0) if isinstance(health, dict) else 0
+                if isinstance(until, (int, float)) and math.isfinite(until) and until > now:
+                    continue
+                eligible.append(server)
+
+            def failure_rank(server):
+                health = nodes.get(f"{server[0]}:{server[1]}", {})
+                failures = health.get("failures", 0) if isinstance(health, dict) else 0
+                return failures if isinstance(failures, int) else 0
+
+            eligible.sort(key=failure_rank)
+            cached = [
+                s for s in eligible
+                if (s[0], s[1]) == (state.get("host"), state.get("port"))
+                and not failure_rank(s)
+            ]
+            return [*cached, *(s for s in eligible if s not in cached)]
+
+    def _server_is_quarantined(self, server: tuple[str, int, str]) -> bool:
+        with self._health_lock:
+            nodes = self._health_state().get("nodes", {})
+            health = nodes.get(f"{server[0]}:{server[1]}", {})
+            until = health.get("cooldown_until", 0) if isinstance(health, dict) else 0
+            return isinstance(until, (int, float)) and until > time.time()
+
+    @classmethod
+    def read_isolated_minute_bars(
+        cls, *, kind: str, symbol: str, market: int, period: str, count: int,
+        deadline: float, validate: Callable[[list[dict]], None] | None = None,
+    ) -> list[dict]:
+        """Read at most two pages/two nodes, without discovery or disk writes.
+
+        Each attempt owns its socket. Minute failures and successful endpoints
+        update only the bounded in-process health registry used for selection.
+        """
+        if (kind not in {"stock", "index"} or period not in {"30min", "60min"}
+                or not isinstance(symbol, str) or len(symbol) != 6
+                or not symbol.isascii() or not symbol.isdigit()
+                or isinstance(market, bool) or market not in {MARKET_SZ, MARKET_SH}
+                or isinstance(count, bool) or not isinstance(count, int)
+                or not 1 <= count <= 1040
+                or isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+                or not math.isfinite(deadline)
+                or (validate is not None and not callable(validate))):
+            raise ValueError("invalid isolated minute request")
+        deadline = min(deadline, time.monotonic() + 10.0)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("TDX minute request budget exhausted")
+
+        # Bypass the normal constructor's discovery/probes and pooled streams.
+        adapter = cls.__new__(cls)
+        adapter.timeout = 2.0
+        adapter._read_only_health = True
+        with cls._health_lock:
+            preferred_backend = adapter._health_state().get("backend")
+        backend = "pytdx" if preferred_backend == "pytdx" else "mootdx"
+        last_error = None
+        for server in adapter._ordered_servers()[:2]:
+            if time.monotonic() >= deadline:
+                break
+            attempt_deadline = min(deadline, time.monotonic() + 5.0)
+            api = None
+            quarantine = True
+            try:
+                try:
+                    api = adapter._open_api(server, backend, attempt_deadline)
+                except ImportError:
+                    if backend != "mootdx":
+                        raise
+                    backend = "pytdx"
+                    api = adapter._open_api(server, backend, attempt_deadline)
+                client = api.client if backend == "mootdx" else api
+                method = client.get_index_bars if kind == "index" else client.get_security_bars
+                rows = []
+                for offset in range(0, count, 800):
+                    if time.monotonic() >= attempt_deadline:
+                        raise TimeoutError("TDX minute request budget exhausted")
+                    size = min(800, count - offset)
+                    page = method(CATEGORY_MAP[period], market, symbol, offset, size)
+                    if time.monotonic() >= attempt_deadline:
+                        raise TimeoutError("TDX minute request budget exhausted")
+                    if getattr(client, "last_transaction_failed", False):
+                        raise ConnectionError("TDX minute transaction failed")
+                    if not page:
+                        quarantine = False
+                        raise ConnectionError("TDX minute bars unavailable")
+                    if not isinstance(page, list) or len(page) > size:
+                        raise ValueError("TDX minute response exceeds page limit")
+                    for row in page:
+                        if (not isinstance(row, dict)
+                                or (row.get("code") is not None and str(row["code"]) != symbol)):
+                            raise ValueError("TDX minute response has invalid security code")
+                    rows.extend(page)
+                    if len(page) < size:
+                        break
+                if validate is not None:
+                    validate(rows)
+                if time.monotonic() >= attempt_deadline:
+                    raise TimeoutError("TDX minute request budget exhausted")
+                adapter._save_server_state(
+                    host=server[0], port=server[1], name=server[2],
+                    backend=backend, persist=False,
+                )
+                return rows
+            except Exception as exc:
+                last_error = exc
+                if quarantine and not isinstance(exc, ImportError):
+                    adapter._mark_server_failure(server, persist=False)
+                logger.debug("Isolated TDX minute attempt failed (%s)", type(exc).__name__)
+            finally:
+                adapter._close_api(api, backend)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("TDX minute request budget exhausted") from last_error
+        raise ConnectionError("TDX minute source unavailable") from last_error
 
     def _connect_pytdx(self) -> bool:
-        """mootdx 握手失败时，降级使用 pytdx 同一套通达信服务器。"""
-        try:
-            from pytdx.hq import TdxHq_API
-        except ImportError:
-            logger.warning("⚠️  pytdx 未安装，无法作为 mootdx 兜底")
-            self.connected = False
-            return False
-
-        for host, port, name in self._ordered_servers():
-            api = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=False)
-            try:
-                if not api.connect(host, port, time_out=self.timeout):
-                    continue
-
-                test_data = api.get_security_bars(
-                    CATEGORY_MAP["daily"], MARKET_SH, "600519", 0, 1
-                )
-                if test_data:
-                    self.api = api
-                    self.connected = True
-                    self.backend = "pytdx"
-                    self.current_server = f"{host}:{port}({name})[pytdx]"
-                    self._save_server_state(
-                        host=host,
-                        port=port,
-                        name=name,
-                        backend="pytdx",
-                    )
-                    logger.info(f"✅ pytdx 兜底已连接到 {self.current_server}")
-                    return True
-
-                api.disconnect()
-            except Exception as e:
-                logger.debug(f"pytdx 连接 {host}:{port} 失败: {e}")
-                try:
-                    api.disconnect()
-                except Exception:
-                    pass
-                continue
-
-        logger.warning("pytdx 无法连接到任何已配置服务器")
-        self.connected = False
-        self.backend = None
-        return False
+        return self._connect_candidates("pytdx")
 
     def _connect_manual(self) -> bool:
-        """手动尝试连接各个服务器"""
-        for host, port, name in self._ordered_servers():
-            api = None
-            try:
-                api = self.Quotes.factory(
-                    market='std',
-                    server=(host, int(port)),
-                    timeout=self.timeout,
-                    heartbeat=False,
-                    auto_retry=False,
-                    raise_exception=False,
-                )
+        return self._connect_candidates("mootdx")
 
-                test_data = api.bars(symbol='600519', start=0, offset=1)
-                if test_data is not None and not test_data.empty:
-                    self.api = api
-                    self.connected = True
-                    self.backend = "mootdx"
-                    self.current_server = f"{host}:{port}({name})"
-                    self._save_server_state(
-                        host=host,
-                        port=port,
-                        name=name,
-                        backend="mootdx",
-                    )
-                    logger.info(f"✅ mootdx 已连接到 {self.current_server}")
-                    return True
+    def _open_api(self, server: tuple[str, int, str], backend: str, deadline: float):
+        """Build mootdx without BaseQuotes.config.setup()/implicit bestip scans."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("TDX validation budget exhausted")
+        if backend == "mootdx":
+            from mootdx.quotes import StdQuotes, TdxHq_API
+            api = StdQuotes.__new__(StdQuotes)
+            api.server = server[:2]
+            api.timeout = self.timeout
+            api.verbose = False
+            api.client = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
+            client = api.client
+        else:
+            from pytdx.hq import TdxHq_API
+            api = client = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
+        try:
+            # Setup contains multiple socket reads; each must share the same deadline.
+            client.need_setup = False
+            if not client.connect(server[0], server[1], time_out=min(self.timeout, remaining)):
+                raise ConnectionError("TDX connect failed")
+            client.client = self._DeadlineSocket(client.client, self.timeout, deadline)
+            client.need_setup = True
+            client.setup()
+            return api
+        except Exception:
+            self._close_api(api, backend)
+            raise
 
-            except Exception as e:
-                logger.debug(f"连接 {host}:{port} 失败: {e}")
-            if api is not None and hasattr(api, "close"):
+    @staticmethod
+    def _close_api(api, backend: str) -> None:
+        if api is None:
+            return
+        client = getattr(api, "client", None) if backend == "mootdx" else api
+        sock = getattr(client, "client", None)
+        try:
+            if callable(getattr(client, "disconnect", None)):
+                client.disconnect()
+            elif callable(getattr(api, "close", None)):
+                api.close()
+        except Exception as exc:
+            logger.debug("TDX connection close failed: %s", exc)
+        finally:
+            # Both libraries may erase client.client after a failed shutdown.
+            if callable(getattr(sock, "close", None)):
                 try:
-                    api.close()
-                except Exception:
-                    pass
+                    sock.close()
+                except OSError as exc:
+                    logger.debug("TDX socket close failed: %s", exc)
 
-        logger.warning("⚠️  mootdx 无法连接到任何已配置服务器")
+    @staticmethod
+    def _validate_probe_bars(data: pd.DataFrame) -> None:
+        required = {"open", "high", "low", "close"}
+        date_column = next((c for c in ("datetime", "trade_date", "date") if c in data), None)
+        if date_column is None or not required.issubset(data.columns):
+            raise ConnectionError("TDX probe lacks daily dates/OHLC")
+        dates = pd.to_datetime(data[date_column], errors="coerce")
+        today = pd.Timestamp.now().normalize()
+        values = data[list(required)].apply(pd.to_numeric, errors="coerce")
+        if (dates.isna().any() or (dates > today + pd.Timedelta(days=1)).any()
+                or dates.max().normalize() > today
+                or dates.max() < today - pd.Timedelta(days=14)
+                or not values.map(lambda v: math.isfinite(v) and v > 0).all().all()
+                or (values["high"] < values[["open", "close", "low"]].max(axis=1)).any()
+                or (values["low"] > values[["open", "close", "high"]].min(axis=1)).any()):
+            raise ConnectionError("TDX probe daily date/OHLC validation failed")
+
+    def _validate_node(self, api, backend: str, deadline: float) -> bool:
+        fingerprints = set()
+        for market, symbol in ((MARKET_SH, "600519"), (MARKET_SZ, "000001"), (MARKET_BJ, "920799")):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("TDX validation budget exhausted")
+            client = getattr(api, "client", None) if backend == "mootdx" else api
+            if callable(getattr(client, "get_security_bars", None)):
+                raw = client.get_security_bars(CATEGORY_MAP["daily"], market, symbol, 0, 2)
+                data = pd.DataFrame(raw) if raw is not None else None
+            else:
+                data = api.bars(symbol=symbol, market=market, frequency=4, start=0, offset=2)
+            if bool(getattr(client, "last_transaction_failed", False)):
+                raise ConnectionError("TDX probe transaction failed")
+            # An empty, successful response is unverified capability, not proof of a bad node.
+            if data is None or data.empty:
+                return False
+            self._validate_probe_bars(data)
+            fingerprint = tuple(data.iloc[-1][["open", "high", "low", "close"]])
+            if fingerprint in fingerprints:
+                raise ConnectionError("TDX probe returned cloned market prices")
+            fingerprints.add(fingerprint)
+        return True
+
+    def _accept_connection(self, api, backend: str, server: tuple[str, int, str]) -> None:
+        client = getattr(api, "client", None) if backend == "mootdx" else api
+        sock = getattr(client, "client", None)
+        if isinstance(sock, self._DeadlineSocket):
+            sock.deadline = None
+            sock.sock.settimeout(self.timeout)
+        self.api = api
+        self.connected = True
+        self.backend = backend
+        self._active_server = server
+        self.current_server = f"{server[0]}:{server[1]}({server[2]})[{backend}]"
+
+    def _connect_candidates(self, backend: str) -> bool:
+        if not hasattr(self, "_round_deadline"):
+            self._round_deadline = time.monotonic() + self.VALIDATION_BUDGET_SECONDS
+            self._round_attempts = 0
+        for server in self._ordered_servers():
+            if self._round_attempts >= self.MAX_CANDIDATES or time.monotonic() >= self._round_deadline:
+                break
+            self._round_attempts += 1
+            with self._health_lock:
+                state = self._health_state()
+                state["cursor"] = (self.SERVERS.index(server) + 1) % len(self.SERVERS)
+            probe = business = None
+            try:
+                probe = self._open_api(server, backend, self._round_deadline)
+                verified = self._validate_node(probe, backend, self._round_deadline)
+                self._close_api(probe, backend)
+                probe = None
+                if not verified:
+                    continue
+                business = self._open_api(server, backend, self._round_deadline)
+                if time.monotonic() >= self._round_deadline:
+                    raise TimeoutError("TDX validation budget exhausted")
+                self._accept_connection(business, backend, server)
+                return True
+            except ImportError as exc:
+                logger.debug("TDX backend unavailable: %s", exc)
+                break
+            except Exception as exc:
+                self._mark_server_failure(server)
+                logger.debug("TDX node %s:%s failed: %s", server[0], server[1], exc)
+            finally:
+                self._close_api(probe, backend)
+                if business is not getattr(self, "api", None):
+                    self._close_api(business, backend)
         self.api = None
         self.connected = False
         self.backend = None
         return False
 
+    def fork_connection(self, *, connection_deadline: float) -> "MootdxAdapter":
+        """Open another clean stream to this round's validated node, without another scan."""
+        adapter = copy(self)
+        adapter.api = None
+        adapter.connected = False
+        adapter.success_count = adapter.fail_count = 0
+        adapter._connection_deadline = None
+        server = getattr(self, "_active_server", None)
+        if server is None or not self.is_available():
+            return adapter
+        api = None
+        try:
+            api = adapter._open_api(server, self.backend, connection_deadline)
+            if time.monotonic() >= connection_deadline:
+                raise TimeoutError("TDX pool startup budget exhausted")
+            adapter._accept_connection(api, self.backend, server)
+        except Exception as exc:
+            adapter._mark_server_failure(server)
+            adapter._close_api(api, self.backend)
+            logger.debug("TDX pool stream startup failed: %s", exc)
+        return adapter
+
+    def _request_with_failover(
+        self, operation: Callable[[], Optional[pd.DataFrame]],
+    ) -> Optional[pd.DataFrame]:
+        """One extra attempt per logical request, including nested qfq/xdxr requests."""
+        if getattr(self, "_business_active", False):
+            return operation()
+        self._business_active = True
+        try:
+            attempts = 1 if getattr(self, "_pool_managed", False) else 2
+            for attempt in range(attempts):
+                result = operation()
+                server = getattr(self, "_active_server", None)
+                if self.last_failure_kind != "connectivity":
+                    if result is not None and not result.empty and server is not None:
+                        self._save_server_state(
+                            host=server[0], port=server[1], name=server[2], backend=self.backend,
+                        )
+                    return result
+                if server is None:
+                    return None  # A failed discovery round must not itself be retried.
+                self._mark_server_failure(server)
+                self._discard_connection()
+                if attempt == attempts - 1:
+                    return None
+            return None
+        finally:
+            self._business_active = False
+
     def _ensure_connected(self) -> bool:
         """Ensure the current connection is usable without sending a probe request."""
         if not self.connected or not self.api:
-            return self._connect()
+            return False if getattr(self, "_pool_managed", False) else self._connect()
+
+        server = getattr(self, "_active_server", None)
+        if server is not None and self._server_is_quarantined(server):
+            self._discard_connection()
+            return False if getattr(self, "_pool_managed", False) else self._connect()
 
         if self._transaction_failed():
             logger.warning("TDX 上一事务失败，丢弃连接后重连")
+            server = getattr(self, "_active_server", None)
+            if server is not None:
+                self._mark_server_failure(server)
             self._discard_connection()
-            return self._connect()
+            return False if getattr(self, "_pool_managed", False) else self._connect()
 
         return True
 
-    def _transaction_failed(self) -> bool:
+    def _transaction_failed(self, error: Exception | None = None) -> bool:
         """Check the pytdx transaction behind either adapter backend."""
+        # tdxpy does not maintain last_transaction_failed. Its exception wrapper
+        # instead exposes the parser/socket error as original_exception.
+        if error is not None:
+            original = getattr(error, "original_exception", None)
+            if original is not None or isinstance(error, (OSError, struct.error, zlib.error)):
+                return True
         api = getattr(self, "api", None)
         if api is None:
             return False
@@ -345,15 +691,7 @@ class MootdxAdapter:
         self.api = None
         self.connected = False
         self.backend = None
-        if stale_api is None:
-            return
-        try:
-            if stale_backend == "pytdx" and hasattr(stale_api, "disconnect"):
-                stale_api.disconnect()
-            elif hasattr(stale_api, "close"):
-                stale_api.close()
-        except Exception as exc:
-            logger.debug("TDX 失败连接关闭异常: %s", exc)
+        self._close_api(stale_api, stale_backend)
 
     def _parse_symbol(self, symbol: str) -> int:
         """
@@ -493,21 +831,17 @@ class MootdxAdapter:
                     )
                 data = self.api.to_df(raw_data) if raw_data else None
             else:
-                try:
-                    data = self.api.index_bars(
-                        symbol=code,
-                        market=market_code,
-                        frequency=frequency,
-                        start=start,
-                        offset=request_size,
-                    )
-                except TypeError:
-                    data = self.api.index_bars(
-                        symbol=code,
-                        frequency=frequency,
-                        start=start,
-                        offset=request_size,
-                    )
+                data = self.api.index_bars(
+                    symbol=code,
+                    market=market_code,
+                    frequency=frequency,
+                    start=start,
+                    offset=request_size,
+                )
+
+            if self._transaction_failed():
+                self._discard_connection()
+                raise ConnectionError("TDX index pagination transaction failed")
 
             if data is None or data.empty:
                 break
@@ -529,6 +863,10 @@ class MootdxAdapter:
         return pd.concat(all_data, ignore_index=True)
 
     def get_xdxr_info(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Fetch corporate actions with at most one failover retry."""
+        return self._request_with_failover(lambda: self._get_xdxr_info_once(symbol))
+
+    def _get_xdxr_info_once(self, symbol: str) -> Optional[pd.DataFrame]:
         """
         获取除权除息信息。
         """
@@ -571,13 +909,75 @@ class MootdxAdapter:
         except Exception as e:
             logger.warning(f"mootdx 获取 {symbol} xdxr 失败: {e}")
             self.last_failure_kind = (
-                "connectivity" if isinstance(e, ConnectionError) or self._transaction_failed()
+                "connectivity" if isinstance(e, ConnectionError) or self._transaction_failed(e)
                 else "request"
             )
             self._discard_connection()
             return None
 
+    def get_recent_stock_bars(
+        self, symbol: str, period: str = "5min", count: int = 3,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch bounded raw intraday bars without daily truncation or qfq work."""
+        if period not in {"1min", "5min", "15min", "30min", "60min"}:
+            raise ValueError(f"unsupported intraday period: {period}")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 800:
+            raise ValueError("count must be between 1 and 800")
+        if not isinstance(symbol, str) or len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit():
+            raise ValueError("symbol must contain six ASCII digits")
+
+        def fetch() -> Optional[pd.DataFrame]:
+            self.last_failure_kind = None
+            if not self._ensure_connected():
+                self.last_failure_kind = "connectivity"
+                self.fail_count += 1
+                return None
+            try:
+                frame = self._fetch_bars_data(
+                    symbol=symbol, period=period, batch_size=count, max_bars=count,
+                )
+                if frame is None or frame.empty:
+                    raise ConnectionError("empty intraday response")
+                frame = _normalize_volume_aliases(frame)
+                frame = frame.rename(columns={"datetime": "bar_time"})
+                frame["bar_time"] = pd.to_datetime(frame["bar_time"], errors="coerce")
+                frame = frame.dropna(subset=["bar_time"])
+                if frame.empty:
+                    self.last_failure_kind = "invalid_data"
+                    self.fail_count += 1
+                    return None
+                frame["symbol"] = symbol
+                self.success_count += 1
+                return frame.sort_values("bar_time").drop_duplicates(
+                    subset=["bar_time"], keep="last",
+                ).reset_index(drop=True)
+            except Exception as exc:
+                self.fail_count += 1
+                self.last_failure_kind = (
+                    "connectivity" if isinstance(exc, ConnectionError)
+                    or self._transaction_failed(exc) else "invalid_data"
+                )
+                logger.warning("mootdx %s %s failed: %s", symbol, period,
+                               getattr(exc, "original_exception", None) or exc)
+                return None
+
+        return self._request_with_failover(fetch)
+
     def get_stock_kline(
+        self,
+        symbol: str,
+        start_date: str = None,
+        end_date: str = None,
+        period: str = "daily",
+        adjust: str = "qfq",
+        max_bars: int | None = None,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch bars with one failover for the entire bars + qfq action request."""
+        return self._request_with_failover(lambda: self._get_stock_kline_once(
+            symbol, start_date, end_date, period, adjust, max_bars,
+        ))
+
+    def _get_stock_kline_once(
         self,
         symbol: str,
         start_date: str = None,
@@ -667,7 +1067,7 @@ class MootdxAdapter:
                 from data_job.core.mootdx_qfq import apply_mootdx_qfq
 
                 xdxr_df = self.get_xdxr_info(symbol)
-                if self.last_failure_kind == "connectivity":
+                if self.last_failure_kind in {"connectivity", "request"}:
                     self.fail_count += 1
                     return None
                 df = apply_mootdx_qfq(df, xdxr_df)
@@ -696,13 +1096,27 @@ class MootdxAdapter:
             logger.warning(f"mootdx 获取 {symbol} K线失败: {e}")
             self.fail_count += 1
             self.last_failure_kind = (
-                "connectivity" if isinstance(e, ConnectionError) or self._transaction_failed()
+                "connectivity" if isinstance(e, ConnectionError) or self._transaction_failed(e)
                 else "request"
             )
             self._discard_connection()
             return None
 
     def get_index_kline(
+        self,
+        symbol: str = "000001",
+        start_date: str = None,
+        end_date: str = None,
+        period: str = "daily",
+        market: int | None = None,
+        max_bars: int | None = None,
+    ) -> Optional[pd.DataFrame]:
+        """Restart index pagination from page zero on one clean replacement stream."""
+        return self._request_with_failover(lambda: self._get_index_kline_once(
+            symbol, start_date, end_date, period, market, max_bars,
+        ))
+
+    def _get_index_kline_once(
         self,
         symbol: str = "000001",
         start_date: str = None,
@@ -725,18 +1139,21 @@ class MootdxAdapter:
         Returns:
             DataFrame or None
         """
+        self.last_failure_kind = None
         if not self._ensure_connected():
+            self.last_failure_kind = "connectivity"
             return None
 
         try:
             code = str(symbol).zfill(6)
-            df = self._fetch_index_bars_data(
-                code,
-                period=period,
-                market=market,
-                max_bars=max_bars,
-            )
+            try:
+                df = self._fetch_index_bars_data(
+                    code, period=period, market=market, max_bars=max_bars,
+                )
+            except Exception as exc:
+                raise ConnectionError("TDX index pagination failed") from exc
             if df is None or df.empty:
+                self.last_failure_kind = "no_data"
                 return None
 
             df = _normalize_volume_aliases(df)
@@ -784,6 +1201,11 @@ class MootdxAdapter:
         except Exception as e:
             logger.warning(f"mootdx 获取指数 {symbol} K线失败: {e}")
             self.fail_count += 1
+            self.last_failure_kind = (
+                "connectivity" if isinstance(e, ConnectionError) or self._transaction_failed(e)
+                else "request"
+            )
+            self._discard_connection()
             return None
 
     def get_stock_list(self, market: int = None) -> Optional[pd.DataFrame]:
@@ -1004,6 +1426,18 @@ class MootdxAdapter:
         sector_symbol: str,
         start_date: str = None,
         end_date: str = None,
+        period: str = "daily",
+    ) -> Optional[pd.DataFrame]:
+        """Use the same single-retry transaction boundary for sector index bars."""
+        return self._request_with_failover(lambda: self._get_sector_kline_once(
+            sector_symbol, start_date, end_date, period,
+        ))
+
+    def _get_sector_kline_once(
+        self,
+        sector_symbol: str,
+        start_date: str = None,
+        end_date: str = None,
         period: str = "daily"
     ) -> Optional[pd.DataFrame]:
         """
@@ -1018,12 +1452,17 @@ class MootdxAdapter:
         Returns:
             DataFrame or None
         """
+        self.last_failure_kind = None
         if not self._ensure_connected():
+            self.last_failure_kind = "connectivity"
             return None
 
         try:
             code = str(sector_symbol).zfill(6)
-            df = self._fetch_index_bars_data(code, period=period)
+            try:
+                df = self._fetch_index_bars_data(code, period=period)
+            except Exception as exc:
+                raise ConnectionError("TDX sector index pagination failed") from exc
             if df is None or df.empty:
                 self.fail_count += 1
                 return None
@@ -1081,38 +1520,31 @@ class MootdxAdapter:
         except Exception as e:
             logger.warning(f"mootdx 获取板块 {sector_symbol} K线失败: {e}")
             self.fail_count += 1
+            self.last_failure_kind = (
+                "connectivity" if isinstance(e, ConnectionError) or self._transaction_failed(e)
+                else "request"
+            )
+            self._discard_connection()
             return None
 
     def disconnect(self):
         """断开连接"""
-        if getattr(self, "api", None):
-            try:
-                if getattr(self, "backend", "mootdx") == "pytdx" and hasattr(self.api, "disconnect"):
-                    self.api.disconnect()
-                elif hasattr(self.api, "close"):
-                    self.api.close()
-                self.connected = False
-                logger.info("mootdx/pytdx 已断开连接")
-            except:
-                pass
+        self._discard_connection()
 
     def __del__(self):
         """析构函数，确保断开连接"""
         self.disconnect()
 
 
-# 单例模式
-_mootdx_instance = None
-
-
 def get_mootdx_adapter() -> Optional[MootdxAdapter]:
     """获取 mootdx 适配器单例"""
-    global _mootdx_instance
-
-    if _mootdx_instance is None:
-        _mootdx_instance = MootdxAdapter()
-
-    return _mootdx_instance if _mootdx_instance.is_available() else None
+    with MootdxAdapter._instance_lock:
+        if MootdxAdapter._instance is None:
+            MootdxAdapter._instance = MootdxAdapter()
+        elif not MootdxAdapter._instance.is_available():
+            MootdxAdapter._instance._connect()
+        adapter = MootdxAdapter._instance
+        return adapter if adapter.is_available() else None
 
 
 # 使用示例

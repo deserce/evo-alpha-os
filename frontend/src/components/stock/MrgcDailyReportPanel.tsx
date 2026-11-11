@@ -35,11 +35,11 @@ type Report = {
 };
 type ReportResponse = { report: Report | null; email_html: string; job: ReportJob; archive: { valid: boolean; generated_at: string; complete: boolean; archive_id: string } | null };
 
-export async function loadReport(date: string, generate = false, regenerate = false): Promise<ReportResponse> {
+export async function loadReport(date: string, generate = false, regenerate = false, hintsOnly = false): Promise<ReportResponse> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 35_000);
   try {
-    const url = generate ? '/api/v1/watch/mrgc-report/generate' : `/api/v1/watch/mrgc-report?trade_date=${encodeURIComponent(date)}`;
+    const url = generate ? '/api/v1/watch/mrgc-report/generate' : `/api/v1/watch/mrgc-report?trade_date=${encodeURIComponent(date)}${hintsOnly ? '&hints_only=true' : ''}`;
     const response = await fetch(url, {
       method: generate ? 'POST' : 'GET', signal: controller.signal,
       ...(generate ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trade_date: date, regenerate }) } : {}),

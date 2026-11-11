@@ -147,8 +147,8 @@ export function MarketIndexPanel({ indices = [], defaultIndexCode, tradeDate }: 
         data: ['K线', 'MA20', 'MA50', 'MA120'],
       },
       grid: [
-        { left: 42, right: 16, top: 26, height: 196 },
-        { left: 42, right: 16, top: 238, height: 58 },
+        { left: 42, right: 16, top: 26, height: '59%' },
+        { left: 42, right: 16, top: '72%', bottom: 24 },
       ],
       xAxis: [
         {
@@ -337,7 +337,7 @@ export function MarketIndexPanel({ indices = [], defaultIndexCode, tradeDate }: 
           ))}
         </div>
 
-        <div className="min-h-[310px]">
+        <div className="market-index-chart">
           {klineQuery.isLoading ? (
             <div className="dashboard-empty h-[300px]">指数K线加载中</div>
           ) : klineQuery.isError ? (
@@ -350,7 +350,7 @@ export function MarketIndexPanel({ indices = [], defaultIndexCode, tradeDate }: 
               </button>
             </div>
           ) : klineItems.length ? (
-            <ReactECharts option={option} style={{ height: 310, width: '100%' }} notMerge lazyUpdate />
+            <ReactECharts option={option} style={{ height: '100%', width: '100%' }} notMerge lazyUpdate />
           ) : (
             <div className="dashboard-empty flex h-[300px] flex-col items-center justify-center gap-2">
               <span>{klineQuery.data?.message || `暂无${chartPeriodLabel(period)}指数K线，请切换其它周期`}</span>

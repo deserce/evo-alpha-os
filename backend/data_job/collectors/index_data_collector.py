@@ -22,7 +22,7 @@ if str(backend_dir) not in sys.path:
 from data_job.common import setup_network_emergency_kit, setup_backend_path, setup_logger
 
 # 基类导入
-from data_job.core.base_collector import BaseCollector
+from data_job.core.base_collector import BaseCollector, NetworkError
 from data_job.core.mootdx_adapter import MARKET_SH, MARKET_SZ, MootdxAdapter
 from data_core.market_calendar import is_a_share_session
 
@@ -76,6 +76,14 @@ class IndexDataCollector(BaseCollector):
             {"code": "sh000905", "name": "中证500", "symbol": "000905", "tdx_market": MARKET_SH},
             {"code": "sh000852", "name": "中证1000", "symbol": "000852", "tdx_market": MARKET_SH},
         ]
+
+    def _health_check(self):
+        """只检查数据库；TDX/HTTP 可用性由正式取数验证，不依赖百度探测。"""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as exc:
+            raise NetworkError(f"数据库连接失败: {exc}") from exc
 
     def _init_table(self):
         """初始化指数数据表"""

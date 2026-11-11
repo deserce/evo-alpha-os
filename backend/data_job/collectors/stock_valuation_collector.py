@@ -9,7 +9,6 @@ from datetime import date
 import akshare as ak
 import pandas as pd
 from sqlalchemy import text, inspect
-from tqdm import tqdm
 
 # 公共工具导入
 from data_job.common import setup_network_emergency_kit, setup_backend_path, setup_logger
@@ -28,6 +27,12 @@ logger = setup_logger(__name__)
 
 class StockValuationCollector(BaseCollector):
     """股票估值数据采集器"""
+
+    _columns = [
+        "code", "name", "trade_date", "price", "pe_ttm", "pb",
+        "total_mv", "circ_mv", "pct_chg", "turnover", "volume_ratio",
+        "limit_up_price", "limit_down_price", "source",
+    ]
 
     def __init__(self):
         super().__init__(
@@ -145,7 +150,7 @@ class StockValuationCollector(BaseCollector):
         return df
 
     def fetch_local_snapshot(self, target_date: str | None = None) -> pd.DataFrame:
-        """从近期缺失 K 线和换手率反推流通市值，作为实时行情失败时的稳定兜底。"""
+        """补齐本地行情；流通市值仅为推算值，不能恢复历史 PE/PB 或总市值。"""
         if target_date:
             query = """
                 SELECT
@@ -160,21 +165,11 @@ class StockValuationCollector(BaseCollector):
                 LEFT JOIN stock_info s ON s.symbol = k.symbol
                 WHERE k.trade_date = :target_date
                   AND k.close IS NOT NULL
-                  AND k.turnover_rate IS NOT NULL
-                  AND k.turnover_rate > 0
             """
         else:
             query = """
             WITH latest_kline_date AS (
                 SELECT MAX(trade_date) AS trade_date FROM stock_daily_prices
-            ),
-            target_dates AS (
-                SELECT DISTINCT k.trade_date
-                FROM stock_daily_prices k
-                JOIN latest_kline_date latest
-                LEFT JOIN stock_valuation_daily v ON v.trade_date = k.trade_date
-                WHERE v.trade_date IS NULL
-                  AND k.trade_date >= DATE(latest.trade_date, '-30 day')
             )
             SELECT
                 k.symbol AS code,
@@ -186,10 +181,13 @@ class StockValuationCollector(BaseCollector):
                 k.volume
             FROM stock_daily_prices k
             LEFT JOIN stock_info s ON s.symbol = k.symbol
-            JOIN target_dates d ON d.trade_date = k.trade_date
+            CROSS JOIN latest_kline_date latest
             WHERE k.close IS NOT NULL
-              AND k.turnover_rate IS NOT NULL
-              AND k.turnover_rate > 0
+              AND k.trade_date >= DATE(latest.trade_date, '-30 day')
+              AND NOT EXISTS (
+                  SELECT 1 FROM stock_valuation_daily v
+                  WHERE v.code = k.symbol AND v.trade_date = k.trade_date
+              )
             """
         df = pd.read_sql(text(query), self.engine, params={"target_date": target_date})
         if df.empty:
@@ -217,20 +215,21 @@ class StockValuationCollector(BaseCollector):
 
         if source == 'local_kline':
             df = df.copy()
-            df['pe_ttm'] = 0
-            df['pb'] = 0
-            df['volume_ratio'] = 0
-            df['limit_up_price'] = 0
-            df['limit_down_price'] = 0
+            for column in (
+                'pe_ttm', 'pb', 'total_mv', 'volume_ratio',
+                'limit_up_price', 'limit_down_price',
+            ):
+                df[column] = None
             df['source'] = source
-            valid_turnover = pd.to_numeric(df['turnover'], errors='coerce') > 0
-            float_shares = pd.Series(0.0, index=df.index)
-            float_shares.loc[valid_turnover] = (
-                pd.to_numeric(df.loc[valid_turnover, 'volume'], errors='coerce')
-                / (pd.to_numeric(df.loc[valid_turnover, 'turnover'], errors='coerce') / 100)
+            inputs = df.reindex(columns=['price', 'volume', 'turnover']).apply(
+                pd.to_numeric, errors='coerce',
+            ).replace([float('inf'), float('-inf')], float('nan'))
+            valid = inputs.gt(0).all(axis=1)
+            # K 线没有总股本或历史财务分母，不能将流通市值冒充总市值。
+            df['circ_mv'] = (
+                inputs['price'] * inputs['volume']
+                / (inputs['turnover'].where(valid) / 100)
             )
-            df['circ_mv'] = pd.to_numeric(df['price'], errors='coerce').fillna(0) * float_shares
-            df['total_mv'] = df['circ_mv']
             df = df.drop(columns=['volume'], errors='ignore')
         else:
             rename_map = {
@@ -242,29 +241,18 @@ class StockValuationCollector(BaseCollector):
             df = df.rename(columns=rename_map)
             if source == 'sina':
                 df['code'] = df['code'].astype(str).str.extract(r'(\d{6})', expand=False)
-                df['total_mv'] = 0
-                df['circ_mv'] = 0
-                df['pe_ttm'] = 0
-                df['pb'] = 0
-                df['turnover'] = 0
-                df['volume_ratio'] = 0
+                for column in ('total_mv', 'circ_mv', 'pe_ttm', 'pb', 'turnover', 'volume_ratio'):
+                    df[column] = None
             if 'trade_date' not in df.columns or df['trade_date'].isna().all():
                 df['trade_date'] = date.today()
-            df['limit_up_price'] = df.get('limit_up_price', 0)
-            df['limit_down_price'] = df.get('limit_down_price', 0)
             df['source'] = source
 
-        cols = [
-            "code", "name", "trade_date", "price", "pe_ttm", "pb",
-            "total_mv", "circ_mv", "pct_chg", "turnover", "volume_ratio",
-            "limit_up_price", "limit_down_price", "source"
-        ]
-        for c in cols:
+        for c in self._columns:
             if c == "source" and c not in df.columns:
                 df[c] = source
             elif c not in df.columns:
-                df[c] = 0
-        df = df[cols].copy()
+                df[c] = None
+        df = df[self._columns].copy()
         df['code'] = df['code'].astype(str).str.zfill(6)
         df = df[df['code'].str.match(r"^(00|30|60|68|83|87|43|92)\d{4}$")]
 
@@ -274,56 +262,75 @@ class StockValuationCollector(BaseCollector):
             "volume_ratio", "limit_up_price", "limit_down_price"
         ]
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            df[col] = pd.to_numeric(df[col], errors='coerce').replace(
+                [float('inf'), float('-inf')], float('nan'),
+            )
 
         return df
 
     def save_data(self, df: pd.DataFrame):
         """
-        保存估值数据
+        按股票和日期幂等保存；仅当天非推算数据同步当前估值。
 
         Args:
             df: 要保存的数据
         """
-        if df.empty:
+        if df is None or df.empty:
             return
 
-        trade_dates = sorted(pd.to_datetime(df['trade_date']).dt.strftime('%Y-%m-%d').unique())
+        df = df.reindex(columns=self._columns).copy()
+        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise').dt.strftime('%Y-%m-%d')
+        if df[['code', 'trade_date']].isna().any().any():
+            raise ValueError("估值记录必须包含 code 和 trade_date")
+        trade_dates = sorted(df['trade_date'].unique())
         date_desc = ", ".join(trade_dates)
 
         logger.info(f"💾 正在存储 {date_desc} 的估值数据 ({len(df)}条)...")
 
+        columns_sql = ', '.join(self._columns)
+        values_sql = ', '.join(f':{column}' for column in self._columns)
+        # 真值之间保留缺项；替换兜底行时不继承推算值或旧版伪造的零值。
+        updates_sql = ', '.join(
+            f"{column} = CASE WHEN {self.table_name}.source = 'local_kline' "
+            f'THEN excluded.{column} '
+            f'ELSE COALESCE(excluded.{column}, {self.table_name}.{column}) END'
+            for column in self._columns if column not in ('code', 'trade_date')
+        )
+        upsert = text(f"""
+            INSERT INTO {self.table_name} ({columns_sql}) VALUES ({values_sql})
+            ON CONFLICT (code, trade_date) DO UPDATE SET {updates_sql}
+            WHERE excluded.source <> 'local_kline'
+               OR {self.table_name}.source = 'local_kline'
+        """)
+        today = date.today().isoformat()
         with self.engine.begin() as conn:
-            for trade_date in trade_dates:
-                conn.execute(text(f"DELETE FROM {self.table_name} WHERE trade_date = :dt"), {"dt": trade_date})
-
-            # 追加插入
-            df.to_sql(self.table_name, conn, if_exists='append', index=False)
-
-            # 同步更新 stock_info 表的估值字段
-            logger.info("🔄 同步更新 stock_info 表的估值字段...")
             update_count = 0
-            for _, row in tqdm(df.iterrows(), total=len(df), desc="  更新估值信息", unit="只"):
-                # total_mv 单位是元，需要转换为亿元
-                market_cap = row['total_mv'] / 100000000 if pd.notna(row['total_mv']) else None
+            for start in range(0, len(df), 500):
+                batch = df.iloc[start:start + 500].astype(object)
+                records = batch.where(pd.notna(batch), None).to_dict('records')
+                conn.execute(upsert, records)
+                for row in records:
+                    if row['trade_date'] != today or row['source'] in (None, '', 'local_kline'):
+                        continue
+                    market_cap = row['total_mv'] / 100000000 if row['total_mv'] else None
+                    conn.execute(text("""
+                        UPDATE stock_info
+                        SET
+                            pe = CASE WHEN :pe > 0 THEN :pe ELSE pe END,
+                            pb = CASE WHEN :pb > 0 THEN :pb ELSE pb END,
+                            market_cap = CASE
+                                WHEN :market_cap > 0 THEN :market_cap ELSE market_cap END
+                        WHERE symbol = :symbol
+                    """), {
+                        "pe": row['pe_ttm'],
+                        "pb": row['pb'],
+                        "market_cap": market_cap,
+                        "symbol": row['code'],
+                    })
+                    update_count += 1
 
-                conn.execute(text("""
-                    UPDATE stock_info
-                    SET
-                        pe = CASE WHEN :pe > 0 THEN :pe ELSE pe END,
-                        pb = CASE WHEN :pb > 0 THEN :pb ELSE pb END,
-                        market_cap = CASE WHEN :market_cap > 0 THEN :market_cap ELSE market_cap END
-                    WHERE symbol = :symbol
-                """), {
-                    "pe": row['pe_ttm'],
-                    "pb": row['pb'],
-                    "market_cap": market_cap,
-                    "symbol": row['code']
-                })
-                update_count += 1
-
-            logger.info(f"✅ {date_desc} 估值数据入库成功！")
-            logger.info(f"✅ 已同步更新 {update_count} 只股票的估值信息到 stock_info 表")
+        logger.info(f"✅ {date_desc} 估值数据入库成功！")
+        logger.info(f"✅ 已同步更新 {update_count} 只股票的估值信息到 stock_info 表")
 
     def run(self, target_date: str | None = None) -> bool:
         """执行估值数据采集"""
@@ -353,6 +360,14 @@ class StockValuationCollector(BaseCollector):
             df_raw = self.fetch_local_snapshot()
         if df_raw is not None and not df_raw.empty:
             df_clean = self.process_data(df_raw)
+            if df_clean is None or df_clean.empty:
+                self.log_collection_end(False, "清洗后无有效估值数据")
+                return False
+            if 'source' in df_clean and df_clean['source'].eq('local_kline').any():
+                logger.warning(
+                    "degraded: source=local_kline；仅保存本地行情与推算流通市值，"
+                    "历史 PE/PB 和总市值无法真实恢复，缺失字段保留 NULL，非官方估值"
+                )
             self.save_data(df_clean)
             self.log_collection_end(True, f"采集 {len(df_clean)} 条数据")
             return True

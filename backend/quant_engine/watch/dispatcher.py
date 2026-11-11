@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from app.core.config import settings
 from app.notifications.email_notifier import EmailDeliveryResult, send_notification
@@ -78,6 +79,23 @@ class WatchNotificationDispatcher:
     ) -> str | None:
         if delivery["status"] in {"SENT", "SKIPPED"}:
             return None
+        if delivery["delivery_type"] == "event":
+            event = conn.execute(
+                "SELECT * FROM watch_events WHERE event_id=?", (delivery["event_id"],)
+            ).fetchone()
+            if event is None:
+                return self._skip_delivery(conn, delivery, "event missing before delivery")
+            if not self._event_actionable(event):
+                return self._skip_delivery(conn, delivery, "event resolved before delivery")
+            reason = self._event_delivery_block_reason(event)
+            if reason:
+                return self._skip_delivery(conn, delivery, reason)
+            if not self._event_should_send_immediately(event):
+                return self._skip_delivery(conn, delivery, "end-of-day trigger included in digest")
+        elif delivery["delivery_type"] == "digest":
+            trade_date = str(delivery["dedupe_key"]).rsplit(":", 1)[-1]
+            if self._has_historical_snapshots(conn, trade_date):
+                return self._skip_delivery(conn, delivery, "historical repair snapshot is not a digest")
         result = self.sender(subject, body, is_html=True)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         attempts = int(delivery["attempt_count"] or 0) + 1
@@ -380,6 +398,57 @@ class WatchNotificationDispatcher:
             and str(event["status"] or "UNREAD").upper()
             not in {"ACKNOWLEDGED", "RESOLVED"}
         )
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+    @classmethod
+    def _historical_payload(cls, payload: dict) -> bool:
+        markers = {"historical", "historical_repair", "history_repair", "repair", "backfill"}
+        return (
+            any(str(payload.get(key) or "").lower() in markers
+                for key in ("source", "mode", "origin"))
+            or any(payload.get(key) in (True, 1, "true", "True")
+                   for key in ("historical", "is_historical", "repair"))
+            or str(cls._json_mapping(payload.get("watch_rebuild")).get("mode") or "").lower()
+            == "historical"
+        )
+
+    def _event_delivery_block_reason(self, event: sqlite3.Row) -> str | None:
+        """发送资格与请求日期无关，显式日期也不能复活历史盘中提醒。"""
+        payload = self._json_mapping(event["payload"])
+        dedupe_key = str(event["dedupe_key"] or "").lower()
+        if self._historical_payload(payload) or dedupe_key.startswith(
+            ("historical:", "repair:", "backfill:")
+        ):
+            return "historical repair event is not deliverable"
+        intraday = (
+            str(payload.get("source") or "").lower() == "intraday_5min"
+            or dedupe_key.startswith("intraday:")
+        )
+        if intraday and str(event["trade_date"] or "")[:10] != self._today():
+            return "intraday event expired outside its trading date"
+        return None
+
+    def _has_historical_snapshots(self, conn: sqlite3.Connection, trade_date: str) -> bool:
+        return any(
+            self._historical_payload(self._json_mapping(row[0]))
+            for row in conn.execute(
+                "SELECT factors FROM watch_daily_snapshot WHERE trade_date=?", (trade_date,)
+            )
+        )
+
+    def _skip_existing_event_deliveries(
+        self, conn: sqlite3.Connection, event: sqlite3.Row, reason: str,
+    ) -> int:
+        deliveries = conn.execute(
+            "SELECT * FROM notification_deliveries WHERE event_id=? "
+            "AND status IN ('PENDING', 'FAILED')", (event["event_id"],)
+        ).fetchall()
+        for delivery in deliveries:
+            self._skip_delivery(conn, delivery, reason)
+        return len(deliveries)
 
     @classmethod
     def _event_should_send_immediately(cls, event: sqlite3.Row) -> bool:
@@ -717,6 +786,10 @@ class WatchNotificationDispatcher:
                 params,
             ).fetchall()
             for event in events:
+                reason = self._event_delivery_block_reason(event)
+                if reason:
+                    stats["skipped"] += self._skip_existing_event_deliveries(conn, event, reason)
+                    continue
                 if not self._event_should_send_immediately(event):
                     continue
                 delivery = self._ensure_delivery(
@@ -785,6 +858,7 @@ class WatchNotificationDispatcher:
             "SELECT * FROM watch_events WHERE trade_date=? ORDER BY severity DESC, created_at",
             (trade_date,),
         ).fetchall()
+        events = [event for event in events if not self._event_delivery_block_reason(event)]
         dataset = self._digest_dataset(conn, trade_date)
         snapshots = dataset["rows"]
         counts = self._state_counts(snapshots)
@@ -1068,6 +1142,9 @@ class WatchNotificationDispatcher:
         stats = self._stats()
         date_text = str(trade_date)[:10]
         with closing(self._connect()) as conn:
+            if self._has_historical_snapshots(conn, date_text):
+                stats["skipped"] += 1
+                return stats
             c_dataset = self._c_digest_dataset(conn, date_text)
             if not c_dataset["trusted"]:
                 logger.warning("C日报可信门未通过: trade_date=%s reason=%s",
@@ -1797,6 +1874,11 @@ class WatchNotificationDispatcher:
                     body = self._portfolio_exit_immediate_body(event)
                 elif delivery_type == "digest":
                     trade_date = str(delivery["dedupe_key"]).rsplit(":", 1)[-1]
+                    if self._has_historical_snapshots(conn, trade_date):
+                        stats[self._skip_delivery(
+                            conn, delivery, "historical repair snapshot is not a digest"
+                        )] += 1
+                        continue
                     if self._table_exists(conn, "smart_watchlist_state"):
                         smart = conn.execute(
                             "SELECT target_trade_date FROM smart_watchlist_state "
@@ -1830,6 +1912,10 @@ class WatchNotificationDispatcher:
                             delivery,
                             "event resolved before delivery",
                         )] += 1
+                        continue
+                    reason = self._event_delivery_block_reason(event)
+                    if reason:
+                        stats[self._skip_delivery(conn, delivery, reason)] += 1
                         continue
                     if not self._event_should_send_immediately(event):
                         stats[self._skip_delivery(

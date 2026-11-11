@@ -968,11 +968,25 @@ async def update_watch_event(event_id: str, body: WatchEventUpdate):
 
 
 @router.get('/mrgc-report', response_model=ApiResponse)
-def get_mrgc_daily_report(trade_date: str):
+def get_mrgc_daily_report(trade_date: str, hints_only: bool = False):
     """Read the dated archive and task status without recalculating or calling AI."""
     from quant_engine.watch.mrgc_report_jobs import get_report
     try:
-        return ApiResponse(data=get_report(WATCH_DB_PATH, trade_date))
+        data = (get_report(WATCH_DB_PATH, trade_date, include_email=False)
+                if hints_only else get_report(WATCH_DB_PATH, trade_date))
+        report = data.get("report")
+        if hints_only:
+            if report is not None:
+                fields = ("symbol", "name", "status", "data_status", "analysis", "price", "stop_price")
+                stocks = []
+                for stock in report["stocks"][:300]:
+                    stocks.append({
+                        **{key: stock.get(key) for key in fields},
+                        "events": (stock.get("events") or [])[:32],
+                        "chan_signals": (stock.get("chan_signals") or [])[:32],
+                    })
+                data["report"] = {"date": report["date"], "status": report["status"], "stocks": stocks}
+        return ApiResponse(data=data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (sqlite3.Error, OSError) as exc:

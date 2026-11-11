@@ -102,48 +102,31 @@ def aggregate_120min(bars: list[dict]) -> list[dict]:
 
 def _tdx_bars(kind: str, symbol: str, market: int, minutes: int,
               count: int, deadline: float) -> tuple[list[dict], str, str]:
-    from data_job.core.tdx_adapter import TDX_SERVERS
-    from pytdx.hq import TdxHq_API
+    from data_job.core.mootdx_adapter import MootdxAdapter
 
-    # A new connection for every attempt; no probe or pooled monitor stream.
-    for host, port in TDX_SERVERS[:2]:
-        api = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
-        try:
-            if not api.connect(host, port, time_out=_remaining(deadline)):
-                continue
-            rows = []
-            method = api.get_index_bars if kind == "index" else api.get_security_bars
-            for offset in range(0, count, 800):
-                timeout = _remaining(deadline)
-                if getattr(api, "client", None) is not None:
-                    api.client.settimeout(timeout)
-                page = method(2 if minutes == 30 else 3, market, symbol,
-                              offset, min(800, count - offset))
-                if not page:
-                    raise MinuteChartUnavailable("通达信分钟行情为空")
-                rows.extend(page)
-                if len(page) < min(800, count - offset):
-                    break
-            raw = []
-            for row in rows:
-                # TDX's binary bars carry no symbol; an isolated request stream is mandatory.
-                if row.get("code") is not None and str(row["code"]) != symbol:
-                    raise MinuteChartUnavailable("通达信返回证券代码不一致")
-                raw.append({"bar_time": row.get("datetime"), "open": row.get("open"),
-                            "high": row.get("high"), "low": row.get("low"),
-                            "close": row.get("close"), "volume": row.get("vol"),
-                            "amount": row.get("amount")})
-            # Keep native TDX volume. Index and stock native units must not be guessed.
-            return raw, "tdx_index" if kind == "index" else "tdx_stock", "tdx_native"
-        except Exception as exc:
-            logger.debug("Isolated minute TDX request failed (%s)", type(exc).__name__)
-            _remaining(deadline)
-        finally:
-            try:
-                api.disconnect()
-            except Exception as exc:
-                logger.debug("Minute TDX disconnect failed (%s)", type(exc).__name__)
-    raise MinuteChartUnavailable("通达信分钟行情暂不可用")
+    def convert(rows: list[dict]) -> list[dict]:
+        return [{"bar_time": row.get("datetime"), "open": row.get("open"),
+                 "high": row.get("high"), "low": row.get("low"),
+                 "close": row.get("close"), "volume": row.get("vol"),
+                 "amount": row.get("amount")} for row in rows]
+
+    def validate(rows: list[dict]) -> None:
+        # Validate inside the attempt so malformed source data can fail over.
+        # A requested date outside the source window is not a broken node.
+        _normalize_bars(convert(rows), datetime.now(SHANGHAI), None, minutes)
+
+    try:
+        rows = MootdxAdapter.read_isolated_minute_bars(
+            kind=kind, symbol=symbol, market=market, period=f"{minutes}min",
+            count=count, deadline=deadline, validate=validate,
+        )
+    except TimeoutError as exc:
+        raise MinuteChartUnavailable("分钟行情请求超时") from exc
+    except Exception as exc:
+        logger.debug("Isolated minute TDX request failed (%s)", type(exc).__name__)
+        raise MinuteChartUnavailable("通达信分钟行情暂不可用") from exc
+    # Keep native volume units; never share the monitor's socket or daily bars.
+    return convert(rows), f"tdx_{kind}", "tdx_native"
 
 
 def _eastmoney_bars(symbol: str, minutes: int, count: int,

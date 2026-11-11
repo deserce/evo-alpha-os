@@ -9,7 +9,7 @@ import {
   type CSSProperties,
   type ReactNode,
 } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   GripVertical,
   PanelRightClose,
@@ -28,6 +28,7 @@ import {
   int,
   num,
   pct,
+  ratioPct,
   rows,
   text,
   toNumber,
@@ -37,7 +38,17 @@ import { quantApi, stockApi } from '@/lib/api';
 import { useGlobalStore } from '@/lib/store';
 import { resolveStrategyDate, strategyDateOptions } from '@/lib/strategyDateSelection';
 
-type SourceId = 'mrgc' | 'alpha' | 'pocket' | 'breakout' | 'exhaustion';
+type LegacySourceId = 'mrgc' | 'alpha' | 'pocket' | 'breakout' | 'exhaustion';
+type FormulaSourceId =
+  | 'rps_acceleration_v1'
+  | 'rps_platform_breakout_v1'
+  | 'rps_long_pullback_v1'
+  | 'rps_resonance_v1'
+  | 'monthly_reversal_v65'
+  | 'near_year_high_v1';
+type SourceId = LegacySourceId | FormulaSourceId;
+type FormulaRun = { status: string; signal_count: number | null };
+type FormulaPage = { rows: Row[]; total: number; calculation?: Row };
 type SortKey = 'close' | 'pct_chg' | 'rps_5' | 'rps_10' | 'rps_20' | 'rps_50' | 'rps_120' | 'rps_250';
 type SortState = { key: SortKey; dir: 'asc' | 'desc' };
 
@@ -61,13 +72,49 @@ type TableColumn = {
   render: (row: Row) => ReactNode;
 };
 
-const SOURCE_OPTIONS: SourceOption[] = [
+const LEGACY_SOURCE_OPTIONS: SourceOption[] = [
   { id: 'mrgc', label: '陶博士 MRGC', short: 'MRGC', hint: '形态选股', icon: Sparkles, tone: 'cyan' },
   { id: 'alpha', label: 'Alpha Pool', short: 'Alpha', hint: 'S4/S5 机会', icon: Target, tone: 'blue' },
   { id: 'pocket', label: '口袋买点', short: '口袋', hint: 'Pocket Pivot', icon: Zap, tone: 'green' },
   { id: 'breakout', label: '突破买点', short: '突破', hint: 'Breakout', icon: Zap, tone: 'amber' },
   { id: 'exhaustion', label: '抛压衰竭', short: '衰竭', hint: 'Supply Exhaustion', icon: Zap, tone: 'rose' },
 ];
+
+const FORMULA_SOURCE_OPTIONS: SourceOption[] = [
+  { id: 'rps_acceleration_v1', label: 'RPS50 加速启动', short: '加速启动', hint: 'RPS 翻强 · 量价确认', icon: Zap, tone: 'cyan' },
+  { id: 'rps_platform_breakout_v1', label: '20 日启动点突破', short: '启动点突破', hint: '启动阳线 · RPS 共振', icon: Zap, tone: 'amber' },
+  { id: 'rps_long_pullback_v1', label: '年度主线回踩', short: '年度回踩', hint: 'RPS120 / 250 · 回踩', icon: Target, tone: 'green' },
+  { id: 'rps_resonance_v1', label: '多周期 RPS 共振', short: 'RPS 共振', hint: 'RPS10 / 20 / 50', icon: Zap, tone: 'blue' },
+  { id: 'monthly_reversal_v65', label: '月线反转 6.5', short: '月线反转', hint: '日 K 计算 · 15 根首次成立', icon: Sparkles, tone: 'rose' },
+  { id: 'near_year_high_v1', label: '接近一年新高', short: '接近年高', hint: '收盘 / 250 日最高 > 90%', icon: Target, tone: 'amber' },
+];
+// Temporarily show only MRGC and the formula strategies on this page.
+const SOURCE_OPTIONS = [
+  ...LEGACY_SOURCE_OPTIONS.filter(({ id }) => id === 'mrgc'),
+  ...FORMULA_SOURCE_OPTIONS,
+];
+const FORMULA_PAGE_SIZE = 500;
+const FORMULA_METRIC: Record<FormulaSourceId, {
+  label: string;
+  format: (meta: Row) => string;
+}> = {
+  rps_acceleration_v1: { label: '20 日前 RPS50', format: (meta) => num(meta.rps_50_at_20, 1) },
+  rps_platform_breakout_v1: { label: '启动日高点', format: (meta) => num(meta.high_20, 2) },
+  rps_long_pullback_v1: { label: '距 50 日前收盘', format: (meta) => ratioPct(meta.distance_to_close_50) },
+  rps_resonance_v1: {
+    label: '当日量 / 5 日均量',
+    format: (meta) => {
+      const average = toNumber(meta.ma_volume_5);
+      return average > 0 ? num(toNumber(meta.volume, Number.NaN) / average, 2) : '-';
+    },
+  },
+  monthly_reversal_v65: { label: '站上 MA200 天数', format: (meta) => int(meta.closes_above_ma_200) },
+  near_year_high_v1: { label: '收盘 / 年内最高', format: (meta) => ratioPct(meta.close_to_high_250) },
+};
+
+function isFormulaSource(source: SourceId): source is FormulaSourceId {
+  return FORMULA_SOURCE_OPTIONS.some((option) => option.id === source);
+}
 
 const SIGNAL_SOURCE_TYPE: Partial<Record<SourceId, string>> = {
   pocket: 'pocket_pivot',
@@ -122,15 +169,57 @@ function sourceToneClass(tone: SourceOption['tone'], active: boolean) {
 function SourceTabs({
   activeSource,
   counts,
+  options,
   onSelect,
 }: {
   activeSource: SourceId;
-  counts: Record<SourceId, number | null>;
+  counts: Partial<Record<SourceId, number | null>>;
+  options: SourceOption[];
   onSelect: (source: SourceId) => void;
 }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const strip = scrollRef.current;
+    if (!strip) return;
+
+    const onWheel = (event: WheelEvent) => {
+      if (!event.cancelable || event.ctrlKey || event.shiftKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+
+      const maxScroll = strip.scrollWidth - strip.clientWidth;
+      if (maxScroll <= 0) return;
+
+      const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? strip.clientWidth : 1;
+      const next = Math.max(0, Math.min(maxScroll, strip.scrollLeft + event.deltaY * scale));
+      if (Math.abs(next - strip.scrollLeft) < 0.5) return;
+
+      event.preventDefault();
+      strip.scrollLeft = next;
+    };
+
+    strip.addEventListener('wheel', onWheel, { passive: false });
+    return () => strip.removeEventListener('wheel', onWheel);
+  }, []);
+
+  useEffect(() => {
+    const strip = scrollRef.current;
+    const active = strip?.querySelector('[aria-pressed="true"]');
+    if (!strip || !active) return;
+
+    const viewport = strip.getBoundingClientRect();
+    const button = active.getBoundingClientRect();
+    if (button.left < viewport.left) strip.scrollLeft += button.left - viewport.left;
+    else if (button.right > viewport.right) strip.scrollLeft += button.right - viewport.right;
+  }, [activeSource]);
+
   return (
-    <div className="flex min-w-0 flex-nowrap items-center gap-1 overflow-x-auto custom-scrollbar">
-      {SOURCE_OPTIONS.map((option) => {
+    <div
+      ref={scrollRef}
+      role="group"
+      aria-label="选股策略，可横向滚动"
+      className="flex min-w-0 flex-nowrap items-center gap-1 overflow-x-auto overscroll-x-contain custom-scrollbar"
+    >
+      {options.map((option) => {
         const Icon = option.icon;
         const active = activeSource === option.id;
         const count = counts[option.id];
@@ -138,8 +227,10 @@ function SourceTabs({
           <button
             key={option.id}
             type="button"
+            aria-pressed={active}
+            title={option.label}
             onClick={() => onSelect(option.id)}
-            className={`group h-8 min-w-[104px] rounded-md border px-2 text-left transition ${sourceToneClass(option.tone, active)}`}
+            className={`group h-8 min-w-[104px] shrink-0 rounded-md border px-2 text-left transition ${sourceToneClass(option.tone, active)}`}
           >
             <span className="flex items-center justify-between gap-2">
               <span className="flex min-w-0 items-center gap-1.5">
@@ -250,7 +341,9 @@ export default function StrategyPage() {
   const { globalDate, setGlobalDate, reportOpen } = useGlobalStore();
   const queryClient = useQueryClient();
   const restoredStrategy = useGlobalStore.getState().stockSidebarUi.strategy;
-  const [activeSource, setActiveSource] = useState<SourceId>(restoredStrategy && ['mrgc','alpha','pocket','breakout','exhaustion'].includes(restoredStrategy.source) ? restoredStrategy.source as SourceId : 'mrgc');
+  const [activeSource, setActiveSource] = useState<SourceId>(
+    SOURCE_OPTIONS.find((option) => option.id === restoredStrategy?.source)?.id ?? 'mrgc',
+  );
   const [sortState, setSortState] = useState<SortState | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState(restoredStrategy?.symbol || '');
   const assistantSelectionRef = useRef<{ symbol: string; date: string; source: SourceId } | null>(null);
@@ -302,6 +395,37 @@ export default function StrategyPage() {
       }),
     enabled: Boolean(effectiveDate) && activeSource === 'mrgc',
   });
+
+  const formulaSource = isFormulaSource(activeSource) ? activeSource : undefined;
+  const formulaRunsQuery = useQuery({
+    queryKey: ['strategy-formula-runs', effectiveDate],
+    queryFn: () => quantApi.getFormulaStrategyRuns(effectiveDate) as Promise<{
+      runs: Partial<Record<FormulaSourceId, FormulaRun>>;
+    }>,
+    enabled: Boolean(effectiveDate),
+  });
+  const formulaQuery = useInfiniteQuery({
+    queryKey: ['strategy-source-formula', effectiveDate, formulaSource],
+    queryFn: ({ pageParam }) => quantApi.getStrategyResults({
+      tradeDate: effectiveDate,
+      strategyName: formulaSource,
+      limit: FORMULA_PAGE_SIZE,
+      offset: pageParam,
+    }) as Promise<FormulaPage>,
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, _pages, offset) =>
+      lastPage.rows.length && offset + lastPage.rows.length < lastPage.total
+        ? offset + lastPage.rows.length
+        : undefined,
+    enabled: Boolean(effectiveDate && formulaSource),
+  });
+  const formulaCalculation = formulaQuery.data?.pages[0]?.calculation;
+  const formulaRows = useMemo(
+    () => formulaCalculation?.status === 'success'
+      ? formulaQuery.data?.pages.flatMap((page) => page.rows) ?? []
+      : [],
+    [formulaCalculation, formulaQuery.data],
+  );
 
   const mrgcRebuildMutation = useMutation({
     mutationFn: (tradeDate: string) =>
@@ -387,7 +511,7 @@ export default function StrategyPage() {
     enabled: Boolean(effectiveDate) && activeSource === 'exhaustion',
   });
 
-  const sourceRows = useMemo<Record<SourceId, Row[]>>(
+  const sourceRows = useMemo<Record<LegacySourceId, Row[]>>(
     () => ({
       mrgc: rows<Row>(mrgcQuery.data?.rows),
       alpha: rows<Row>(alphaQuery.data?.rows),
@@ -398,15 +522,23 @@ export default function StrategyPage() {
     [alphaQuery.data, breakoutQuery.data, exhaustionQuery.data, mrgcQuery.data, pocketQuery.data],
   );
 
-  const sourceCounts = useMemo<Record<SourceId, number | null>>(
+  const sourceCounts = useMemo<Partial<Record<SourceId, number | null>>>(
     () => ({
       mrgc: mrgcQuery.data ? sourceRows.mrgc.length : null,
       alpha: alphaQuery.data ? sourceRows.alpha.length : null,
       pocket: pocketQuery.data ? sourceRows.pocket.length : null,
       breakout: breakoutQuery.data ? sourceRows.breakout.length : null,
       exhaustion: exhaustionQuery.data ? sourceRows.exhaustion.length : null,
+      ...Object.fromEntries(
+        Object.entries(formulaRunsQuery.data?.runs ?? {}).map(([id, run]) => [
+          id, run?.status === 'success' ? run.signal_count : null,
+        ]),
+      ),
+      ...(formulaSource && formulaCalculation?.status === 'success'
+        ? { [formulaSource]: toNumber(formulaCalculation.signal_count, formulaRows.length) }
+        : {}),
     }),
-    [alphaQuery.data, breakoutQuery.data, exhaustionQuery.data, mrgcQuery.data, pocketQuery.data, sourceRows],
+    [alphaQuery.data, breakoutQuery.data, exhaustionQuery.data, mrgcQuery.data, pocketQuery.data, sourceRows, formulaRunsQuery.data, formulaSource, formulaCalculation, formulaRows.length],
   );
 
   const isLoading =
@@ -414,10 +546,12 @@ export default function StrategyPage() {
     (activeSource === 'alpha' && alphaQuery.isLoading) ||
     (activeSource === 'pocket' && pocketQuery.isLoading) ||
     (activeSource === 'breakout' && breakoutQuery.isLoading) ||
-    (activeSource === 'exhaustion' && exhaustionQuery.isLoading);
+    (activeSource === 'exhaustion' && exhaustionQuery.isLoading) ||
+    (Boolean(formulaSource) && formulaQuery.isLoading);
 
   const currentRows = useMemo(() => {
-    const rowsWithIndex = sourceRows[activeSource].map((row, index) => ({ row, index }));
+    const activeRows = isFormulaSource(activeSource) ? formulaRows : sourceRows[activeSource];
+    const rowsWithIndex = activeRows.map((row, index) => ({ row, index }));
 
     if (sortState) {
       return rowsWithIndex
@@ -456,7 +590,7 @@ export default function StrategyPage() {
     }
 
     return rowsWithIndex.map((item) => item.row);
-  }, [activeSource, sortState, sourceRows]);
+  }, [activeSource, sortState, sourceRows, formulaRows]);
 
   const selectedIndex = useMemo(
     () => currentRows.findIndex((row) => rowSymbol(row) === selectedSymbol),
@@ -464,6 +598,7 @@ export default function StrategyPage() {
   );
   const selectedRow = selectedIndex >= 0 ? currentRows[selectedIndex] : undefined;
   const activeOption = SOURCE_OPTIONS.find((option) => option.id === activeSource) ?? SOURCE_OPTIONS[0];
+  const formulaMetric = formulaSource ? FORMULA_METRIC[formulaSource] : undefined;
 
   const tableColumns = useMemo<TableColumn[]>(
     () => [
@@ -517,6 +652,17 @@ export default function StrategyPage() {
         className: 'w-[48px] min-w-[48px]',
         render: (row) => <span className="font-mono text-text-primary">{formatRpsValue(row[key])}</span>,
       })),
+      ...(formulaMetric ? [{
+        key: 'formula_metric',
+        label: formulaMetric.label,
+        align: 'right' as const,
+        className: 'w-[110px] min-w-[110px]',
+        render: (row: Row) => (
+          <span className="font-mono text-text-primary">
+            {formulaMetric.format((row.meta ?? {}) as Row)}
+          </span>
+        ),
+      }] : []),
       {
         key: 'state',
         label: 'S',
@@ -525,7 +671,7 @@ export default function StrategyPage() {
         render: (row) => <StageBadge value={text(row.lifecycle_state, '-')} />,
       },
     ],
-    [],
+    [formulaMetric],
   );
 
   const handleSort = useCallback((key: SortKey) => {
@@ -594,12 +740,14 @@ export default function StrategyPage() {
   }, [handleListNavigation]);
 
   const handleRefresh = useCallback(() => {
+    void formulaRunsQuery.refetch();
+    if (formulaSource) void formulaQuery.refetch();
     if (activeSource === 'mrgc') void mrgcQuery.refetch();
     if (activeSource === 'alpha') void alphaQuery.refetch();
     if (activeSource === 'pocket') void pocketQuery.refetch();
     if (activeSource === 'breakout') void breakoutQuery.refetch();
     if (activeSource === 'exhaustion') void exhaustionQuery.refetch();
-  }, [activeSource, alphaQuery, breakoutQuery, exhaustionQuery, mrgcQuery, pocketQuery]);
+  }, [activeSource, alphaQuery, breakoutQuery, exhaustionQuery, mrgcQuery, pocketQuery, formulaRunsQuery, formulaSource, formulaQuery]);
 
   useEffect(() => {
     if (!detailOpen) {
@@ -704,7 +852,15 @@ export default function StrategyPage() {
   const mrgcNeedsRecalculation =
     activeSource === 'mrgc' && !isLoading && !mrgcCalculated;
   const emptyText =
-    activeSource === 'mrgc'
+    formulaSource
+      ? formulaQuery.isError
+        ? '策略结果读取失败，请刷新重试。'
+        : formulaCalculation?.status === 'failed'
+          ? `筛选失败：${text(formulaCalculation.error_message, '请查看任务日志。')}`
+          : formulaCalculation?.status === 'success'
+            ? '筛选已完成，本日没有命中结果。'
+            : '当前日期尚未运行此策略。'
+    : activeSource === 'mrgc'
       ? mrgcCalculated
         ? 'MRGC 筛选已完成，本日没有命中结果。'
         : text(mrgcCalculation.error_message, '当前日期尚未运行 MRGC 筛选。')
@@ -720,18 +876,18 @@ export default function StrategyPage() {
         <section className="evo-panel mb-1.5 shrink-0 px-2.5 py-1.5">
           <div className="flex min-w-0 items-center gap-2">
             <div className="hidden shrink-0 items-baseline gap-2 xl:flex">
-              <h1 className="text-[16px] font-black leading-none text-white">
-                <span className="font-mono">04</span> Strategy
+              <h1 className="evo-page-title truncate">
+                <span className="evo-page-index">04</span> Strategy
               </h1>
               <span className="text-[11px] text-text-tertiary">策略选股</span>
             </div>
             <div className="min-w-0 flex-1">
-              <SourceTabs activeSource={activeSource} counts={sourceCounts} onSelect={selectSource} />
+              <SourceTabs options={SOURCE_OPTIONS} activeSource={activeSource} counts={sourceCounts} onSelect={selectSource} />
             </div>
             <select
               value={effectiveDate || ''}
               onChange={(event) => setGlobalDate(event.target.value)}
-              className="h-8 min-w-[130px] rounded-md border border-border-primary bg-[#0b1220] px-2.5 font-mono text-xs text-text-primary outline-none focus:border-brand-blue/70"
+              className="h-8 min-w-[112px] shrink-0 rounded-md border border-border-primary bg-[#0b1220] px-2.5 font-mono text-xs text-text-primary outline-none focus:border-brand-blue/70"
             >
               {dateOptions.map((date) => (
                 <option key={date} value={date} className="bg-bg-secondary">
@@ -742,7 +898,7 @@ export default function StrategyPage() {
             <button
               type="button"
               onClick={() => setDetailOpen((value) => !value)}
-              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border-primary/70 bg-bg-primary/55 px-2.5 text-xs text-text-secondary transition hover:border-brand-blue/50 hover:text-brand-blue-light"
+              className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border-primary/70 bg-bg-primary/55 px-2.5 text-xs text-text-secondary transition hover:border-brand-blue/50 hover:text-brand-blue-light"
             >
               {detailOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
               <span className="hidden sm:inline">{detailOpen ? '收起详情' : '展开详情'}</span>
@@ -750,7 +906,7 @@ export default function StrategyPage() {
             <button
               type="button"
               onClick={handleRefresh}
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-border-primary/70 bg-bg-primary/55 text-text-secondary transition hover:border-brand-blue/50 hover:text-brand-blue-light"
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border-primary/70 bg-bg-primary/55 text-text-secondary transition hover:border-brand-blue/50 hover:text-brand-blue-light"
               aria-label="刷新策略页面数据"
             >
               <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
@@ -772,12 +928,14 @@ export default function StrategyPage() {
               <div className="min-w-0">
                 <div className="truncate text-sm font-black text-text-primary">{activeOption.label} 股池</div>
                 <div className="truncate text-[10px] text-text-tertiary">
-                  ↑ / ↓ 切换，表头排序，横向查看指标
+                  {formulaSource ? activeOption.hint : '↑ / ↓ 切换，表头排序，横向查看指标'}
                 </div>
               </div>
             </div>
             <div className="font-mono text-xs text-text-tertiary">
-              {selectedIndex >= 0 ? `${selectedIndex + 1} / ${currentRows.length}` : `${currentRows.length}`}
+              {selectedIndex >= 0
+                ? `${selectedIndex + 1} / ${sourceCounts[activeSource] ?? currentRows.length}`
+                : sourceCounts[activeSource] ?? currentRows.length}
             </div>
           </div>
 
@@ -787,7 +945,7 @@ export default function StrategyPage() {
             onClick={() => listRef.current?.focus()}
             className="min-h-0 flex-1 overflow-auto outline-none custom-scrollbar focus-visible:ring-1 focus-visible:ring-brand-blue-light/70"
           >
-            <table className="w-[732px] table-fixed border-separate border-spacing-0 text-left text-[11px]">
+            <table className={`${detailOpen ? (formulaSource ? 'w-[842px]' : 'w-[732px]') : (formulaSource ? 'w-full min-w-[842px]' : 'w-full min-w-[732px]')} table-fixed border-separate border-spacing-0 text-left text-[11px]`}>
               <thead className="sticky top-0 z-10 border-b border-border-secondary bg-[#07111f]/98 text-[10px] text-text-tertiary backdrop-blur">
                 <tr>
                   {tableColumns.map((column) => (
@@ -859,7 +1017,7 @@ export default function StrategyPage() {
                             type="button"
                             disabled={mrgcRebuildActive || !effectiveDate}
                             onClick={() => effectiveDate && mrgcRebuildMutation.mutate(effectiveDate)}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-brand-blue/55 bg-brand-blue/12 px-3 text-xs font-bold text-brand-blue-light transition hover:border-brand-blue-light/75 hover:bg-brand-blue/20 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-brand-blue/55 bg-brand-blue/12 px-3 text-xs font-bold text-brand-blue-light transition hover:border-brand-blue-light/75 hover:bg-brand-blue/20 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             <RefreshCw className={`h-3.5 w-3.5 ${mrgcRebuildActive ? 'animate-spin' : ''}`} />
                             {mrgcRebuildActive ? '正在重新筛选' : '重新筛选该日期'}
@@ -874,6 +1032,18 @@ export default function StrategyPage() {
                 )}
               </tbody>
             </table>
+            {formulaSource && formulaQuery.hasNextPage ? (
+              <button
+                type="button"
+                onClick={() => void formulaQuery.fetchNextPage()}
+                disabled={formulaQuery.isFetchingNextPage}
+                className="m-2 rounded-md border border-border-primary px-3 py-1.5 text-xs text-text-secondary hover:text-brand-blue-light"
+              >
+                {formulaQuery.isFetchingNextPage
+                  ? '正在加载…'
+                  : `加载更多（已显示 ${currentRows.length} / ${sourceCounts[formulaSource]}）`}
+              </button>
+            ) : null}
           </div>
         </section>
 

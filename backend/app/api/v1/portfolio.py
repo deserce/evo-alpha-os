@@ -459,6 +459,105 @@ def list_accounts() -> list[dict[str, object]]:
         return result
 
 
+_EXIT_RISK_REASONS = {
+    "HARD_STOP_TRIGGERED": "触及硬止损线",
+    "TAKE_PROFIT_TRIGGERED": "达到分档止盈条件",
+    "TRAILING_STOP_TRIGGERED": "回落至移动止损线",
+    "TREND_EXIT_WATCH": "趋势结构转弱，继续观察",
+    "TREND_EXIT_TRIGGERED": "触发趋势卖点",
+    "TIME_STOP_TRIGGERED": "触发时间止损",
+    "PORTFOLIO_RISK": "触发组合风险规则",
+    "EXIT_DATA_BLOCKED": "卖点所需行情或指标待校验",
+}
+
+
+@router.get("/risk-summary")
+def get_risk_summary(trade_date: date) -> dict[str, object]:
+    """Read exact-date Portfolio risk for positions held at the daily snapshot."""
+    day = trade_date.isoformat()
+    counts = {"executable": 0, "watch": 0, "blocked": 0}
+    with _map_errors(), closing(_connect_read()) as conn:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("BEGIN")
+        snapshot = conn.execute(
+            """
+            SELECT COUNT(*) AS account_count, COALESCE(SUM(position_count), 0) AS position_count
+            FROM portfolio_account_daily_snapshots
+            WHERE snapshot_date = ?
+            """,
+            (day,),
+        ).fetchone()
+        rows = []
+        if snapshot["account_count"]:
+            has_stock_info = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stock_info'"
+            ).fetchone() is not None
+            name = "COALESCE(NULLIF(stock.name, ''), event.symbol)" if has_stock_info else "event.symbol"
+            stock_join = "LEFT JOIN stock_info stock ON stock.symbol = event.symbol" if has_stock_info else ""
+            matching_events = """
+                FROM portfolio_position_daily_snapshots position
+                JOIN portfolio_exit_events event
+                  ON event.account_id = position.account_id
+                 AND event.symbol = position.symbol
+                 AND event.position_revision = position.position_revision
+                 AND event.trigger_date = position.snapshot_date
+                WHERE position.snapshot_date = ? AND position.quantity > 0
+                  AND event.event_type <> 'EXIT_DATA_RECOVERED'
+            """
+            category = """
+                CASE WHEN event.event_type = 'EXIT_DATA_BLOCKED' THEN 'blocked'
+                     WHEN event.executable = 1 AND event.available_quantity > 0
+                          AND event.recommended_quantity > 0 THEN 'executable'
+                     ELSE 'watch' END
+            """
+            for row in conn.execute(
+                f"SELECT {category} AS category, COUNT(*) AS count "
+                f"{matching_events} GROUP BY category",
+                (day,),
+            ):
+                counts[row["category"]] = row["count"]
+
+            # Join display fields only after choosing the small event preview.
+            preview = conn.execute(
+                f"""
+                WITH matched AS (
+                    SELECT event.id, position.quantity, {category} AS category
+                    {matching_events}
+                    ORDER BY event.event_status = 'RESOLVED',
+                             CASE event.severity WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END,
+                             event.triggered_at DESC, event.id DESC
+                    LIMIT 8
+                )
+                SELECT event.id, event.account_id, account.name AS account_name,
+                       event.symbol, {name} AS name, event.event_type, event.event_status,
+                       event.severity, event.triggered_at, event.bar_time, matched.quantity,
+                       event.available_quantity, event.recommended_quantity, matched.category,
+                       CASE WHEN json_type(event.payload_json, '$.reason') = 'text'
+                            THEN substr(json_extract(event.payload_json, '$.reason'), 1, 240)
+                       END AS reason
+                FROM matched
+                JOIN portfolio_exit_events event ON event.id = matched.id
+                JOIN portfolio_accounts account ON account.id = event.account_id
+                {stock_join}
+                ORDER BY event.event_status = 'RESOLVED',
+                         CASE event.severity WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END,
+                         event.triggered_at DESC, event.id DESC
+                """,
+                (day,),
+            )
+            for row in preview:
+                item = dict(row)
+                item["reason"] = (item["reason"] or "").strip() or _EXIT_RISK_REASONS[row["event_type"]]
+                rows.append(item)
+    return {
+        "trade_date": day,
+        "snapshot_ready": bool(snapshot["account_count"]),
+        "position_count": snapshot["position_count"],
+        "counts": counts,
+        "rows": rows,
+    }
+
+
 @router.get("/statement")
 def get_statement(account_id: int = Query(gt=0)) -> dict[str, object]:
     """Read bounded account history with reversal flags from the entire ledger."""

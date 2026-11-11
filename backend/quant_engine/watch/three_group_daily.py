@@ -6,6 +6,7 @@ are recorded separately from existing low-buy/portfolio reminder dedupe keys.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 import fcntl
@@ -22,12 +23,12 @@ from zoneinfo import ZoneInfo
 from app.core.config import settings
 from app.notifications.email_notifier import EmailDeliveryResult, send_notification
 from quant_engine.research.structure_turning import VERSION, evaluate_structure_turning
-from quant_engine.watch.chan_daily_snapshot import ChanDailySnapshotStore
+from quant_engine.watch.chan_daily_snapshot import ChanDailySnapshotStore, FORMULA_VERSION
 from quant_engine.watch.engine import DB_PATH
 from quant_engine.watch.mrgc_daily_report import GROUP_DEFS, build_report, render_email
 from quant_engine.watch.mrgc_report_archive import read_archive, source_signature, write_archive
 from quant_engine.watch.smart_mrgc_pool import resolve_members
-from quant_engine.watch.structure_monitor import StructureMonitor, _day
+from quant_engine.watch.structure_monitor import MAX_BARS, MAX_SYMBOLS, StructureMonitor, _day
 
 
 def _json(value: object) -> str:
@@ -129,11 +130,29 @@ def _prune(conn: sqlite3.Connection, target: str, now: datetime) -> None:
 
 def _freeze(conn: sqlite3.Connection, target: str, now: datetime) -> list[dict]:
     prior = conn.execute('SELECT groups_json FROM three_group_daily_runs WHERE trade_date=?', (target,)).fetchone()
-    if prior:
-        return json.loads(prior[0])
     resolved = resolve_members(conn, target)
     if resolved['status'] != 'READY':
         raise ValueError('mrgc_membership_not_ready')
+    if prior:
+        groups = json.loads(prior[0])
+        for group in groups:
+            if group['id'] == 'mrgc':
+                group['symbols'] = [row['symbol'] for row in resolved['members']]
+        _validate_groups(groups)
+        raw = _json(groups)
+        if raw != prior[0]:
+            conn.execute('UPDATE three_group_daily_runs SET groups_json=?,member_hash=?,status=?,updated_at=? '
+                         'WHERE trade_date=?', (raw,hashlib.sha256(raw.encode()).hexdigest(),
+                                                'FROZEN',now.isoformat(),target))
+            conn.commit()
+        return groups
+    historical_scope = None
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='structure_monitor_runs'").fetchone():
+        if conn.execute('SELECT 1 FROM structure_monitor_runs WHERE trade_date=? LIMIT 1', (target,)).fetchone():
+            path = next(row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main')
+            historical_scope = StructureMonitor(path).resolve_scope(conn, target, historical=True)
+            if historical_scope['status'] != 'READY':
+                raise ValueError('c_membership_not_ready')
     groups = []
     for gid, name, pid in GROUP_DEFS:
         if gid == 'mrgc':
@@ -148,13 +167,16 @@ def _freeze(conn: sqlite3.Connection, target: str, now: datetime) -> list[dict]:
             pid = pool[0]
             symbols = [row[0] for row in conn.execute('SELECT DISTINCT symbol FROM stock_pool_members '
                                                     'WHERE pool_id=? ORDER BY symbol LIMIT 301', (pid,))]
+            if historical_scope is not None:
+                symbols = sorted(symbol for symbol, member in historical_scope['members'].items()
+                                 if pid in member['pool_ids'])
         groups.append(dict(id=gid, name=name, pool_id=pid, symbols=symbols))
-    unique = {symbol for group in groups for symbol in group['symbols']}
-    if len(unique) > 300 or any(not isinstance(s, str) or not re.fullmatch(r'\d{6}', s) for s in unique):
-        raise ValueError('member_capacity_or_format_invalid')
+    _validate_groups(groups)
     raw = _json(groups)
     stamp = now.isoformat()
     membership_source = 'daily_frozen' if target == now.date().isoformat() else 'backfill_time_members'
+    if historical_scope is not None:
+        membership_source = historical_scope['membership_source']
     conn.execute('INSERT INTO three_group_daily_runs '
         '(trade_date,frozen_at,groups_json,member_hash,membership_source,status,updated_at) VALUES (?,?,?,?,?,?,?)',
         (target, stamp, raw, hashlib.sha256(raw.encode()).hexdigest(), membership_source, 'FROZEN', stamp))
@@ -162,45 +184,71 @@ def _freeze(conn: sqlite3.Connection, target: str, now: datetime) -> list[dict]:
     return groups
 
 
+def _validate_groups(groups: list[dict]) -> None:
+    unique = {symbol for group in groups for symbol in group['symbols']}
+    if len(unique) > MAX_SYMBOLS or any(not isinstance(s, str) or not re.fullmatch(r'[0-9]{6}', s) for s in unique):
+        raise ValueError('member_capacity_or_format_invalid')
+    if sum(len(group['symbols']) for group in groups) > 6000:
+        raise ValueError('group_membership_capacity_exceeded')
+
+
 def _ensure_c(path: Path | str, target: str, groups: list[dict]) -> None:
     """Supplement only frozen members; never delete another pool's formal state."""
+    _day(target)
+    _validate_groups(groups)
     monitor = StructureMonitor(path)
     start = time.monotonic()
-    with closing(_connect(path)) as conn:
+    with closing(_connect(path)) as conn, conn:
         monitor.ensure_schema(conn)
-        conn.commit()
         quality = monitor._quality_statuses(conn, target)
         members = {}
         for group in groups:
             for symbol in group['symbols']:
                 member = members.setdefault(symbol, dict(symbol=symbol, name=symbol, pool_ids=[], pool_names=[]))
-                member['pool_ids'].append(group['pool_id'])
-                member['pool_names'].append(group['name'])
+                if group['pool_id'] not in member['pool_ids']:
+                    member['pool_ids'].append(group['pool_id'])
+                    member['pool_names'].append(group['name'])
+        existing = conn.execute('SELECT * FROM structure_monitor_snapshots '
+            'WHERE trade_date=? AND version=? AND config_hash=? LIMIT 601',
+            (target,VERSION,monitor.config_hash)).fetchall()
+        active = {row['symbol'] for row in existing if row['status'] != 'REMOVED'}
+        if len(existing) > 600 or len(active | set(members)) > MAX_SYMBOLS:
+            raise ValueError('c_monitor_capacity_exceeded')
+        saved = {row['symbol']: row for row in existing}
+        prior_run = conn.execute('SELECT * FROM structure_monitor_runs WHERE trade_date=? AND version=? AND config_hash=?',
+                                 (target,VERSION,monitor.config_hash)).fetchone()
+        changed = False
+        end = (datetime.fromisoformat(target)+timedelta(days=1)).date().isoformat()
         has_info = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_info'").fetchone()
         for symbol, member in members.items():
             if time.monotonic() - start > 90:
                 raise ValueError('c_calculation_budget_exceeded')
-            prior = conn.execute('SELECT data_status,current_price FROM structure_monitor_snapshots '
-                'WHERE trade_date=? AND symbol=? AND version=? AND config_hash=?',
-                (target, symbol, VERSION, monitor.config_hash)).fetchone()
-            raw = conn.execute('SELECT substr(trade_date,1,10) AS trade_date,open,high,low,close,volume '
-                'FROM stock_daily_prices WHERE symbol=? AND trade_date>=? AND trade_date<? '
-                'ORDER BY trade_date LIMIT 1501', (symbol, '2023-01-01', target + 'T')).fetchall()
-            input_hash = hashlib.sha256(_json([VERSION,monitor.config_hash,quality,
-                [list(row) for row in raw]]).encode()).hexdigest()
-            saved_hash = conn.execute('SELECT input_hash FROM three_group_c_inputs WHERE trade_date=? AND symbol=?',
-                                      (target,symbol)).fetchone()
-            if (not monitor._quality_reason(quality,symbol)) and prior and prior['data_status'] == 'OK' \
-                    and saved_hash and saved_hash[0] == input_hash:
-                continue
+            prior = saved.get(symbol)
+            raw = monitor._prices(conn, symbol, end)
+            input_digest = monitor._input_digest(raw)
+            if prior:
+                pools = dict(zip(json.loads(prior['pool_ids']), json.loads(prior['pool_names'])))
+                pools.update(zip(member['pool_ids'], member['pool_names']))
+                member.update(name=prior['name'], pool_ids=list(pools), pool_names=list(pools.values()))
             if has_info:
                 info = conn.execute('SELECT name FROM stock_info WHERE symbol=? LIMIT 1', (symbol,)).fetchone()
-                member['name'] = info[0] or symbol if info else symbol
+                if info and info[0]:
+                    member['name'] = info[0]
             reason = monitor._quality_reason(quality, symbol)
             if not reason and (not raw or raw[-1]['trade_date'] != target):
                 reason = 'target_daily_bar_missing'
-            if not reason and len(raw) > 1500:
+            if not reason and len(raw) > MAX_BARS:
                 reason = 'history_bar_limit_exceeded'
+            if not reason and prior and prior['data_status'] == 'OK' and prior['status'] != 'REMOVED' \
+                    and json.loads(prior['state_json']).get('_input_digest') == input_digest:
+                if (json.loads(prior['pool_ids']) != member['pool_ids']
+                        or json.loads(prior['pool_names']) != member['pool_names']):
+                    changed = True
+                    for table in ('structure_monitor_snapshots', 'structure_monitor_events'):
+                        conn.execute(f'UPDATE {table} SET pool_ids=?,pool_names=? WHERE trade_date=? '
+                            'AND symbol=? AND version=? AND config_hash=?',
+                            (_json(member['pool_ids']),_json(member['pool_names']),target,symbol,VERSION,monitor.config_hash))
+                continue
             calculated = None
             if not reason:
                 try:
@@ -210,12 +258,14 @@ def _ensure_c(path: Path | str, target: str, groups: list[dict]) -> None:
                 except ValueError:
                     reason = 'invalid_ohlcv'
             state = calculated['state'] if not reason else {'status': 'BLOCKED', 'trade_date': target}
+            if not monitor._quality_reason(quality, symbol):
+                state['_input_digest'] = input_digest
+            if reason:
+                state['last_known_state'] = monitor._last_known(conn, symbol, target)
             now = _now().isoformat()
             price = float(raw[-1]['close']) if not reason else None
-            with conn:
-                conn.execute('INSERT OR REPLACE INTO three_group_c_inputs VALUES (?,?,?)',
-                             (target,symbol,input_hash))
-                conn.execute('INSERT INTO structure_monitor_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) '
+            changed = True
+            conn.execute('INSERT INTO structure_monitor_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) '
                     'ON CONFLICT(trade_date,symbol,version,config_hash) DO UPDATE SET '
                     'name=excluded.name,pool_ids=excluded.pool_ids,pool_names=excluded.pool_names,'
                     'status=excluded.status,data_status=excluded.data_status,reason=excluded.reason,'
@@ -223,18 +273,44 @@ def _ensure_c(path: Path | str, target: str, groups: list[dict]) -> None:
                     (target,symbol,VERSION,monitor.config_hash,member['name'],_json(member['pool_ids']),
                      _json(member['pool_names']),state['status'],'BLOCKED' if reason else 'OK', reason or '',
                      price,_json(state),now))
-                conn.execute('DELETE FROM structure_monitor_events WHERE trade_date=? AND symbol=? '
+            conn.execute('DELETE FROM structure_monitor_events WHERE trade_date=? AND symbol=? '
                              'AND version=? AND config_hash=?', (target,symbol,VERSION,monitor.config_hash))
-                for marker in calculated['markers'] if not reason else []:
-                    if marker['trade_date'] != target:
-                        continue
-                    event_key = [symbol,target,marker['marker_type'],marker.get('setup_id'),
-                                 marker.get('trade_id'),VERSION,monitor.config_hash]
-                    payload = {**marker,'simulation':True,'execution':'NONE','source':'structure_monitor_daily'}
-                    conn.execute('INSERT INTO structure_monitor_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            for marker in calculated['markers'] if not reason else []:
+                if marker['trade_date'] != target:
+                    continue
+                event_key = [symbol,target,marker['marker_type'],marker.get('setup_id'),
+                             marker.get('trade_id'),VERSION,monitor.config_hash]
+                payload = {**marker,'simulation':True,'execution':'NONE','source':'structure_monitor_daily'}
+                conn.execute('INSERT INTO structure_monitor_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         (hashlib.sha256(_json(event_key).encode()).hexdigest(),target,symbol,VERSION,
                          monitor.config_hash,member['name'],_json(member['pool_ids']),_json(member['pool_names']),
                          marker['marker_type'],marker.get('setup_id'),marker.get('trade_id'),_json(payload),now))
+        if changed or not prior_run:
+            rows = conn.execute('SELECT symbol,name,pool_ids,pool_names,status FROM structure_monitor_snapshots '
+                'WHERE trade_date=? AND version=? AND config_hash=? LIMIT 600',
+                (target,VERSION,monitor.config_hash)).fetchall()
+            stats = json.loads(prior_run['stats_json']) if prior_run else dict(
+                historical=target != _now().date().isoformat(), membership_source='daily_frozen')
+            stats = {key: value for key, value in stats.items()
+                     if not isinstance(value, int) or isinstance(value, bool)}
+            stats.update(Counter(row['status'] for row in rows))
+            stats.update(total=sum(row['status'] != 'REMOVED' for row in rows), events=conn.execute(
+                'SELECT COUNT(*) FROM structure_monitor_events WHERE trade_date=? AND version=? AND config_hash=?',
+                (target,VERSION,monitor.config_hash)).fetchone()[0], members=[dict(symbol=row['symbol'],
+                    name=row['name'], pool_ids=json.loads(row['pool_ids']), pool_names=json.loads(row['pool_names']))
+                    for row in rows if row['status'] != 'REMOVED'])
+            blocked = any(row['status'] == 'BLOCKED' for row in rows) or stats.get('membership_reason')
+            conn.execute('INSERT OR REPLACE INTO structure_monitor_runs VALUES (?,?,?,?,?,?,?,?,?)',
+                (target,VERSION,monitor.config_hash,'BLOCKED' if blocked else 'COMPLETED',
+                 prior_run['scope'] if prior_run else 'three_group_daily_supplement',
+                 _json(monitor.config),_json(stats),round(time.monotonic()-start,4),_now().isoformat()))
+
+
+def _preparation_hash(path: Path | str, report: dict, groups: list[dict]) -> str:
+    # Generated C/Chan timestamps must not turn a failed retry into a new input.
+    inputs = dict(report, source=dict(report.get('source', {}), publication_mode=''))
+    return hashlib.sha256(_json([VERSION, StructureMonitor(path).config_hash, FORMULA_VERSION,
+        groups, source_signature(path,inputs)]).encode()).hexdigest()
 
 
 def _ensure_chan(path: Path | str, target: str, groups: list[dict], days: list[str]) -> None:
@@ -265,12 +341,13 @@ def prepare(db_path: Path | str, trade_date: str, workflow_child: bool = False) 
                 groups = _freeze(conn, target, _now())
                 run = conn.execute('SELECT * FROM three_group_daily_runs WHERE trade_date=?', (target,)).fetchone()
                 prior = read_archive(db_path,target)
-                if run['status'] == 'READY' and prior and prior.get('valid') and prior['archive_id'] == run['report_id']:
-                    return dict(status='READY', reason='reused', report_id=run['report_id'], trade_date=target)
                 initial = build_report(db_path,target,frozen_groups=groups,freeze_mrgc=True,compute_chan=False)
-                incoming_hash = hashlib.sha256(_json([source_signature(db_path,initial),
-                    initial.get('missing'),initial.get('status')]).encode()).hexdigest()
+                incoming_hash = _preparation_hash(db_path, initial, groups)
                 changed = run['last_input_hash'] != incoming_hash
+                if (not changed and run['status'] == 'READY' and prior and prior.get('valid')
+                        and prior['archive_id'] == run['report_id']
+                        and source_signature(db_path,prior['report']) == run['signature']):
+                    return dict(status='READY', reason='reused', report_id=run['report_id'], trade_date=target)
                 if run['attempt_count'] >= 3 and not changed:
                     return dict(status='BLOCKED',reason='prepare_attempt_limit',trade_date=target)
                 with conn:
@@ -308,8 +385,9 @@ def prepare(db_path: Path | str, trade_date: str, workflow_child: bool = False) 
                 if stored_bytes + len(body.encode()) + len(_json(report).encode()) > 50*1024*1024:
                     raise ValueError('frozen_ledger_storage_budget_exceeded')
                 conn.execute('UPDATE three_group_daily_runs SET status=?,report_id=?,signature=?,report_json=?,'
-                             'email_html=?,reason=?,updated_at=? WHERE trade_date=?',
-                             ('READY',envelope['archive_id'],signature,_json(report),body,'',_now().isoformat(),target))
+                             'email_html=?,reason=?,last_input_hash=?,updated_at=? WHERE trade_date=?',
+                             ('READY',envelope['archive_id'],signature,_json(report),body,'',
+                              _preparation_hash(db_path,report,groups),_now().isoformat(),target))
             return dict(status='READY',report_id=envelope['archive_id'],trade_date=target,reason='')
     except RuntimeError as exc:
         return dict(status='BLOCKED',reason=str(exc)[:160],trade_date=target)

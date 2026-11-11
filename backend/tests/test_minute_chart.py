@@ -1,6 +1,7 @@
 """Minute-chart source limits, completed-session aggregation and isolation."""
 from datetime import datetime
 import json
+import socket
 import time
 
 import pytest
@@ -10,6 +11,15 @@ from app.core.minute_chart import (
     MinuteChartService, MinuteChartUnavailable, SHANGHAI,
     _normalize_bars, aggregate_120min,
 )
+
+
+@pytest.fixture(autouse=True)
+def forbid_live_minute_network(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("minute unit tests must not open real network connections")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
 
 
 def raw(stamp="2026-09-30 10:30", **changes):
@@ -147,34 +157,74 @@ def test_lru_cache_entries_and_memory_are_bounded(monkeypatch):
     assert stats["max_concurrent_requests"] == 2
 
 
-def test_tdx_retries_new_isolated_stream_and_two_pages(monkeypatch):
+@pytest.mark.parametrize("kind,minutes,market,symbol", [
+    ("stock", 30, 0, "000792"), ("stock", 60, 1, "600519"),
+    ("index", 30, 1, "000001"), ("index", 60, 0, "399006"),
+])
+def test_tdx_uses_shared_healthy_reader_without_old_fixed_nodes(
+    monkeypatch, kind, minutes, market, symbol,
+):
     from pytdx import hq
-    clients = []
-    class Socket:
-        def settimeout(self, timeout):
-            assert 0 < timeout <= 2
-    class Api:
-        def __init__(self, **kwargs):
-            self.client = Socket()
-            self.index = len(clients)
-            self.calls = []
-            self.closed = False
-            clients.append(self)
-        def connect(self, *args, **kwargs):
-            return True
-        def disconnect(self):
-            self.closed = True
-        def get_security_bars(self, category, market, symbol, offset, count):
-            self.calls.append((offset, count))
-            if self.index == 0:
-                raise OSError("broken stream")
-            return [dict(datetime="2026-09-30 10:30", open=10, high=12, low=9,
-                         close=11, vol=100, amount=1000)] * count
-    monkeypatch.setattr(hq, "TdxHq_API", Api)
-    rows, _, _ = module._tdx_bars("stock", "600519", 1, 60, 1040, time.monotonic()+12)
+    from data_job.core.mootdx_adapter import MootdxAdapter
+
+    calls = []
+
+    def old_connection(**kwargs):
+        pytest.fail("minute charts must not use the old fixed-node connection path")
+
+    def source(**kwargs):
+        calls.append(kwargs)
+        rows = [dict(datetime="2026-09-30 10:30", open=10, high=12, low=9,
+                     close=11, vol=100, amount=1000)] * kwargs["count"]
+        kwargs["validate"](rows)
+        return rows
+
+    monkeypatch.setattr(hq, "TdxHq_API", old_connection)
+    monkeypatch.setattr(MootdxAdapter, "read_isolated_minute_bars", staticmethod(source))
+    deadline = time.monotonic() + 10
+    rows, source_name, unit = module._tdx_bars(kind, symbol, market, minutes, 1040, deadline)
     assert len(rows) == 1040
-    assert len(clients) == 2 and all(client.closed for client in clients)
-    assert clients[1].calls == [(0, 800), (800, 240)]
+    assert rows[0]["bar_time"] == "2026-09-30 10:30"
+    assert rows[0]["volume"] == 100
+    assert source_name == f"tdx_{kind}" and unit == "tdx_native"
+    assert len(calls) == 1
+    assert {key: value for key, value in calls[0].items() if key != "validate"} == {
+        "kind": kind, "symbol": symbol, "market": market,
+        "period": f"{minutes}min", "count": 1040, "deadline": deadline,
+    }
+
+
+def test_tdx_minute_validation_happens_inside_node_attempt(monkeypatch):
+    from data_job.core.mootdx_adapter import MootdxAdapter
+
+    validations = []
+
+    def source(**kwargs):
+        with pytest.raises(MinuteChartUnavailable, match="OHLCV"):
+            kwargs["validate"]([dict(datetime="2026-09-30 10:30", open=10,
+                                    high=8, low=9, close=11, vol=100, amount=1000)])
+        validations.append(True)
+        return [dict(datetime="2026-09-30 10:30", open=10, high=12,
+                     low=9, close=11, vol=100, amount=1000)]
+
+    monkeypatch.setattr(MootdxAdapter, "read_isolated_minute_bars", staticmethod(source))
+    rows, _, _ = module._tdx_bars("stock", "000792", 0, 30, 260, time.monotonic() + 10)
+    assert rows[0]["close"] == 11 and validations == [True]
+
+
+@pytest.mark.parametrize("error,message", [
+    (TimeoutError("expired"), "分钟行情请求超时"),
+    (ConnectionError("offline"), "通达信分钟行情暂不可用"),
+])
+def test_tdx_reader_errors_keep_safe_specific_messages(monkeypatch, error, message):
+    from data_job.core.mootdx_adapter import MootdxAdapter
+
+    def source(**kwargs):
+        raise error
+
+    monkeypatch.setattr(MootdxAdapter, "read_isolated_minute_bars", staticmethod(source))
+    with pytest.raises(MinuteChartUnavailable, match=message):
+        module._tdx_bars("stock", "000792", 0, 30, 260, time.monotonic() + 10)
 
 
 def test_eastmoney_checks_returned_code_and_closes(monkeypatch):

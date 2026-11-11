@@ -1903,6 +1903,10 @@ def build_workflow_command(
         "--kline-end",
         target,
     ]
+    if mode in {"morning", "daily", "retry"}:
+        command[2:2] = ["--repair-recent"]
+        if mode != "morning":
+            command[3:3] = ["--time-budget-minutes", "20" if mode == "retry" else "30"]
     if skip_notifications:
         command.append("--skip-notifications")
 
@@ -1931,6 +1935,16 @@ def build_workflow_command(
     if mode == "catchup":
         command.append("--force-kline")
     return command
+
+
+def should_kick_material_queue(
+    mode: str, target: str, *, explicit_target: bool = False,
+) -> bool:
+    """Keep historical/manual repairs isolated from unrelated material downloads."""
+    return (
+        mode in {"daily", "retry"} and not explicit_target
+        and target == datetime.now().date().isoformat()
+    )
 
 
 def build_watch_post_command(
@@ -2386,6 +2400,38 @@ def write_status_report(
             payload["morning_repair_summary"] = morning_repair_summary(conn)
             payload["known_legacy_anomalies"] = known_legacy_anomalies(conn)
             payload["core_ok"] = bool(market_data_ready and analytics_ready)
+            if all(sqlite_table_exists(conn, table) for table in
+                   ("trading_calendar", "stock_info", "stock_daily_prices_raw")):
+                from data_core.repair_plan import build_repair_plan
+                repair_plan = build_repair_plan(conn, target, limit=7)
+                repair_pending = [
+                    {"trade_date": row["trade_date"], "missing": row["pending"]}
+                    for row in repair_plan["dates"] if row["pending"]
+                ]
+                payload["repair_pending_dates"] = repair_pending
+                payload["monitoring_ready"] = all(
+                    row["datasets"][name]["ready"] for row in repair_plan["dates"]
+                    for name in ("watch", "c"))
+                payload["local_reports_ready"] = all(
+                    row["datasets"]["report"]["ready"] for row in repair_plan["dates"])
+                payload["full_recent_window_complete"] = repair_plan["complete"]
+                core_pending = [{"trade_date": row["trade_date"], "missing": [
+                    name for name in row["pending"]
+                    if row["datasets"][name]["category"] == "core"]}
+                    for row in repair_plan["dates"]]
+                core_pending = [row for row in core_pending if row["missing"]]
+                payload["recent_pending_dates"] = core_pending
+                payload["core_window_complete"] = not core_pending
+                payload["previous_day_complete"] = not any(
+                    row["trade_date"] == target for row in core_pending)
+                payload["core_ok"] = bool(
+                    payload["core_ok"] and payload["previous_day_complete"])
+                payload["recent_window_complete"] = not repair_pending
+                payload["valuation_degraded"] = [
+                    {"trade_date": row["trade_date"],
+                     "missing": row["datasets"]["valuation"]["degraded"]}
+                    for row in repair_plan["dates"]
+                    if row["datasets"]["valuation"]["degraded"]]
             support_stale = []
             for name, latest in support_latest.items():
                 coverage_ok = bool(coverage.get(name, {}).get("ok"))
@@ -2420,6 +2466,11 @@ def write_status_report(
         f"- recent_window_complete: {payload.get('recent_window_complete')}",
         f"- core_window_complete: {payload.get('core_window_complete')}",
         f"- recent_pending_dates: {payload.get('recent_pending_dates')}",
+        f"- repair_pending_dates: {payload.get('repair_pending_dates')}",
+        f"- monitoring_ready: {payload.get('monitoring_ready')}",
+        f"- local_reports_ready: {payload.get('local_reports_ready')}",
+        f"- full_recent_window_complete: {payload.get('full_recent_window_complete')}",
+        f"- valuation_degraded: {payload.get('valuation_degraded')}",
         f"- morning_repair_summary: {payload.get('morning_repair_summary')}",
         f"- market_data_ready: {payload.get('market_data_ready')}",
         f"- analytics_ready: {payload.get('analytics_ready')}",
@@ -2642,7 +2693,24 @@ def verify_after_run(
             else:
                 messages.append(f"sector RPS v2 freshness ok: latest={sector_rps.get('latest')}")
 
-        messages.append("recent stock_daily gap scan skipped in wrapper")
+        if require_rps and all(sqlite_table_exists(conn, table) for table in
+                               ("trading_calendar", "stock_info", "stock_daily_prices_raw")):
+            from data_core.repair_plan import build_repair_plan
+            plan = build_repair_plan(conn, target, limit=7)
+            for day in plan["dates"]:
+                core = [name for name in day["pending"]
+                        if day["datasets"][name]["category"] == "core"]
+                advisory = [name for name in day["pending"] if name not in core]
+                if core:
+                    ok = False
+                    messages.append(
+                        f"exact-date core coverage failed: {day['trade_date']} {core}")
+                if advisory:
+                    messages.append(f"recent repair advisory: {day['trade_date']} {advisory}")
+            if not any(day["pending"] for day in plan["dates"]):
+                messages.append("recent exact-date coverage ok")
+        else:
+            messages.append("recent stock_daily gap scan skipped in wrapper")
 
     return VerificationResult(ok=ok, messages=tuple(messages))
 
@@ -2811,6 +2879,14 @@ def main() -> int:
     returncode = run_command(command, env, timeout_seconds=timeout_seconds)
     workflow_seconds = time.perf_counter() - started
     print(f"workflow_returncode={returncode} elapsed={workflow_seconds:.1f}s")
+    # The workflow child has released the Data Core lock. Materials are
+    # independent of market-data quality and must survive either early return.
+    if should_kick_material_queue(args.mode, target, explicit_target=args.target is not None):
+        material_returncode = run_command(
+            [sys.executable, "-m", "data_job.auto_f10", "--kick"],
+            env, timeout_seconds=15,
+        )
+        print(f"material_queue_kick_returncode={material_returncode}")
     if returncode != 0:
         record_pipeline_phase_timings(
             mode=args.mode,
@@ -2873,15 +2949,6 @@ def main() -> int:
     if report_post_command:
         report_returncode = run_command(report_post_command, env, timeout_seconds=180)
         print(f"three_group_delivery_returncode={report_returncode}")
-
-    # F10 enqueues during selection are deferred by the Data Core lock.
-    # Kick one bounded background batch only after verification and report delivery.
-    if args.mode in {"daily", "retry"}:
-        material_returncode = run_command(
-            [sys.executable, "-m", "data_job.auto_f10", "--kick"],
-            env, timeout_seconds=15,
-        )
-        print(f"material_queue_kick_returncode={material_returncode}")
 
     write_status_report(
         mode=args.mode,

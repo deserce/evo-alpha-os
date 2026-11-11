@@ -14,7 +14,9 @@ import json
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from contextlib import closing
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +33,53 @@ from quant_engine.common import setup_logger
 
 DB_PATH = BACKEND_DIR / "data" / "local_quant.db"
 logger = setup_logger(__name__)
+
+
+def resolve_sparse_output_dates(
+    conn: sqlite3.Connection,
+    *,
+    target_dates: list[str] | None,
+    fallback: Callable[[], list[str]],
+    task_name: str,
+    missing_only: bool,
+) -> tuple[list[str], list[str]]:
+    """Validate exact source dates; sparse zero outputs require a successful audit."""
+    if target_dates is not None:
+        if not target_dates or isinstance(target_dates, (str, bytes)):
+            raise ValueError("target_dates must contain 1..7 ISO dates")
+        for value in target_dates:
+            if not isinstance(value, str) or date.fromisoformat(value).isoformat() != value:
+                raise ValueError("target_dates must contain ISO dates YYYY-MM-DD")
+        dates = sorted(set(target_dates))
+        if len(dates) > 7:
+            raise ValueError("target_dates cannot exceed 7 dates")
+    else:
+        dates = fallback()
+    if not dates:
+        raise ValueError("no source trading dates")
+    for day in dates:
+        if date.fromisoformat(day) > date.today():
+            raise ValueError(f"future target date: {day}")
+        end = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        for table in ("stock_daily_prices", "stock_lifecycle_state"):
+            if not conn.execute(
+                f"SELECT 1 FROM {table} WHERE trade_date>=? AND trade_date<? LIMIT 1",
+                (day, end),
+            ).fetchone():
+                raise ValueError(f"{table} missing exact target date: {day}")
+    skipped = []
+    if missing_only and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pipeline_task_log'"
+    ).fetchone():
+        for day in dates:
+            if conn.execute(
+                "SELECT 1 FROM pipeline_task_log WHERE status='success' "
+                "AND task_name IN (?,?) "
+                "AND instr(','||replace(target_dates,' ','')||',',?)>0 LIMIT 1",
+                (task_name, task_name + "@" + day, "," + day + ","),
+            ).fetchone():
+                skipped.append(day)
+    return [day for day in dates if day not in skipped], skipped
 
 
 class TimingSignalCalculator:
@@ -93,17 +142,19 @@ class TimingSignalCalculator:
 
     def _load_source(self, conn: sqlite3.Connection, dates: list[str], load_start: str) -> pd.DataFrame:
         date_values = ",".join("?" for _ in dates)
+        end = (date.fromisoformat(dates[-1]) + timedelta(days=1)).isoformat()
         lifecycle = pd.read_sql_query(
             f"""
             SELECT trade_date, symbol, name, sector_name, lifecycle_state, state_rank,
                    market_state, industry_state, rps_20, rps_50, rps_120, rps_250,
                    structure_score
             FROM stock_lifecycle_state
-            WHERE trade_date IN ({date_values})
+            WHERE trade_date >= ? AND trade_date < ?
+              AND substr(trade_date, 1, 10) IN ({date_values})
               AND state_rank >= 3
             """,
             conn,
-            params=dates,
+            params=[dates[0], end, *dates],
         )
         if lifecycle.empty:
             return lifecycle
@@ -115,20 +166,22 @@ class TimingSignalCalculator:
             SELECT symbol, trade_date, open, high, low, close, volume, amount, pct_chg, turnover_rate
             FROM stock_daily_prices
             WHERE trade_date >= ?
+              AND trade_date < ?
               AND symbol IN ({symbol_values})
             ORDER BY symbol, trade_date
             """,
             conn,
-            params=[load_start, *symbols],
+            params=[load_start, end, *symbols],
         )
         finance = pd.read_sql_query(
             f"""
             SELECT code AS symbol, report_date, net_profit_up, revenue_up, roe
             FROM stock_finance_summary
             WHERE code IN ({symbol_values})
+              AND report_date < ?
             """,
             conn,
-            params=symbols,
+            params=[*symbols, end],
         )
         for df in (lifecycle, kline, finance):
             if not df.empty:
@@ -245,12 +298,12 @@ class TimingSignalCalculator:
     ) -> list[str]:
         rows = conn.execute(
             """
-            SELECT DISTINCT trade_date
+            SELECT DISTINCT substr(trade_date, 1, 10)
             FROM stock_daily_prices
-            WHERE trade_date BETWEEN ? AND ?
+            WHERE trade_date >= ? AND trade_date < ?
             ORDER BY trade_date
             """,
-            (start_date, end_date),
+            (start_date, (date.fromisoformat(end_date) + timedelta(days=1)).isoformat()),
         ).fetchall()
         return [str(row[0])[:10] for row in rows]
 
@@ -385,13 +438,27 @@ class TimingSignalCalculator:
         return result[keep].copy()
 
     def _save(self, conn: sqlite3.Connection, df: pd.DataFrame, dates: list[str]) -> None:
+        if not df.empty and not set(df["trade_date"]).issubset(dates):
+            raise ValueError("timing output contains an unrequested date")
         with conn:
             for trade_date in dates:
-                conn.execute("DELETE FROM timing_signals_daily WHERE trade_date = ?", (trade_date,))
+                end = (date.fromisoformat(trade_date) + timedelta(days=1)).isoformat()
+                conn.execute(
+                    "DELETE FROM timing_signals_daily WHERE trade_date>=? AND trade_date<?",
+                    (trade_date, end),
+                )
+            if not df.empty:
+                columns = ",".join(df.columns)
+                placeholders = ",".join("?" for _ in df.columns)
+                for start in range(0, len(df), 1000):
+                    batch = df.iloc[start:start + 1000].astype(object)
+                    conn.executemany(
+                        f"INSERT INTO timing_signals_daily ({columns}) VALUES ({placeholders})",
+                        batch.where(pd.notna(batch), None).itertuples(index=False, name=None),
+                    )
         if df.empty:
             logger.info("timing_signals_daily: no rows to save")
             return
-        df.to_sql(self.target_table, conn, if_exists="append", index=False, method="multi", chunksize=1000)
         logger.info(
             "timing_signals_daily: saved %s rows, range %s..%s",
             f"{len(df):,}",
@@ -399,36 +466,52 @@ class TimingSignalCalculator:
             df["trade_date"].max(),
         )
 
-    def run_daily(self, days: int = 3) -> dict:
-        return self.run(mode="daily", days=days)
+    def run_daily(
+        self, days: int = 3, target_dates: list[str] | None = None, missing_only: bool = False
+    ) -> dict:
+        """Compute only requested dates; None retains the recent-days default."""
+        return self.run(mode="daily", days=days, target_dates=target_dates, missing_only=missing_only)
 
     def run_init(self, days: int = 3) -> dict:
         return self.run(mode="init", days=days)
 
-    def run(self, mode: str = "daily", days: int = 3) -> dict:
+    def run(
+        self, mode: str = "daily", days: int = 3,
+        target_dates: list[str] | None = None, missing_only: bool = False,
+    ) -> dict:
         start = time.time()
+        computed_dates = []
+        skipped_dates = []
+        records = 0
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                self._create_table(conn)
-                dates = self._get_output_dates(conn, mode, days)
-                if not dates:
-                    return {"success": False, "error": "无交易日期", "records": 0}
-                load_start = (pd.to_datetime(dates[0]).date() - timedelta(days=90)).strftime("%Y-%m-%d")
-                cooldown_start = (pd.to_datetime(dates[0]).date() - timedelta(days=30)).strftime("%Y-%m-%d")
-                logger.info("🚀 [TimingSignalCalculator] mode=%s, dates=%s..%s", mode, dates[0], dates[-1])
-                source = self._load_source(conn, dates, load_start)
-                cooldown_history = self._load_cooldown_history(conn, cooldown_start, dates[0])
-                trade_calendar = self._load_trade_calendar(conn, cooldown_start, dates[-1])
-                result = (
-                    self._compute_signals(source, cooldown_history, trade_calendar)
-                    if not source.empty
-                    else pd.DataFrame()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                dates, skipped_dates = resolve_sparse_output_dates(
+                    conn, target_dates=target_dates,
+                    fallback=lambda: self._get_output_dates(conn, mode, days),
+                    task_name="timing_signals", missing_only=missing_only,
                 )
-                self._save(conn, result, dates)
-            return {"success": True, "records": len(result), "elapsed": time.time() - start}
+                self._create_table(conn)
+                for day in dates:
+                    load_start = (date.fromisoformat(day) - timedelta(days=90)).isoformat()
+                    cooldown_start = (date.fromisoformat(day) - timedelta(days=30)).isoformat()
+                    logger.info("TimingSignalCalculator mode=%s target=%s", mode, day)
+                    source = self._load_source(conn, [day], load_start)
+                    cooldown_history = self._load_cooldown_history(conn, cooldown_start, day)
+                    trade_calendar = self._load_trade_calendar(conn, cooldown_start, day)
+                    result = (
+                        self._compute_signals(source, cooldown_history, trade_calendar)
+                        if not source.empty else pd.DataFrame()
+                    )
+                    self._save(conn, result, [day])
+                    computed_dates.append(day)
+                    records += len(result)
+            return {"success": True, "records": records, "elapsed": time.time() - start,
+                    "computed_dates": computed_dates, "skipped_dates": skipped_dates}
         except Exception as e:
             logger.error(f"❌ 买点信号计算失败: {e}")
-            return {"success": False, "error": str(e), "records": 0, "elapsed": time.time() - start}
+            return {"success": False, "error": str(e), "records": records,
+                    "elapsed": time.time() - start, "computed_dates": computed_dates,
+                    "skipped_dates": skipped_dates}
 
 
 if __name__ == "__main__":
@@ -437,7 +520,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EvoAlpha 四类买点信号计算器")
     parser.add_argument("--mode", choices=("daily", "init"), default="daily")
     parser.add_argument("--days", type=int, default=3)
+    parser.add_argument("--target-dates", nargs="+")
+    parser.add_argument("--missing-only", action="store_true")
     args = parser.parse_args()
 
-    result = TimingSignalCalculator().run(mode=args.mode, days=args.days)
+    result = TimingSignalCalculator().run(
+        mode=args.mode, days=args.days, target_dates=args.target_dates, missing_only=args.missing_only
+    )
     raise SystemExit(0 if result.get("success") else 1)

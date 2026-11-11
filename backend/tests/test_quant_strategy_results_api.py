@@ -159,6 +159,69 @@ def test_strategy_results_uses_date_indexed_joins(tmp_path, monkeypatch):
     assert data["calculation"]["signal_count"] == 1
 
 
+def test_formula_results_are_isolated_paginated_and_enriched(tmp_path, monkeypatch):
+    db_path = tmp_path / "quant.db"
+    make_strategy_db(db_path)
+    name = "near_year_high_v1"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE quant_formula_results AS SELECT * FROM quant_preselect_results WHERE 0")
+        conn.executemany(
+            "INSERT INTO quant_formula_results VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (name, "2026-05-29", symbol, "MATCH", '{"ratio":0.95}', "接近一年新高",
+                 "formula", "2026-05-29 15:01:00")
+                for symbol in ("000001", "000002")
+            ],
+        )
+        conn.execute(
+            "INSERT INTO strategy_run_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("formula", name, "2026-05-29", "success", 2, None, "15:00", "15:01"),
+        )
+    monkeypatch.setattr(quant_api, "DB_PATH", db_path)
+
+    page1 = asyncio.run(
+        quant_api.get_strategy_results("2026-05-29", strategy_name=name, limit=1)
+    ).data
+    page2 = asyncio.run(
+        quant_api.get_strategy_results("2026-05-29", strategy_name=name, limit=1, offset=1)
+    ).data
+    legacy = asyncio.run(quant_api.get_strategy_results("2026-05-29", limit=10)).data
+
+    assert page1["total"] == page2["total"] == 2
+    assert page1["rows"][0]["symbol"] == "000001"
+    assert page1["rows"][0]["close"] == 12.34
+    assert page1["rows"][0]["meta"] == {"ratio": 0.95}
+    assert page2["rows"][0]["symbol"] == "000002"
+    assert [row["strategy_name"] for row in legacy["rows"]] == ["mrgc_v1"]
+
+
+def test_formula_runs_distinguish_missing_zero_and_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "quant.db"
+    make_strategy_db(db_path)
+    success, failed, missing = quant_api.FORMULA_STRATEGY_NAMES[:3]
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO strategy_run_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("zero", success, "2026-05-29", "success", 0, None, "15:00", "15:01"),
+                ("failed", failed, "2026-05-29", "failed", 0, "输入缺失", "15:00", "15:01"),
+                ("older", missing, "2026-05-28", "success", 3, None, "15:00", "15:01"),
+            ],
+        )
+    monkeypatch.setattr(quant_api, "DB_PATH", db_path)
+
+    runs = asyncio.run(quant_api.get_formula_strategy_runs("2026-05-29")).data["runs"]
+    assert runs[success] == {"status": "success", "signal_count": 0}
+    assert runs[failed]["status"] == "failed"
+    assert runs[missing] == {"status": "not_run", "signal_count": None}
+    for name, status in [(success, "success"), (failed, "failed"), (missing, "not_run")]:
+        result = asyncio.run(
+            quant_api.get_strategy_results("2026-05-29", strategy_name=name, limit=10)
+        ).data
+        assert result["calculation"]["status"] == status
+        assert result["rows"] == []
+
+
 def test_strategy_results_distinguishes_successful_zero_result(tmp_path, monkeypatch):
     db_path = tmp_path / "quant.db"
     make_strategy_db(db_path)

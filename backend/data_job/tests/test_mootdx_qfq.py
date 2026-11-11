@@ -3,14 +3,21 @@
 """
 
 import importlib.util
+import json
+import socket
 import sqlite3
+import struct
 import sys
 import unittest
 from datetime import date
 from pathlib import Path
+from queue import Empty
+from threading import Event, Thread
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, ".")
 
@@ -38,6 +45,734 @@ init_target_table = _module.init_target_table
 init_raw_target_table = _module.init_raw_target_table
 save_dual_batch = _module.save_dual_batch
 validate_target_tables = _module.validate_target_tables
+
+
+@pytest.fixture(autouse=True)
+def isolate_node_state_and_network(tmp_path, monkeypatch):
+    """No test may touch the real health cache or open a network connection."""
+    monkeypatch.setattr(MootdxAdapter, "SERVER_STATE_PATH", tmp_path / "nodes.json")
+
+    def reject_network(*args, **kwargs):
+        raise AssertionError("network access is forbidden in these offline tests")
+
+    monkeypatch.setattr(socket.socket, "connect", reject_network)
+    monkeypatch.setattr(socket, "create_connection", reject_network)
+    connect = sqlite3.connect
+
+    def memory_database_only(database, *args, **kwargs):
+        if database != ":memory:":
+            raise AssertionError("only in-memory test databases are permitted")
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", memory_database_only)
+
+
+@pytest.fixture
+def isolated_minute_source(monkeypatch):
+    nodes = [(f"192.0.2.{i}", 7709, f"minute{i}") for i in range(1, 4)]
+    calls, clients, openings = [], [], []
+    behavior = [lambda host, kind, category, market, symbol, offset, count: [
+        {"datetime": "2026-11-02 15:00", "code": symbol, "close": 11.0}
+    ] * count]
+
+    class Client:
+        last_transaction_failed = False
+
+        def __init__(self, host):
+            self.host = host
+            self.closed = False
+            self.client = SimpleNamespace(close=lambda: None)
+
+        def disconnect(self):
+            self.closed = True
+
+        def get_security_bars(self, *args):
+            return self.bars("stock", *args)
+
+        def get_index_bars(self, *args):
+            return self.bars("index", *args)
+
+        def bars(self, kind, category, market, symbol, offset, count):
+            calls.append((self.host, kind, category, market, symbol, offset, count))
+            return behavior[0](self.host, kind, category, market, symbol, offset, count)
+
+    def opening(self, server, backend, deadline):
+        openings.append((server, backend, deadline))
+        client = Client(server[0])
+        clients.append(client)
+        return SimpleNamespace(client=client) if backend == "mootdx" else client
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("minute reads must not discover, probe, or persist state")
+
+    monkeypatch.setattr(MootdxAdapter, "SERVERS", nodes)
+    monkeypatch.setattr(MootdxAdapter, "_open_api", opening)
+    for name in ("__init__", "_connect", "_validate_node", "_write_server_state"):
+        monkeypatch.setattr(MootdxAdapter, name, forbidden)
+    return SimpleNamespace(nodes=nodes, calls=calls, clients=clients,
+                           openings=openings, behavior=behavior)
+
+
+def read_minute_fixture(**changes):
+    import time
+
+    request = dict(kind="stock", symbol="000792", market=0, period="30min",
+                   count=4, deadline=time.monotonic() + 10)
+    request.update(changes)
+    return MootdxAdapter.read_isolated_minute_bars(**request)
+
+
+def test_isolated_minutes_prefer_cached_healthy_node_without_disk_writes(isolated_minute_source):
+    import time
+
+    source = isolated_minute_source
+    state = {"host": source.nodes[1][0], "port": 7709, "backend": "mootdx",
+             "nodes": {f"{source.nodes[0][0]}:7709": {
+                 "failures": 1, "cooldown_until": time.time() + 600}}}
+    path = MootdxAdapter.SERVER_STATE_PATH
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    rows = read_minute_fixture()
+    assert rows[-1]["datetime"] == "2026-11-02 15:00"
+    assert [item[0][0] for item in source.openings] == [source.nodes[1][0]]
+    assert all(client.closed for client in source.clients)
+    assert path.read_bytes() == before
+
+
+def test_isolated_minutes_retry_broken_stream_once_and_remember_bad_node(isolated_minute_source):
+    source = isolated_minute_source
+    normal = source.behavior[0]
+
+    def response(host, *args):
+        if host == source.nodes[0][0]:
+            raise ConnectionError("broken stream")
+        return normal(host, *args)
+
+    source.behavior[0] = response
+    assert read_minute_fixture()
+    assert read_minute_fixture()
+    assert [item[0][0] for item in source.openings] == [
+        source.nodes[0][0], source.nodes[1][0], source.nodes[1][0]]
+    assert all(client.closed for client in source.clients)
+    assert not MootdxAdapter.SERVER_STATE_PATH.exists()
+
+
+def test_isolated_minute_health_does_not_change_daily_selection(isolated_minute_source):
+    source = isolated_minute_source
+    normal = source.behavior[0]
+
+    def response(host, *args):
+        if host == source.nodes[0][0]:
+            raise ConnectionError("minute-only failure")
+        return normal(host, *args)
+
+    source.behavior[0] = response
+    assert read_minute_fixture()
+    daily = MootdxAdapter.__new__(MootdxAdapter)
+    assert daily._ordered_servers()[0] == source.nodes[0]
+    assert daily._health_state().get("success_epoch") is None
+
+
+def test_isolated_minutes_observe_changed_daily_node_file(isolated_minute_source):
+    source = isolated_minute_source
+    path = MootdxAdapter.SERVER_STATE_PATH
+    path.write_text(json.dumps({"host": source.nodes[0][0], "port": 7709}))
+    assert read_minute_fixture()
+    path.write_text(json.dumps({"host": source.nodes[2][0], "port": 7709,
+                                "backend": "mootdx", "last_success_at": "new daily run"}))
+    assert read_minute_fixture()
+    assert [opening[0] for opening in source.openings] == [source.nodes[0], source.nodes[2]]
+
+
+@pytest.mark.parametrize("disk_cooldown", [0, 2300.0])
+def test_daily_node_file_refresh_preserves_active_minute_cooldown(
+    isolated_minute_source, monkeypatch, disk_cooldown,
+):
+    source = isolated_minute_source
+    normal = source.behavior[0]
+    clock = [1000.0]
+    monkeypatch.setattr("data_job.core.mootdx_adapter.time.time", lambda: clock[0])
+
+    def response(host, *args):
+        if host == source.nodes[0][0]:
+            raise ConnectionError("minute-only failure")
+        return normal(host, *args)
+
+    source.behavior[0] = response
+    assert read_minute_fixture()
+    reader = MootdxAdapter.__new__(MootdxAdapter)
+    reader._read_only_health = True
+    key = f"{source.nodes[0][0]}:7709"
+    original_cooldown = reader._health_state()["nodes"][key]["cooldown_until"]
+    path = MootdxAdapter.SERVER_STATE_PATH
+    disk_nodes = {key: {"failures": 2, "cooldown_until": disk_cooldown}} if disk_cooldown else {}
+    path.write_text(json.dumps({"host": source.nodes[1][0], "port": 7709, "nodes": disk_nodes}))
+    assert read_minute_fixture()
+    assert source.nodes[0] not in reader._ordered_servers()
+    merged_cooldown = max(original_cooldown, disk_cooldown)
+    assert reader._health_state()["nodes"][key]["cooldown_until"] == merged_cooldown
+    clock[0] = merged_cooldown + 1
+    path.write_text(json.dumps({"host": source.nodes[1][0], "port": 7709,
+                                "nodes": {}, "last_success_at": "later update"}))
+    assert source.nodes[0] in reader._ordered_servers()
+
+
+def test_isolated_minutes_second_page_failure_restarts_from_zero(isolated_minute_source):
+    source = isolated_minute_source
+
+    def response(host, kind, category, market, symbol, offset, count):
+        if host == source.nodes[0][0] and offset:
+            raise OSError("second page failed")
+        return [{"code": symbol, "close": 10 if host == source.nodes[0][0] else 20}] * count
+
+    source.behavior[0] = response
+    rows = read_minute_fixture(period="60min", count=1040)
+    assert len(rows) == 1040 and {row["close"] for row in rows} == {20}
+    assert [(call[0], call[-2], call[-1]) for call in source.calls] == [
+        (source.nodes[0][0], 0, 800), (source.nodes[0][0], 800, 240),
+        (source.nodes[1][0], 0, 800), (source.nodes[1][0], 800, 240)]
+    assert all(client.closed for client in source.clients)
+
+
+def test_isolated_minutes_index_uses_explicit_market_and_index_method(isolated_minute_source):
+    source = isolated_minute_source
+    read_minute_fixture(kind="index", symbol="000001", market=1, period="60min")
+    assert source.calls[0][1:5] == ("index", 3, 1, "000001")
+
+
+def test_isolated_minutes_validate_before_promoting_and_fail_over(isolated_minute_source):
+    source = isolated_minute_source
+    validated = []
+
+    def validate(rows):
+        validated.append(rows)
+        if len(validated) == 1:
+            raise ValueError("invalid minute OHLC")
+
+    assert read_minute_fixture(validate=validate)
+    assert len(validated) == len(source.openings) == 2
+    assert all(client.closed for client in source.clients)
+
+
+def test_isolated_empty_minutes_do_not_quarantine_or_scan_all_nodes(isolated_minute_source):
+    source = isolated_minute_source
+    source.behavior[0] = lambda *args: []
+    with pytest.raises(ConnectionError):
+        read_minute_fixture()
+    assert len(source.openings) == 2
+    adapter = MootdxAdapter.__new__(MootdxAdapter)
+    assert len(adapter._ordered_servers()) == 3
+    assert all(client.closed for client in source.clients)
+
+
+def test_isolated_minutes_total_deadline_is_not_reset(isolated_minute_source, monkeypatch):
+    source = isolated_minute_source
+    clock = [10.0]
+    monkeypatch.setattr("data_job.core.mootdx_adapter.time.monotonic", lambda: clock[0])
+    normal = source.behavior[0]
+
+    def slow(*args):
+        clock[0] += 6
+        return normal(*args)
+
+    source.behavior[0] = slow
+    with pytest.raises(TimeoutError):
+        read_minute_fixture(deadline=20.0)
+    assert len(source.openings) <= 2
+    assert all(opening[2] <= 20 for opening in source.openings)
+    assert source.openings[0][2] <= 15
+    assert all(client.closed for client in source.clients)
+
+
+@pytest.mark.parametrize("changes", [
+    {"kind": "sector"}, {"period": "daily"}, {"count": 1041}, {"count": True},
+    {"count": 0}, {"symbol": "../bad"}, {"market": 2}, {"market": True},
+    {"deadline": float("nan")},
+])
+def test_isolated_minutes_reject_invalid_request_before_connecting(isolated_minute_source, changes):
+    with pytest.raises(ValueError):
+        read_minute_fixture(**changes)
+    assert not isolated_minute_source.openings
+
+
+class TestMootdxNodeFailover(unittest.TestCase):
+    def adapter(self):
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.api = None
+        adapter.backend = None
+        adapter.current_server = None
+        adapter.connected = False
+        adapter.Quotes = object()
+        adapter.timeout = 1
+        adapter.success_count = 0
+        adapter.fail_count = 0
+        adapter.last_failure_kind = None
+        adapter.SERVERS = [
+            (f"192.0.2.{i}", 7709, f"node{i}") for i in range(1, 10)
+        ]
+        return adapter
+
+    @staticmethod
+    def bars(price=10.0):
+        today = pd.Timestamp.now().normalize()
+        return pd.DataFrame({
+            "datetime": [today - pd.Timedelta(days=1), today],
+            "open": [price, price], "high": [price + 1, price + 1],
+            "low": [price - 1, price - 1], "close": [price, price],
+            "volume": [100.0, 110.0], "amount": [1000.0, 1100.0],
+        })
+
+    def test_failed_nodes_are_shared_and_cool_down_for_ten_minutes(self):
+        first = self.adapter()
+        second = self.adapter()
+        node = first.SERVERS[0]
+        with patch("data_job.core.mootdx_adapter.time.time", return_value=1000):
+            first._mark_server_failure(node)
+            self.assertNotIn(node, second._ordered_servers())
+        with patch("data_job.core.mootdx_adapter.time.time", return_value=1599):
+            self.assertNotIn(node, second._ordered_servers())
+        with patch("data_job.core.mootdx_adapter.time.time", return_value=1601):
+            self.assertIn(node, second._ordered_servers())
+        payload = json.loads(first.SERVER_STATE_PATH.read_text())
+        self.assertEqual(payload["nodes"]["192.0.2.1:7709"]["cooldown_until"], 1600)
+
+    def test_pool_managed_disconnected_stream_never_discovers_from_worker(self):
+        adapter = self.adapter()
+        adapter._pool_managed = True
+        with patch.object(adapter, "_connect", return_value=True) as connect:
+            self.assertFalse(adapter._ensure_connected())
+        connect.assert_not_called()
+
+    def test_pool_managed_quarantined_stream_closes_without_discovery(self):
+        adapter = self.adapter()
+        adapter._pool_managed = True
+        adapter.api, adapter.backend, adapter.connected = object(), "pytdx", True
+        adapter._active_server = adapter.SERVERS[0]
+        adapter._mark_server_failure(adapter.SERVERS[0])
+        with patch.object(adapter, "_connect", return_value=True) as connect:
+            self.assertFalse(adapter._ensure_connected())
+        connect.assert_not_called()
+        self.assertIsNone(adapter.api)
+
+    def test_pool_managed_request_closes_failed_stream_without_nested_retry(self):
+        adapter = self.adapter()
+        adapter._pool_managed = True
+        adapter._active_server = adapter.SERVERS[0]
+        calls = []
+
+        def operation():
+            calls.append(1)
+            adapter.last_failure_kind = "connectivity"
+            return None
+
+        with patch.object(adapter, "_discard_connection") as discard:
+            self.assertIsNone(adapter._request_with_failover(operation))
+        self.assertEqual(calls, [1])
+        discard.assert_called_once_with()
+
+    def test_round_visits_at_most_six_and_next_round_rotates(self):
+        adapter = self.adapter()
+        calls = []
+
+        def fail(server, backend, deadline):
+            calls.append(server)
+            raise ConnectionError("offline")
+
+        with patch.object(adapter, "_open_api", side_effect=fail):
+            self.assertFalse(adapter._connect())
+            self.assertEqual(len(calls), 6)
+            self.assertFalse(adapter._connect())
+        self.assertEqual(len(calls), 9)
+        self.assertEqual(len(set(calls)), 9)
+
+    def test_round_stops_at_thirty_second_deadline(self):
+        adapter = self.adapter()
+        clock = [0.0]
+
+        def slow_failure(server, backend, deadline):
+            self.assertEqual(deadline, 30.0)
+            clock[0] += 10.0
+            raise TimeoutError("deadline")
+
+        with patch("data_job.core.mootdx_adapter.time.monotonic", side_effect=lambda: clock[0]):
+            with patch.object(adapter, "_open_api", side_effect=slow_failure) as opening:
+                self.assertFalse(adapter._connect())
+        self.assertEqual(opening.call_count, 3)
+
+    def test_probe_closes_and_business_connection_has_no_probe_or_success_cache(self):
+        adapter = self.adapter()
+        adapter.SERVERS = adapter.SERVERS[:1]
+        owner = self
+
+        class API:
+            closed = False
+            calls = 0
+
+            def bars(self, **kwargs):
+                self.calls += 1
+                return owner.bars(price=10.0 + kwargs["market"])
+
+            def close(self):
+                self.closed = True
+
+        probe, business = API(), API()
+        with patch.object(adapter, "_open_api", side_effect=[probe, business]):
+            self.assertTrue(adapter._connect())
+        self.assertTrue(probe.closed)
+        self.assertEqual(probe.calls, 3)
+        self.assertEqual(business.calls, 0)
+        self.assertNotIn("host", adapter._load_server_state())
+        self.assertIsNotNone(adapter.get_stock_kline("600519", adjust="none", max_bars=2))
+        self.assertEqual(adapter._load_server_state()["host"], "192.0.2.1")
+
+    def test_validation_checks_dates_ohlc_and_all_markets(self):
+        adapter = self.adapter()
+        good = self.bars()
+        for bad in (
+            good.assign(datetime="1999-01-01"),
+            good.assign(datetime="2099-01-01"),
+            good.assign(high=1),
+            good.assign(close=float("inf")),
+            good.drop(columns=["low"]),
+        ):
+            with self.subTest(columns=list(bad.columns)):
+                with self.assertRaises(ConnectionError):
+                    adapter._validate_probe_bars(bad)
+
+    def test_valid_empty_business_response_does_not_quarantine_node(self):
+        adapter = self.adapter()
+        adapter.api = FakeQuotesAPI({})
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter._active_server = adapter.SERVERS[0]
+        with patch.object(adapter, "_mark_server_failure") as failed:
+            self.assertIsNone(adapter.get_stock_kline("600519", adjust="none"))
+        self.assertEqual(adapter.last_failure_kind, "no_data")
+        failed.assert_not_called()
+        self.assertTrue(adapter.connected)
+
+    def test_protocol_failure_switches_node_once_without_partial_history(self):
+        adapter = self.adapter()
+        adapter.api = FakeQuotesAPI({})
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter._active_server = adapter.SERVERS[0]
+        good = self.bars()
+
+        def reconnect():
+            adapter.api = FakeQuotesAPI({0: good})
+            adapter.connected = True
+            adapter.backend = "mootdx"
+            adapter._active_server = adapter.SERVERS[1]
+            return True
+
+        with patch.object(adapter, "_fetch_bars_data", side_effect=[struct.error("short"), good]):
+            with patch.object(adapter, "_connect", side_effect=reconnect) as connect:
+                result = adapter.get_stock_kline("600519", adjust="none", max_bars=2)
+        self.assertIsNotNone(result)
+        self.assertEqual(connect.call_count, 1)
+        self.assertNotIn(adapter.SERVERS[0], adapter._ordered_servers())
+        self.assertEqual(adapter._load_server_state()["host"], "192.0.2.2")
+
+    def test_two_protocol_failures_do_not_retry_a_third_time(self):
+        adapter = self.adapter()
+        adapter.api = object()
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter._active_server = adapter.SERVERS[0]
+
+        def reconnect():
+            adapter.api = object()
+            adapter.connected = True
+            adapter.backend = "mootdx"
+            adapter._active_server = adapter.SERVERS[1]
+            return True
+
+        with patch.object(adapter, "_fetch_bars_data", side_effect=struct.error("short")) as fetch:
+            with patch.object(adapter, "_connect", side_effect=reconnect) as connect:
+                self.assertIsNone(adapter.get_stock_kline("600519", adjust="none"))
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(connect.call_count, 1)
+
+    def test_auto_entry_never_calls_factory_or_scans(self):
+        adapter = self.adapter()
+        with patch.object(adapter, "_connect_manual", return_value=False) as manual:
+            self.assertFalse(adapter._connect_mootdx_auto())
+        manual.assert_called_once_with()
+
+    def test_pool_startup_failure_is_not_multiplied_by_slots_or_retries(self):
+        class FailedAdapter:
+            def __init__(self, **kwargs):
+                pass
+
+            def is_available(self):
+                return False
+
+            def disconnect(self):
+                pass
+
+        with patch.object(_module, "MootdxAdapter", side_effect=FailedAdapter) as constructor:
+            pool = _module.AdapterPool(size=8, timeout=1, max_retries=9, retry_delay=10)
+        self.assertEqual(constructor.call_count, 1)
+        self.assertEqual(pool.available, 0)
+        pool.close()
+
+    def test_pool_rejects_unbounded_size(self):
+        with self.assertRaises(ValueError):
+            _module.AdapterPool(size=0, timeout=1, max_retries=1, retry_delay=0)
+        with self.assertRaises(ValueError):
+            _module.AdapterPool(size=100000, timeout=1, max_retries=1, retry_delay=0)
+
+    def test_cooldown_survives_a_new_process_registry(self):
+        adapter = self.adapter()
+        adapter._mark_server_failure(adapter.SERVERS[0])
+        with patch.object(MootdxAdapter, "_health_states", {}):
+            self.assertNotIn(adapter.SERVERS[0], self.adapter()._ordered_servers())
+
+    def test_parallel_failure_reports_do_not_multiply_the_initial_cooldown(self):
+        adapter = self.adapter()
+        with patch("data_job.core.mootdx_adapter.time.time", return_value=1000):
+            adapter._mark_server_failure(adapter.SERVERS[0])
+        with patch("data_job.core.mootdx_adapter.time.time", return_value=1001):
+            adapter._mark_server_failure(adapter.SERVERS[0])
+        health = adapter._load_server_state()["nodes"]["192.0.2.1:7709"]
+        self.assertEqual(health, {"failures": 1, "cooldown_until": 1600})
+
+    def test_socket_is_closed_even_if_library_disconnect_raises(self):
+        class Sock:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class Client:
+            def __init__(self, sock):
+                self.client = sock
+
+            def disconnect(self):
+                self.client = None
+                raise OSError("shutdown on an already broken stream")
+
+        sock = Sock()
+        MootdxAdapter._close_api(Client(sock), "pytdx")
+        self.assertTrue(sock.closed)
+
+    def test_auto_endpoint_cannot_be_saved_as_business_success(self):
+        adapter = self.adapter()
+        adapter._save_server_state(host="auto", port=0, name="auto", backend="mootdx")
+        self.assertFalse(adapter.SERVER_STATE_PATH.exists())
+
+    def test_corrupt_and_oversized_health_cache_do_not_break_selection(self):
+        adapter = self.adapter()
+        for payload in ("{bad", '{"nodes": [], "cursor": "oops"}', " " * 65537):
+            adapter.SERVER_STATE_PATH.write_text(payload)
+            with patch.object(MootdxAdapter, "_health_states", {}):
+                self.assertEqual(len(adapter._ordered_servers()), 9)
+                adapter._mark_server_failure(adapter.SERVERS[0])
+                self.assertEqual(len(adapter._ordered_servers()), 8)
+
+    def test_shared_bad_node_is_not_reused_by_another_pool_stream(self):
+        adapter = self.adapter()
+        other = self.adapter()
+        api = FakeQuotesAPI({})
+        other.api, other.connected, other.backend = api, True, "mootdx"
+        other._active_server = other.SERVERS[0]
+        adapter._mark_server_failure(adapter.SERVERS[0])
+        with patch.object(other, "_connect", return_value=False) as connect:
+            self.assertFalse(other._ensure_connected())
+        connect.assert_called_once_with()
+        self.assertIsNone(other.api)
+
+    def test_empty_capability_probe_is_closed_but_not_quarantined(self):
+        adapter = self.adapter()
+        adapter.SERVERS = adapter.SERVERS[:1]
+
+        class EmptyAPI:
+            closed = False
+
+            def bars(self, **kwargs):
+                return pd.DataFrame()
+
+            def close(self):
+                self.closed = True
+
+        api = EmptyAPI()
+        with patch.object(adapter, "_open_api", return_value=api):
+            with patch.object(adapter, "_mark_server_failure") as failure:
+                self.assertFalse(adapter._connect())
+        self.assertTrue(api.closed)
+        failure.assert_not_called()
+
+    def test_qfq_nested_xdxr_failure_restarts_whole_request_only_once(self):
+        adapter = self.adapter()
+        good = self.bars()
+        class API:
+            closed = False
+            bars_calls = 0
+            xdxr_calls = 0
+
+            def bars(self, **kwargs):
+                self.bars_calls += 1
+                return good.copy()
+
+            def xdxr(self, **kwargs):
+                self.xdxr_calls += 1
+                raise struct.error("truncated action response")
+
+            def close(self):
+                self.closed = True
+
+        first, second = API(), API()
+        adapter.api, adapter.connected, adapter.backend = first, True, "mootdx"
+        adapter._active_server = adapter.SERVERS[0]
+
+        def reconnect():
+            adapter.api, adapter.connected, adapter.backend = second, True, "mootdx"
+            adapter._active_server = adapter.SERVERS[1]
+            return True
+
+        with patch.object(adapter, "_connect", side_effect=reconnect) as connect:
+            self.assertIsNone(adapter.get_stock_kline("600519", adjust="qfq", max_bars=2))
+        self.assertEqual(connect.call_count, 1)
+        self.assertEqual((first.bars_calls, second.bars_calls), (1, 1))
+        self.assertEqual((first.xdxr_calls, second.xdxr_calls), (1, 1))
+        self.assertTrue(first.closed and second.closed)
+
+    def test_index_second_page_failure_discards_partial_and_restarts_at_zero(self):
+        adapter = self.adapter()
+        first_page = pd.concat([self.bars()] * 400, ignore_index=True)
+        final_page = self.bars(price=20.0)
+
+        class API:
+            closed = False
+
+            def __init__(self, failing):
+                self.failing = failing
+                self.starts = []
+
+            def index_bars(self, **kwargs):
+                self.starts.append(kwargs["start"])
+                if not self.failing:
+                    return final_page
+                if kwargs["start"] == 0:
+                    return first_page
+                raise struct.error("short index page")
+
+            def close(self):
+                self.closed = True
+
+        first, second = API(True), API(False)
+        adapter.api, adapter.connected, adapter.backend = first, True, "mootdx"
+        adapter._active_server = adapter.SERVERS[0]
+
+        def reconnect():
+            adapter.api, adapter.connected, adapter.backend = second, True, "mootdx"
+            adapter._active_server = adapter.SERVERS[1]
+            return True
+
+        with patch.object(adapter, "_connect", side_effect=reconnect):
+            result = adapter.get_index_kline("000001", market=MARKET_SH, max_bars=1600)
+        self.assertTrue(first.closed)
+        self.assertEqual(first.starts, [0, 800])
+        self.assertEqual(second.starts, [0])
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result["close"].eq(20.0).all())
+
+    def test_deadline_socket_checks_each_read_without_a_timer_thread(self):
+        class Sock:
+            reads = 0
+            timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def recv(self, count):
+                self.reads += 1
+                return b"ok"
+
+        sock = Sock()
+        wrapped = MootdxAdapter._DeadlineSocket(sock, timeout=10, deadline=30)
+        with patch("data_job.core.mootdx_adapter.time.monotonic", return_value=29):
+            self.assertEqual(wrapped.recv(2), b"ok")
+        with patch("data_job.core.mootdx_adapter.time.monotonic", return_value=30):
+            with self.assertRaises(TimeoutError):
+                wrapped.recv(2)
+        self.assertEqual(sock.timeouts, [1])
+        self.assertEqual(sock.reads, 1)
+
+    def test_pool_forks_without_rediscovery_and_never_blocks_on_duplicate_release(self):
+        instances = []
+
+        class Adapter:
+            def __init__(self, **kwargs):
+                self.closed = False
+                instances.append(self)
+
+            def is_available(self):
+                return True
+
+            def fork_connection(self, **kwargs):
+                return Adapter()
+
+            def disconnect(self):
+                self.closed = True
+
+        with patch.object(_module, "MootdxAdapter", side_effect=Adapter) as constructor:
+            pool = _module.AdapterPool(size=3, timeout=1, max_retries=100, retry_delay=100)
+        self.assertEqual(constructor.call_count, 1)
+        self.assertEqual(pool.available, 3)
+        borrowed = [pool.acquire(timeout=0) for _ in range(3)]
+        with self.assertRaises(Empty):
+            pool.acquire(timeout=0)
+        pool.release(borrowed[0])
+        with self.assertRaises(ValueError):
+            pool.release(borrowed[0])
+        pool.close()
+        with self.assertRaises(RuntimeError):
+            pool.acquire(timeout=0)
+        for adapter in borrowed[1:]:
+            pool.release(adapter)
+        self.assertTrue(all(adapter.closed for adapter in instances))
+        self.assertFalse(pool._owned)
+
+    def test_pool_close_wakes_a_waiting_acquire(self):
+        class Adapter:
+            def __init__(self, **kwargs):
+                pass
+
+            def is_available(self):
+                return True
+
+            def disconnect(self):
+                pass
+
+        with patch.object(_module, "MootdxAdapter", Adapter):
+            pool = _module.AdapterPool(size=1, timeout=1, max_retries=1, retry_delay=0)
+        borrowed = pool.acquire(timeout=0)
+        ready, finished = Event(), Event()
+        errors = []
+
+        def waiter():
+            ready.set()
+            try:
+                pool.acquire(timeout=30)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+            finally:
+                finished.set()
+
+        thread = Thread(target=waiter)
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(1))
+            pool.close()
+            self.assertTrue(finished.wait(1))
+            self.assertEqual(errors, ["adapter pool is closed"])
+        finally:
+            pool.close()
+            thread.join(timeout=1)
+            pool.release(borrowed)
+        self.assertFalse(thread.is_alive())
 
 
 class FakeQuotesAPI:
@@ -570,8 +1305,10 @@ class TestMootdxAdapterPagination(unittest.TestCase):
 
     def test_recent_verified_servers_precede_legacy_servers(self):
         self.assertEqual(
-            MootdxAdapter.SERVERS[:5],
+            MootdxAdapter.SERVERS[:7],
             [
+                ("139.9.52.158", 7709, "国泰君安深圳"),
+                ("103.251.85.94", 7709, "国泰君安上海"),
                 ("59.36.5.11", 7709, "安信"),
                 ("117.34.114.14", 7709, "国泰君安1"),
                 ("117.34.114.15", 7709, "国泰君安2"),
@@ -591,7 +1328,7 @@ class TestMootdxAdapterPagination(unittest.TestCase):
             ordered = adapter._ordered_servers()
 
         self.assertEqual(ordered[0][:2], ("60.12.136.250", 7709))
-        self.assertEqual(ordered[1][:2], ("59.36.5.11", 7709))
+        self.assertEqual(ordered[1][:2], ("139.9.52.158", 7709))
 
     def test_connect_prefers_mootdx_manual_before_pytdx(self):
         adapter = MootdxAdapter.__new__(MootdxAdapter)
@@ -609,21 +1346,38 @@ class TestMootdxAdapterPagination(unittest.TestCase):
         pytdx_connect.assert_not_called()
         auto_connect.assert_not_called()
 
-    def test_connect_manual_passes_mootdx_server_as_tuple(self):
+    def test_connect_manual_uses_explicit_mootdx_stream_without_config_scans(self):
         calls = []
+        clients = []
 
-        class FakeAPI:
-            def bars(self, **kwargs):
-                return pd.DataFrame({"datetime": ["2026-09-11"], "close": [10.0]})
+        class FakeSocket:
+            def settimeout(self, value):
+                self.timeout = value
 
-        class FakeQuotes:
-            @staticmethod
-            def factory(**kwargs):
+        class FakeClient:
+            def __init__(self, **kwargs):
                 calls.append(kwargs)
-                return FakeAPI()
+                clients.append(self)
+                self.client = FakeSocket()
+                self.closed = False
+                self.probes = []
+
+            def connect(self, host, port, time_out):
+                self.server = (host, port)
+                return self
+
+            def setup(self):
+                pass
+
+            def get_security_bars(self, frequency, market, symbol, start, count):
+                self.probes.append((market, symbol))
+                return TestMootdxNodeFailover.bars(price=10.0 + market).to_dict("records")
+
+            def disconnect(self):
+                self.closed = True
 
         adapter = MootdxAdapter.__new__(MootdxAdapter)
-        adapter.Quotes = FakeQuotes
+        adapter.Quotes = object()
         adapter.SERVERS = [("59.36.5.11", 7709, "安信")]
         adapter.timeout = 5
         adapter.connected = False
@@ -631,15 +1385,213 @@ class TestMootdxAdapterPagination(unittest.TestCase):
         adapter.backend = None
         adapter.current_server = None
 
-        with patch.object(adapter, "_save_server_state") as save_state:
-            result = adapter._connect_manual()
+        with patch("mootdx.quotes.TdxHq_API", FakeClient):
+            with patch("mootdx.quotes.config.setup", side_effect=AssertionError("implicit scan")):
+                with patch.object(adapter, "_save_server_state") as save_state:
+                    result = adapter._connect_manual()
 
         self.assertTrue(result)
-        self.assertEqual(calls[0]["server"], ("59.36.5.11", 7709))
+        self.assertEqual(clients[0].server, ("59.36.5.11", 7709))
         self.assertFalse(calls[0]["auto_retry"])
-        save_state.assert_called_once_with(
-            host="59.36.5.11", port=7709, name="安信", backend="mootdx"
-        )
+        self.assertTrue(calls[0]["raise_exception"])
+        self.assertFalse(calls[0]["heartbeat"])
+        self.assertTrue(clients[0].closed)
+        self.assertEqual(len(clients[0].probes), 3)
+        self.assertEqual(clients[1].probes, [])
+        save_state.assert_not_called()
+
+    def test_real_tdxpy_parser_failure_is_not_accepted_as_no_data(self):
+        try:
+            from tdxpy.base_socket_client import last_ack_time
+        except ImportError:
+            self.skipTest("tdxpy is not installed")
+
+        class MalformedClient:
+            auto_retry = False
+            raise_exception = True
+            client = object()
+
+            @last_ack_time
+            def get_security_bars(self, **kwargs):
+                return struct.unpack("<I", b"\x20\x03")
+
+        class MalformedAPI:
+            def __init__(self):
+                self.client = MalformedClient()
+                self.closed = False
+
+            def bars(self, **kwargs):
+                return pd.DataFrame(self.client.get_security_bars(**kwargs))
+
+            def close(self):
+                self.closed = True
+
+        api = MalformedAPI()
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.api = api
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter.success_count = 0
+        adapter.fail_count = 0
+        adapter.last_failure_kind = None
+
+        result = adapter.get_stock_kline("600519", adjust="none", max_bars=2)
+
+        self.assertIsNone(result)
+        self.assertEqual(adapter.last_failure_kind, "connectivity")
+        self.assertTrue(api.closed)
+        self.assertIsNone(adapter.api)
+
+    def test_valid_empty_bars_remain_no_data_without_discarding_stream(self):
+        class EmptyAPI:
+            def __init__(self):
+                self.client = object()
+                self.closed = False
+
+            def bars(self, **kwargs):
+                return pd.DataFrame()
+
+            def close(self):
+                self.closed = True
+
+        api = EmptyAPI()
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.api = api
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter.success_count = 0
+        adapter.fail_count = 0
+        adapter.last_failure_kind = None
+
+        result = adapter.get_stock_kline("600519", adjust="none", max_bars=2)
+
+        self.assertIsNone(result)
+        self.assertEqual(adapter.last_failure_kind, "no_data")
+        self.assertFalse(api.closed)
+        self.assertIs(adapter.api, api)
+
+    def test_wrapped_header_and_body_failures_are_failed_transactions(self):
+        try:
+            from tdxpy.exceptions import TdxFunctionCallError
+            from tdxpy.parser.base import ResponseHeaderRecvFails, ResponseRecvFails
+        except ImportError:
+            self.skipTest("tdxpy is not installed")
+
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.api = object()
+        adapter.backend = "mootdx"
+        for error_type in (ResponseHeaderRecvFails, ResponseRecvFails):
+            with self.subTest(error_type=error_type.__name__):
+                error = TdxFunctionCallError("calling function error")
+                error.original_exception = error_type("truncated response")
+                self.assertTrue(adapter._transaction_failed(error))
+
+    def test_auto_probe_failure_closes_unusable_client(self):
+        class FailedAPI:
+            closed = False
+
+            def bars(self, **kwargs):
+                raise struct.error("truncated probe response")
+
+            def close(self):
+                self.closed = True
+
+        api = FailedAPI()
+
+        class FakeQuotes:
+            @staticmethod
+            def factory(**kwargs):
+                return api
+
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.Quotes = FakeQuotes
+        adapter.api = None
+        adapter.backend = None
+        adapter.connected = False
+        adapter.timeout = 2
+        adapter.SERVERS = [("192.0.2.1", 7709, "offline")]
+
+        with patch.object(adapter, "_open_api", return_value=api):
+            self.assertFalse(adapter._connect_mootdx_auto())
+        self.assertTrue(api.closed)
+        self.assertIsNone(adapter.api)
+
+    def test_qfq_rejects_wrapped_xdxr_protocol_failure(self):
+        try:
+            from tdxpy.exceptions import TdxFunctionCallError
+        except ImportError:
+            self.skipTest("tdxpy is not installed")
+
+        class FailedXdxrAPI:
+            client = object()
+            closed = False
+
+            def xdxr(self, **kwargs):
+                error = TdxFunctionCallError("calling function error")
+                error.original_exception = struct.error("truncated xdxr response")
+                raise error
+
+            def close(self):
+                self.closed = True
+
+        api = FailedXdxrAPI()
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.api = api
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter.success_count = 0
+        adapter.fail_count = 0
+        adapter.last_failure_kind = None
+        bars = pd.DataFrame({
+            "datetime": ["2026-10-22", "2026-10-23"],
+            "open": [10.0, 10.1], "high": [10.2, 10.3],
+            "low": [9.9, 10.0], "close": [10.1, 10.2],
+            "volume": [100.0, 120.0], "amount": [1010.0, 1224.0],
+        })
+        with patch.object(adapter, "_fetch_bars_data", return_value=bars):
+            result = adapter.get_stock_kline("600519", adjust="qfq", max_bars=2)
+
+        self.assertIsNone(result)
+        self.assertEqual(adapter.last_failure_kind, "connectivity")
+        self.assertTrue(api.closed)
+
+    def test_wrapped_second_page_failure_rejects_partial_history(self):
+        try:
+            from tdxpy.exceptions import TdxFunctionCallError
+        except ImportError:
+            self.skipTest("tdxpy is not installed")
+
+        class FailedPageAPI:
+            client = object()
+            calls = 0
+            closed = False
+
+            def bars(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return pd.DataFrame({"datetime": ["2026-10-23"] * 800})
+                error = TdxFunctionCallError("calling function error")
+                error.original_exception = struct.error("truncated K-line response")
+                raise error
+
+            def close(self):
+                self.closed = True
+
+        api = FailedPageAPI()
+        adapter = MootdxAdapter.__new__(MootdxAdapter)
+        adapter.api = api
+        adapter.connected = True
+        adapter.backend = "mootdx"
+        adapter.success_count = 0
+        adapter.fail_count = 0
+        adapter.last_failure_kind = None
+
+        result = adapter.get_stock_kline("600519", adjust="none", max_bars=1600)
+
+        self.assertIsNone(result)
+        self.assertEqual(api.calls, 2)
+        self.assertTrue(api.closed)
+        self.assertEqual(adapter.last_failure_kind, "connectivity")
 
     def test_get_stock_kline_uses_start_offset_and_deduplicates(self):
         """分页应使用递增的 start，且结果不应重复。"""
@@ -1050,5 +2002,94 @@ class TestRawAndQfqDualWrite(unittest.TestCase):
         self.assertEqual(args.raw_table, "stock_daily_prices_raw")
 
 
+@pytest.mark.parametrize('symbol', ['600519', '430047'])
+@pytest.mark.parametrize('has_history', [False, True])
+def test_exact_day_force_window_preserves_recent_request_bound(symbol, has_history):
+    """An exact-day repair must not silently download all history per stock."""
+    from types import SimpleNamespace
+
+    target = date.today()
+    requested = []
+
+    class Adapter:
+        last_failure_kind = None
+
+        def get_xdxr_info(self, code):
+            return None
+
+        def get_stock_kline(self, **kwargs):
+            requested.append(kwargs)
+            return None
+
+    adapter = Adapter()
+    pool = SimpleNamespace(acquire=lambda: adapter, release=lambda value: None)
+    fetch_one_symbol(symbol, target, target,
+                     target - _module.timedelta(days=3) if has_history else None,
+                     1, False, pool, 40, force_window=True)
+    assert requested[0]['max_bars'] == 40
+
+
+@pytest.mark.parametrize('age,full_refresh,force_window,cap,expected', [
+    (7, False, True, 40, 40),
+    (38, False, True, 40, 40),
+    (39, False, True, 40, None),
+    (400, False, True, 40, None),
+    (-1, False, True, 40, None),
+    (0, True, True, 40, None),
+    (0, False, False, 40, None),
+    (0, False, True, None, None),
+])
+def test_exact_day_request_bound_keeps_historical_and_refresh_semantics(
+        age, full_refresh, force_window, cap, expected):
+    target = date.today() - _module.timedelta(days=age)
+    assert _module.choose_request_max_bars(
+        target, target, target, None, full_refresh, force_window, cap) == expected
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("existing_target", [False, True])
+def test_single_day_repair_seeds_missing_pct_chg(existing_target):
+    """Exact-day repair needs the stored previous close for new and existing rows."""
+    with sqlite3.connect(":memory:") as conn:
+        init_target_table(conn, "prices")
+        conn.execute("INSERT INTO prices (symbol,trade_date,close) VALUES (?,?,?)",
+                     ("001326", "2026-10-23", 90.0))
+        row = dict(symbol="001326", trade_date=date(2026, 10, 26), open=90.99,
+                   close=91.0, high=96.66, low=88.49, volume=2055982.0,
+                   amount=192274480.0, pct_chg=None, turnover_rate=8.56,
+                   source=_module.SOURCE_NAME, quality_flag="ok", run_id="test",
+                   updated_at="2026-10-26 16:00:00", adjustment_mode="qfq", market="SZ")
+        if existing_target:
+            columns = list(row)
+            values = [v.isoformat() if isinstance(v, date) else v for v in row.values()]
+            conn.execute(f"INSERT INTO prices ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                         values)
+        result = _module.FetchResult(symbol="001326", status="success", market="SZ",
+                                     data=pd.DataFrame([row]), start_date=row["trade_date"],
+                                     end_date=row["trade_date"], write_policy="repair")
+        assert _module.save_batch(conn, "prices", [result]) == 1
+        actual = conn.execute("SELECT pct_chg FROM prices WHERE trade_date='2026-10-26'").fetchone()[0]
+        assert actual == pytest.approx(100 / 90)
+        assert _module.save_batch(conn, "prices", [result]) == 0
+
+
+@pytest.mark.parametrize("previous_close", [None, 0, -1, "invalid"])
+def test_pct_chg_seed_without_valid_previous_close_remains_unknown(previous_close):
+    data = pd.DataFrame({"trade_date": [date(2026, 10, 26)], "close": [91.0],
+                         "pct_chg": [None]})
+    assert pd.isna(seed_incremental_pct_chg(data, previous_close).iloc[0]["pct_chg"])
+
+
+def test_pct_chg_seed_preserves_existing_multi_day_values():
+    data = pd.DataFrame({"trade_date": [date(2026, 10, 26), date(2026, 10, 27)],
+                         "close": [91.0, 85.69], "pct_chg": [1.11, -5.835164835]})
+    result = seed_incremental_pct_chg(data, 80.0)
+    assert result["pct_chg"].tolist() == data["pct_chg"].tolist()
+    missing_first = data.copy()
+    missing_first.loc[0, "pct_chg"] = None
+    result = seed_incremental_pct_chg(missing_first, 90.0)
+    assert result.iloc[0]["pct_chg"] == pytest.approx(100 / 90)
+    assert result.iloc[1]["pct_chg"] == data.iloc[1]["pct_chg"]

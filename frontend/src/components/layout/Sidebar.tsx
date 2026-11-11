@@ -23,7 +23,7 @@ import { quantApi } from '@/lib/api';
 import { asList } from '@/components/workspace/DashboardPrimitives';
 
 const MODULES = [
-  { id: 'dashboard', name: 'Dashboard', sub: '总览', path: '/a/quant', activePath: '/a/quant', icon: Radar },
+  { id: 'dashboard', name: 'Dashboard', sub: '总览', path: '/a/dashboard', activePath: '/a/dashboard', icon: Radar },
   { id: 'market', name: 'Market', sub: '市场温度', path: '/a/market', activePath: '/a/market', icon: Activity },
   { id: 'industries', name: 'Industries', sub: '行业战役', path: '/a/sector', activePath: '/a/sector', icon: Layers },
   { id: 'alpha', name: 'Alpha Pool', sub: '机会池', path: '/a/alpha-pool', activePath: '/a/alpha-pool', icon: Sparkles },
@@ -32,7 +32,7 @@ const MODULES = [
   { id: 'signals', name: 'Signals', sub: '买点信号', path: '/a/signals', activePath: '/a/signals', icon: Zap },
   { id: 'portfolio', name: 'Portfolio', sub: '持仓风控', path: '/a/portfolio', activePath: '/a/portfolio', icon: BriefcaseBusiness },
   { id: 'review', name: 'Review', sub: '复盘进化', path: '/a/report', activePath: '/a/report', icon: FileText },
-  { id: 'ai', name: 'AI Lab', sub: 'AI实验室', path: '/a/quant#ai-brief', icon: Bot },
+  { id: 'ai', name: 'AI Lab', sub: 'AI实验室', path: '/a/dashboard#ai-brief', icon: Bot },
   { id: 'settings', name: 'Settings', sub: '系统设置', path: '/a/data', activePath: '/a/data', icon: Database },
 ];
 
@@ -59,7 +59,7 @@ export default function Sidebar() {
     >
       {/* Logo + 折叠按钮 */}
       <div className="flex items-center gap-2 px-3 pb-3 pt-4 shrink-0">
-        <Link href="/a/quant" className="flex items-center gap-2 min-w-0">
+        <Link href="/a/dashboard" className="flex items-center gap-2 min-w-0">
           <div className="evo-brand-mark shrink-0">
             <span>A</span>
           </div>

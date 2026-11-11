@@ -58,7 +58,7 @@ def _is_running(db_path: Path | str) -> bool:
             return True
 
 
-def get_report(db_path: Path | str, target: str) -> dict:
+def get_report(db_path: Path | str, target: str, *, include_email: bool = True) -> dict:
     """Return the saved report and compact task state, with no CPU replay."""
     target = _day(target)
     active = _load_job(db_path)
@@ -89,7 +89,7 @@ def get_report(db_path: Path | str, target: str) -> dict:
     if saved and not saved.get('valid') and not running:
         job.update(status='STALE', stage='STALE',
                    reason='源数据或规则需要重新校验，当前展示旧版存档，可更新日报')
-    return dict(report=report, email_html=render_email(report) if report else '', job=job,
+    return dict(report=report, email_html=render_email(report) if include_email and report else '', job=job,
                 archive=None if not saved else dict(
                     valid=saved.get('valid', False), archive_id=saved['archive_id'],
                     generated_at=saved['generated_at'], complete=bool(archived)))

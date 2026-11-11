@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -28,8 +29,8 @@ def _trade_dates(count: int = 62) -> list[str]:
     return values
 
 
-def _make_db(path, *, industry_state: str | None = "I3") -> tuple[str, str]:
-    dates = _trade_dates()
+def _make_db(path, *, industry_state: str | None = "I3", history_days=62) -> tuple[str, str]:
+    dates = _trade_dates(history_days)
     zone_date = dates[-1]
     trigger_date = (date.fromisoformat(zone_date) + timedelta(days=1)).isoformat()
     conn = sqlite3.connect(path)
@@ -62,7 +63,7 @@ def _make_db(path, *, industry_state: str | None = "I3") -> tuple[str, str]:
     )
     rows = []
     for index, trade_date in enumerate(dates):
-        high = 100.0 if index == 40 else 91.0
+        high = 100.0 if index == len(dates) - 22 else 91.0
         volume = 1000.0
         if index >= len(dates) - 3:
             volume = float(700 - (index - (len(dates) - 3)) * 100)
@@ -86,6 +87,1085 @@ def watch_db(tmp_path):
     db_path = tmp_path / "watch.db"
     zone_date, trigger_date = _make_db(db_path)
     return db_path, zone_date, trigger_date
+
+
+def _add_historical_day(db_path, trade_date, *, close=92, industry="I3"):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO stock_daily_prices VALUES ('688001', ?, 90, 93, 89.5, ?, 800)",
+            (trade_date, close),
+        )
+        conn.execute(
+            "INSERT INTO stock_lifecycle_state VALUES "
+            "(?, '688001', '测试股份', 'M3', ?, 90, 80, 'OK', 'manual')",
+            (trade_date, industry),
+        )
+
+
+def _legacy_quality(db_path, *trade_dates):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS data_quality_report "
+            "(trade_date TEXT, module TEXT, market TEXT, status TEXT, created_at TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO data_quality_report VALUES (?, 'stock_daily', 'SH', 'PASS', ?)",
+            [(day, day + " 16:00:00") for day in trade_dates],
+        )
+
+
+def test_legacy_verified_seed_preserves_zone_and_only_writes_target(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _legacy_quality(db_path, zone_date)
+    _add_historical_day(db_path, trigger_date)
+    with sqlite3.connect(db_path) as conn:
+        seed_before = conn.execute("SELECT * FROM watch_daily_snapshot").fetchall()
+        events_before = conn.execute("SELECT * FROM watch_events").fetchall()
+    result = engine.run_daily(trigger_date, historical=True)
+    assert result["success"] is True
+    with sqlite3.connect(db_path) as conn:
+        state, previous, setup_id, raw_factors = conn.execute(
+            "SELECT watch_state, previous_state, setup_id, factors FROM watch_daily_snapshot "
+            "WHERE trade_date=?", (trigger_date,),
+        ).fetchone()
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date=?", (zone_date,)
+        ).fetchall() == seed_before
+        assert conn.execute("SELECT * FROM watch_events").fetchall() == events_before
+        assert conn.execute("SELECT COUNT(*) FROM notification_deliveries").fetchone() == (0,)
+    assert (state, previous, setup_id) == ("TRIGGERED", "IN_ZONE", f"688001:{zone_date}")
+    seed = json.loads(raw_factors)["watch_rebuild"]["legacy_seed"]
+    assert seed["mode"] == "legacy_verified"
+    assert seed["trade_date"] == zone_date
+    assert len(seed["input_signature"]) == 64
+    assert engine.check_historical_snapshots(trigger_date)["trusted"] is True
+
+
+def test_legacy_verified_seed_preserves_cooldown_and_excludes_future_event(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    _legacy_quality(db_path, zone_date, trigger_date)
+    later = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, later, close=90)
+    with sqlite3.connect(db_path) as conn:
+        engine._event(
+            conn, dedupe_key="state:future", trade_date="2099-01-01", event_type="TRIGGERED",
+            severity="HIGH", title="future", message="future", symbol="688001",
+            setup_id=f"688001:{zone_date}",
+        )
+    assert engine.run_daily(later, historical=True)["success"]
+    with sqlite3.connect(db_path) as conn:
+        state, factors = conn.execute(
+            "SELECT watch_state, factors FROM watch_daily_snapshot WHERE trade_date=?", (later,)
+        ).fetchone()
+    assert state == "TRIGGERED"
+    assert json.loads(factors)["watch_rebuild"]["trigger_date"] == trigger_date
+    assert engine.check_historical_snapshots(later)["trusted"]
+
+
+@pytest.mark.parametrize("event_kind", ["intraday", "stale", "daily_price", "older_anchor"])
+def test_legacy_trigger_uses_latest_daily_transition_not_notification(watch_db, event_kind):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    _legacy_quality(db_path, zone_date, trigger_date)
+    target = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    with sqlite3.connect(db_path) as conn:
+        if event_kind == "older_anchor":
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(watch_daily_snapshot)")]
+            row = list(conn.execute(
+                "SELECT * FROM watch_daily_snapshot WHERE trade_date=?", (trigger_date,)
+            ).fetchone())
+            row[columns.index("trade_date")] = _trade_dates()[-3]
+            conn.execute(
+                f"INSERT INTO watch_daily_snapshot VALUES ({','.join('?' for _ in columns)})", row
+            )
+        else:
+            payload = {"current_price": 999, "trigger_price": 998, "invalidation_price": 997}
+            if event_kind == "intraday":
+                payload["source"] = "intraday_5min"
+            conn.execute("UPDATE watch_events SET payload=? WHERE event_type='TRIGGERED'",
+                         (json.dumps(payload),))
+            if event_kind == "stale":
+                conn.execute("UPDATE watch_events SET trade_date=? WHERE event_type='TRIGGERED'",
+                             (zone_date,))
+        before = conn.execute("SELECT * FROM watch_events").fetchall()
+    result = engine.run_daily(target, historical=True)
+    assert result["success"], result
+    with sqlite3.connect(db_path) as conn:
+        state, setup, raw_factors = conn.execute(
+            "SELECT watch_state,setup_id,factors FROM watch_daily_snapshot WHERE trade_date=?",
+            (target,),
+        ).fetchone()
+        assert conn.execute("SELECT * FROM watch_events").fetchall() == before
+    assert (state, setup) == ("TRIGGERED", f"688001:{zone_date}")
+    assert json.loads(raw_factors)["watch_rebuild"]["trigger_date"] == trigger_date
+
+
+@pytest.mark.parametrize("ratio", [0.9865334488984435, 0.9920098343434771, 0.9989019607796388])
+@pytest.mark.parametrize("state", ["IN_ZONE", "TRIGGERED", "INVALIDATED", "WATCHING"])
+def test_legacy_uniform_qfq_rebase_preserves_state_and_old_rows(watch_db, ratio, state):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    if state == "WATCHING":
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE stock_daily_prices SET volume=1000")
+    engine.run(zone_date)
+    days = [zone_date]
+    if state in {"TRIGGERED", "INVALIDATED"}:
+        _add_historical_day(db_path, trigger_date, close=83 if state == "INVALIDATED" else 92)
+        if state == "INVALIDATED":
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("UPDATE stock_daily_prices SET low=82 WHERE trade_date=?",
+                             (trigger_date,))
+        engine.run(trigger_date)
+        days.append(trigger_date)
+    _legacy_quality(db_path, *days)
+    seed_date = days[-1]
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        original = dict(conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date=?", (seed_date,)
+        ).fetchone())
+        assert original["watch_state"] == state
+        old_rows = [tuple(row) for row in conn.execute("SELECT * FROM watch_daily_snapshot")]
+        conn.execute(
+            "UPDATE stock_daily_prices SET open=open*?,high=high*?,low=low*?,close=close*?",
+            (ratio,) * 4,
+        )
+    target = (date.fromisoformat(seed_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE stock_daily_prices SET open=open*?,high=high*?,low=low*?,close=close*? "
+            "WHERE trade_date=?", (ratio,) * 4 + (target,),
+        )
+    result = engine.run_daily(target, historical=True)
+    assert result["success"], result
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date<>?", (target,)
+        ).fetchall() == old_rows
+        previous, setup, raw_factors = conn.execute(
+            "SELECT previous_state,setup_id,factors FROM watch_daily_snapshot WHERE trade_date=?",
+            (target,),
+        ).fetchone()
+        assert conn.execute("SELECT count(*) FROM notification_deliveries").fetchone() == (0,)
+    assert previous == state
+    if state in {"IN_ZONE", "TRIGGERED"}:
+        assert setup == original["setup_id"]
+    metadata = json.loads(raw_factors)["watch_rebuild"]
+    assert metadata["legacy_seed"]["price_rebase_ratio"] == pytest.approx(ratio)
+    if state == "TRIGGERED":
+        assert metadata["trigger_date"] == trigger_date
+    assert engine.check_historical_snapshots(target)["trusted"]
+
+
+@pytest.mark.parametrize("change", [
+    "close", "high", "low", "volume", "macd_history", "lifecycle", "anchor_version",
+    "anchor_quality", "anchor_price", "anchor_parent", "anchor_missing",
+])
+def test_legacy_rebase_keeps_nonuniform_changes_and_bad_anchors_blocked(tmp_path, change):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path = tmp_path / "watch.db"
+    zone_date, trigger_date = _make_db(db_path, history_days=121)
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    current = date.fromisoformat(trigger_date)
+    seed_date = (current + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, seed_date, close=90)
+    engine.run(seed_date)
+    _legacy_quality(db_path, zone_date, trigger_date, seed_date)
+    target = (current + timedelta(days=2)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE stock_daily_prices SET open=open*0.98653,high=high*0.98653,"
+            "low=low*0.98653,close=close*0.98653"
+        )
+        if change in {"close", "high", "low", "volume"}:
+            conn.execute(
+                f"UPDATE stock_daily_prices SET {change}={change}*1.001 WHERE trade_date=?",
+                (seed_date,),
+            )
+        elif change == "macd_history":
+            conn.execute("UPDATE stock_daily_prices SET close=close*1.001 WHERE trade_date=?",
+                         (_trade_dates()[10],))
+        elif change == "lifecycle":
+            conn.execute("UPDATE stock_lifecycle_state SET rps_50=rps_50+0.02 WHERE trade_date=?",
+                         (trigger_date,))
+        elif change == "anchor_version":
+            conn.execute("UPDATE watch_daily_snapshot SET rule_version=999 WHERE trade_date=?",
+                         (trigger_date,))
+        elif change == "anchor_quality":
+            conn.execute("UPDATE data_quality_report SET status='FAIL' WHERE trade_date=?",
+                         (trigger_date,))
+        elif change == "anchor_price":
+            conn.execute("UPDATE watch_daily_snapshot SET trigger_price=trigger_price+1 "
+                         "WHERE trade_date=?", (trigger_date,))
+        elif change == "anchor_parent":
+            conn.execute("UPDATE watch_daily_snapshot SET watch_state='WATCHING' WHERE trade_date=?",
+                         (zone_date,))
+        else:
+            conn.execute("UPDATE watch_daily_snapshot SET previous_state='TRIGGERED' "
+                         "WHERE trade_date=?", (trigger_date,))
+        rows = conn.execute("SELECT * FROM watch_daily_snapshot").fetchall()
+        events = conn.execute("SELECT * FROM watch_events").fetchall()
+    if change in {"close", "high", "low", "volume", "macd_history", "lifecycle"}:
+        # 真修订可以从更早可信种子重放，但绝不能直接通过 uniform-rebase 门。
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            member = engine._monitored_members(conn)[0]
+            previous = engine._previous_snapshot(conn, member.symbol, target)
+            seed, errors = engine._legacy_seed(
+                conn, member, target, previous, engine._historical_rules(conn), allow_warmup=False
+            )
+            assert seed is None
+            assert errors[0].startswith("legacy_seed_untrusted:")
+            assert conn.total_changes == 0
+        return
+    result = engine.run_daily(target, historical=True)
+    assert not result["success"], result
+    assert result["blocked_reasons"][0].startswith("legacy_seed_untrusted:")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT watch_state,data_status FROM watch_daily_snapshot WHERE trade_date=?", (target,)
+        ).fetchone() == ("UNKNOWN", "BLOCKED")
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date<>?", (target,)
+        ).fetchall() == rows
+        assert conn.execute("SELECT * FROM watch_events").fetchall() == events
+
+
+def test_legacy_rebase_read_only_seed_has_bounded_window_and_stable_signature(tmp_path, monkeypatch):
+    from contextlib import closing
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path = tmp_path / "watch.db"
+    zone_date, trigger_date = _make_db(db_path, history_days=121)
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    _legacy_quality(db_path, zone_date, trigger_date)
+    target = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE stock_daily_prices SET open=open*0.98653,high=high*0.98653,"
+                     "low=low*0.98653,close=close*0.98653")
+    before = db_path.read_bytes()
+    calls = []
+    original = engine._prices
+
+    def prices(conn, symbol, trade_date):
+        rows = original(conn, symbol, trade_date)
+        calls.append((symbol, trade_date, len(rows)))
+        assert len(rows) <= 121
+        return rows
+
+    monkeypatch.setattr(engine, "_prices", prices)
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        rules = engine._historical_rules(conn)
+        member = engine._monitored_members(conn)[0]
+        previous = engine._previous_snapshot(conn, member.symbol, target)
+        seed, errors = engine._legacy_seed(conn, member, target, previous, rules)
+        assert errors == []
+        assert seed["watch_state"] == "TRIGGERED"
+        assert len(calls) <= 3
+        assert max(count for _, _, count in calls) == 121
+        calls.clear()
+        again, errors = engine._legacy_seed(conn, member, target, previous, rules)
+        assert errors == []
+        assert again == seed
+        assert len(calls) <= 3
+        assert conn.total_changes == 0
+    assert db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", [None, "output_signature", "row", "nonuniform", "input_only"])
+def test_signed_historical_seed_only_rebases_intact_uniform_qfq(watch_db, bad):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    assert engine.run_daily(zone_date, historical=True)["success"]
+    _add_historical_day(db_path, trigger_date)
+    assert engine.run_daily(trigger_date, historical=True)["success"]
+    _legacy_quality(db_path, zone_date, trigger_date)
+    target = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        saved = dict(conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date=?", (trigger_date,)
+        ).fetchone())
+        factors = json.loads(saved["factors"])
+        output_signature = factors["watch_rebuild"]["output_signature"]
+        if bad != "input_only":
+            conn.execute("UPDATE stock_daily_prices SET open=open*0.98653,high=high*0.98653,"
+                         "low=low*0.98653,close=close*0.98653")
+        if bad == "output_signature":
+            factors["watch_rebuild"]["output_signature"] = "tampered"
+        elif bad == "row":
+            conn.execute("UPDATE watch_daily_snapshot SET current_price=current_price+1 "
+                         "WHERE trade_date=?", (trigger_date,))
+        elif bad == "nonuniform":
+            conn.execute("UPDATE stock_daily_prices SET volume=volume+1 WHERE trade_date=?",
+                         (zone_date,))
+        elif bad == "input_only":
+            factors["watch_rebuild"]["input_signature"] = "stale"
+            saved["factors"] = factors
+            factors["watch_rebuild"]["output_signature"] = engine._snapshot_signature(saved)
+        conn.execute("UPDATE watch_daily_snapshot SET factors=? WHERE trade_date=?",
+                     (json.dumps(factors), trigger_date))
+        before = [tuple(row) for row in conn.execute("SELECT * FROM watch_daily_snapshot")]
+    result = engine.run_daily(target, historical=True)
+    assert result["success"] is (bad is None), result
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date<>?", (target,)
+        ).fetchall() == before
+        state, previous, setup, raw_factors, status = conn.execute(
+            "SELECT watch_state,previous_state,setup_id,factors,data_status "
+            "FROM watch_daily_snapshot WHERE trade_date=?", (target,),
+        ).fetchone()
+        assert conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('watch_events','notification_deliveries')"
+        ).fetchone() == (0,)
+    if bad is None:
+        assert (state, previous, setup) == ("TRIGGERED", "TRIGGERED", f"688001:{zone_date}")
+        metadata = json.loads(raw_factors)["watch_rebuild"]
+        assert metadata["trigger_date"] == trigger_date
+        assert metadata["legacy_seed"]["source_output_signature"] == output_signature
+        assert metadata["legacy_seed"]["price_rebase_ratio"] == pytest.approx(0.98653)
+        assert engine.check_historical_snapshots(target)["trusted"]
+    else:
+        assert (state, status) == ("UNKNOWN", "BLOCKED")
+        if bad == "nonuniform":
+            assert "no_verified_seed" in result["blocked_reasons"][0]
+        else:
+            assert result["blocked_reasons"] == ["previous_snapshot_untrusted"]
+
+
+def _warmup_revision_history(watch_db, *, old_watching=False):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    days = [zone_date, trigger_date]
+    current = date.fromisoformat(trigger_date)
+    for _ in range(4):
+        current += timedelta(days=1)
+        while current.weekday() >= 5:
+            current += timedelta(days=1)
+        days.append(current.isoformat())
+        _add_historical_day(db_path, days[-1], close=90)
+        engine.run(days[-1])
+    current += timedelta(days=1)
+    while current.weekday() >= 5:
+        current += timedelta(days=1)
+    target = current.isoformat()
+    _add_historical_day(db_path, target, close=90)
+    _legacy_quality(db_path, *days)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE trading_calendar (trade_date TEXT PRIMARY KEY,is_open INTEGER)")
+        conn.executemany("INSERT INTO trading_calendar VALUES (?,1)",
+                         [(day,) for day in _trade_dates() + days[1:] + [target]])
+        conn.execute("UPDATE stock_lifecycle_state SET rps_50=89 WHERE trade_date=?",
+                     (trigger_date,))
+        if old_watching:
+            conn.execute("UPDATE watch_daily_snapshot SET watch_state='WATCHING',setup_id=NULL "
+                         "WHERE trade_date=?", (days[-1],))
+    return engine, days, target
+
+
+@pytest.mark.parametrize("old_watching", [False, True])
+def test_historical_warmup_recovers_revised_anchor_without_old_writes(watch_db, monkeypatch,
+                                                                   old_watching):
+    from contextlib import closing
+
+    db_path = watch_db[0]
+    engine, days, target = _warmup_revision_history(watch_db, old_watching=old_watching)
+    tables = ("watch_daily_snapshot", "watch_events", "notification_deliveries",
+              "stock_pools", "stock_pool_members")
+    with sqlite3.connect(db_path) as conn:
+        before = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+    calls = []
+    original = engine._prices
+
+    def prices(conn, symbol, day):
+        rows = original(conn, symbol, day)
+        calls.append((symbol, day, len(rows)))
+        assert len(rows) <= 121
+        return rows
+
+    monkeypatch.setattr(engine, "_prices", prices)
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        rules = engine._historical_rules(conn)
+        member = engine._monitored_members(conn)[0]
+        previous, errors = engine._historical_previous(conn, member, target, rules)
+        assert errors == [], errors
+        assert previous["watch_state"] == "TRIGGERED"
+        metadata = json.loads(previous["factors"])["watch_rebuild"]
+        assert metadata["mode"] == "warmup_verified"
+        assert metadata["trigger_date"] == days[1]
+        assert metadata["warmup"]["seed_date"] == days[0]
+        assert metadata["warmup"]["start_date"] == days[1]
+        assert metadata["warmup"]["end_date"] == days[-1]
+        assert metadata["output_signature"] == engine._snapshot_signature(previous)
+        assert conn.total_changes == 0
+    assert len(calls) <= 82
+    calls.clear()
+    result = engine.run_daily(target, historical=True)
+    assert result["success"], result
+    assert len(calls) <= 82
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT * FROM watch_daily_snapshot WHERE trade_date<>?",
+                            (target,)).fetchall() == before["watch_daily_snapshot"]
+        for table in tables[1:]:
+            assert conn.execute(f"SELECT * FROM {table}").fetchall() == before[table]
+        state, prior, raw_factors = conn.execute(
+            "SELECT watch_state,previous_state,factors FROM watch_daily_snapshot WHERE trade_date=?",
+            (target,),
+        ).fetchone()
+    assert (state, prior) == ("TRIGGERED", "TRIGGERED")
+    assert json.loads(raw_factors)["watch_rebuild"]["warmup"]["seed_date"] == days[0]
+    assert engine.check_historical_snapshots(target)["trusted"]
+
+
+@pytest.mark.parametrize("missing", ["quality", "quality_fail", "lifecycle", "price", "bad_bar"])
+def test_historical_warmup_missing_middle_source_is_blocked(watch_db, missing):
+    db_path = watch_db[0]
+    engine, days, target = _warmup_revision_history(watch_db)
+    middle = days[2]
+    with sqlite3.connect(db_path) as conn:
+        if missing == "quality":
+            conn.execute("DELETE FROM data_quality_report WHERE trade_date=?", (middle,))
+        elif missing == "quality_fail":
+            conn.execute("UPDATE data_quality_report SET status='FAIL' WHERE trade_date=?", (middle,))
+        elif missing == "lifecycle":
+            conn.execute("DELETE FROM stock_lifecycle_state WHERE trade_date=?", (middle,))
+        elif missing == "price":
+            conn.execute("DELETE FROM stock_daily_prices WHERE trade_date=?", (middle,))
+        else:
+            conn.execute("UPDATE stock_daily_prices SET low=1000 WHERE trade_date=?", (middle,))
+        old = conn.execute("SELECT * FROM watch_daily_snapshot").fetchall()
+    result = engine.run_daily(target, historical=True)
+    assert not result["success"], result
+    expected = "source_invalid_ohlcv" if missing == "bad_bar" else "warmup"
+    assert any(expected in error for error in result["blocked_reasons"]), result
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT * FROM watch_daily_snapshot WHERE trade_date<>?",
+                            (target,)).fetchall() == old
+        assert conn.execute("SELECT watch_state,data_status FROM watch_daily_snapshot "
+                            "WHERE trade_date=?", (target,)).fetchone() == ("UNKNOWN", "BLOCKED")
+
+
+@pytest.mark.parametrize("calendar", ["empty", "invalid_date"])
+def test_historical_warmup_early_calendar_error_retains_original_reason(watch_db, calendar):
+    from contextlib import closing
+
+    db_path = watch_db[0]
+    engine, _, target = _warmup_revision_history(watch_db)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM trading_calendar")
+        if calendar == "invalid_date":
+            conn.execute("INSERT INTO trading_calendar VALUES ('2025-99-99',1)")
+    before = db_path.read_bytes()
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        member = engine._monitored_members(conn)[0]
+        seed, errors = engine._historical_warmup(
+            conn, member, target, engine._historical_rules(conn), "factors_changed", {"remaining": 81}
+        )
+        assert seed is None
+        assert len(errors) == 1
+        assert errors[0].startswith(f"legacy_warmup_untrusted:{target}:")
+        assert "trading_days_missing" in errors[0] if calendar == "empty" else "month" in errors[0]
+        assert conn.total_changes == 0
+    assert db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", [
+    "status", "version", "price", "zone", "stop", "state", "factors",
+    "quality_failed", "quality_missing", "lifecycle", "history", "bad_bar", "gap",
+])
+def test_unverifiable_legacy_seed_is_blocked_not_reset(watch_db, bad):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _legacy_quality(db_path, zone_date)
+    _add_historical_day(db_path, trigger_date)
+    with sqlite3.connect(db_path) as conn:
+        statements = {
+            "status": "UPDATE watch_daily_snapshot SET data_status='BLOCKED'",
+            "version": "UPDATE watch_daily_snapshot SET rule_version=999",
+            "price": "UPDATE watch_daily_snapshot SET current_price=999",
+            "zone": "UPDATE watch_daily_snapshot SET zone_low=1",
+            "stop": "UPDATE watch_daily_snapshot SET invalidation_price=1",
+            "state": "UPDATE watch_daily_snapshot SET watch_state='TRIGGERED'",
+            "factors": "UPDATE watch_daily_snapshot SET factors='{}'",
+            "quality_failed": "UPDATE data_quality_report SET status='FAIL'",
+            "quality_missing": "DELETE FROM data_quality_report",
+            "lifecycle": "UPDATE stock_lifecycle_state SET structure_score=79 "
+                         f"WHERE trade_date='{zone_date}'",
+            "history": "UPDATE stock_daily_prices SET volume=volume+1 "
+                       f"WHERE trade_date='{_trade_dates()[-3]}'",
+            "bad_bar": "UPDATE stock_daily_prices SET low=1000 "
+                       f"WHERE trade_date='{zone_date}'",
+            "gap": "UPDATE watch_daily_snapshot SET trade_date='2026-01-01'",
+        }
+        conn.execute(statements[bad])
+        previous = conn.execute("SELECT * FROM watch_daily_snapshot").fetchall()
+    result = engine.run_daily(trigger_date, historical=True)
+    assert result["success"] is False
+    assert any("legacy" in reason for reason in result["blocked_reasons"])
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT watch_state, data_status FROM watch_daily_snapshot WHERE trade_date=?",
+            (trigger_date,),
+        ).fetchone() == ("UNKNOWN", "BLOCKED")
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date<>?", (trigger_date,)
+        ).fetchall() == previous
+
+
+def test_legacy_seed_verification_is_bounded_and_read_only(watch_db, monkeypatch):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _legacy_quality(db_path, zone_date)
+    _add_historical_day(db_path, trigger_date)
+    assert engine.run_daily(trigger_date, historical=True)["success"]
+    before = db_path.read_bytes()
+    calls = []
+    original = engine._prices
+
+    def prices(conn, symbol, trade_date):
+        result = original(conn, symbol, trade_date)
+        calls.append((symbol, trade_date, len(result)))
+        assert len(result) <= 121
+        return result
+
+    monkeypatch.setattr(engine, "_prices", prices)
+    assert engine.check_historical_snapshots(trigger_date)["trusted"]
+    assert len(calls) <= 4
+    assert {symbol for symbol, _, _ in calls} == {"688001"}
+    assert db_path.read_bytes() == before
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE data_quality_report SET status='FAIL'")
+    assert engine.check_historical_snapshots(trigger_date)["trusted"] is False
+
+
+@pytest.mark.parametrize("without_events", [False, True])
+def test_legacy_continuing_cooldown_uses_bounded_anchor(watch_db, monkeypatch, without_events):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    days = [zone_date, trigger_date]
+    current = date.fromisoformat(trigger_date)
+    for _ in range(2):
+        current += timedelta(days=1)
+        days.append(current.isoformat())
+        _add_historical_day(db_path, days[-1], close=90)
+        engine.run(days[-1])
+    _legacy_quality(db_path, *days)
+    target = (current + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    if without_events:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM watch_events")
+    seen = []
+    original = engine._prices
+
+    def prices(conn, symbol, trade_date):
+        seen.append(trade_date)
+        rows = original(conn, symbol, trade_date)
+        assert len(rows) <= 121
+        return rows
+
+    monkeypatch.setattr(engine, "_prices", prices)
+    assert engine.run_daily(target, historical=True)["success"]
+    assert len(seen) <= 4
+    with sqlite3.connect(db_path) as conn:
+        state, setup, factors = conn.execute(
+            "SELECT watch_state, setup_id, factors FROM watch_daily_snapshot WHERE trade_date=?",
+            (target,),
+        ).fetchone()
+    assert (state, setup) == ("TRIGGERED", f"688001:{zone_date}")
+    metadata = json.loads(factors)["watch_rebuild"]
+    assert metadata["legacy_seed"]["mode"] == "legacy_verified"
+    assert metadata["trigger_date"] == trigger_date
+    seen.clear()
+    assert engine.check_historical_snapshots(target)["trusted"]
+    assert len(seen) <= 4
+
+
+def test_legacy_watching_seed_is_verified_without_fabricated_setup(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE stock_daily_prices SET volume=1000")
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _legacy_quality(db_path, zone_date)
+    _add_historical_day(db_path, trigger_date)
+    assert engine.run_daily(trigger_date, historical=True)["success"]
+    with sqlite3.connect(db_path) as conn:
+        state, setup, factors = conn.execute(
+            "SELECT previous_state, setup_id, factors FROM watch_daily_snapshot WHERE trade_date=?",
+            (trigger_date,),
+        ).fetchone()
+    assert state == "WATCHING"
+    assert json.loads(factors)["watch_rebuild"]["legacy_seed"]["mode"] == "legacy_verified"
+    assert setup is None or setup == f"688001:{trigger_date}"
+
+
+def test_legacy_invalidated_seed_is_verified_against_previous_stop(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, invalid_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, invalid_date, close=83)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE stock_daily_prices SET low=82 WHERE trade_date=?", (invalid_date,))
+    engine.run(invalid_date)
+    _legacy_quality(db_path, zone_date, invalid_date)
+    target = (date.fromisoformat(invalid_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    result = engine.run_daily(target, historical=True)
+    assert result["success"], result
+    with sqlite3.connect(db_path) as conn:
+        previous, factors = conn.execute(
+            "SELECT previous_state, factors FROM watch_daily_snapshot WHERE trade_date=?", (target,)
+        ).fetchone()
+    assert previous == "INVALIDATED"
+    assert json.loads(factors)["watch_rebuild"]["legacy_seed"]["mode"] == "legacy_verified"
+
+
+def test_legacy_seed_without_required_parent_is_explicitly_blocked(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    _legacy_quality(db_path, zone_date, trigger_date)
+    target = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target, close=90)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM watch_daily_snapshot WHERE trade_date=?", (zone_date,))
+    result = engine.run_daily(target, historical=True)
+    assert result["success"] is False
+    assert result["blocked_reasons"] == ["legacy_seed_untrusted:parent_missing"]
+
+
+def test_legacy_quality_all_failure_overrides_market_pass(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _legacy_quality(db_path, zone_date)
+    _add_historical_day(db_path, trigger_date)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO data_quality_report VALUES (?, 'stock_daily', 'ALL', 'FAIL', ?)",
+                     (zone_date, zone_date + ' 17:00:00'))
+    result = engine.run_daily(trigger_date, historical=True)
+    assert result["success"] is False
+    assert result["blocked_reasons"] == ["legacy_seed_untrusted:quality_failed"]
+
+
+def test_legacy_new_setup_after_cooldown_verifies_previous_setup_anchor(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date)
+    engine.run(trigger_date)
+    days = [zone_date, trigger_date]
+    current = date.fromisoformat(trigger_date)
+    for index in range(7):
+        current += timedelta(days=1)
+        while current.weekday() >= 5:
+            current += timedelta(days=1)
+        day = current.isoformat()
+        days.append(day)
+        _add_historical_day(db_path, day, close=90.5 if index == 6 else 90)
+        if index == 6:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("UPDATE stock_daily_prices SET volume=100 WHERE trade_date=?", (day,))
+        engine.run(day)
+    seed_date = days[-1]
+    _legacy_quality(db_path, *days)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT watch_state, setup_id FROM watch_daily_snapshot WHERE trade_date=?", (seed_date,)
+        ).fetchone() == ("IN_ZONE", f"688001:{seed_date}")
+    target = (current + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, target)
+    result = engine.run_daily(target, historical=True)
+    assert result["success"], result
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT setup_id FROM watch_daily_snapshot WHERE trade_date=?", (target,)
+        ).fetchone() == (f"688001:{seed_date}",)
+
+
+def test_historical_only_creates_snapshot_and_checker_is_read_only(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, _ = watch_db
+    engine = WatchEngine(db_path)
+    before = db_path.read_bytes()
+    assert engine.check_historical_snapshots(zone_date)["trusted"] is False
+    assert db_path.read_bytes() == before
+    result = engine.run_daily(zone_date, historical=True)
+    assert result["success"] is True
+    assert result["historical"] is True
+    assert result["events"] == 0
+    with sqlite3.connect(db_path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        snapshot = conn.execute("SELECT factors FROM watch_daily_snapshot").fetchone()
+    assert "watch_events" not in tables
+    assert "notification_deliveries" not in tables
+    assert "watch_rule_configs" not in tables
+    metadata = json.loads(snapshot[0])["watch_rebuild"]
+    assert len(metadata["input_signature"]) == 64
+    assert metadata["mode"] == "historical"
+    before = db_path.read_bytes()
+    assert engine.check_historical_snapshots(zone_date)["trusted"] is True
+    assert db_path.read_bytes() == before
+
+
+def test_historical_preserves_events_deliveries_pools_and_other_dates(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _add_historical_day(db_path, trigger_date, industry=None)
+    engine.run(trigger_date)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE watch_events SET dedupe_key='' WHERE symbol='688001'")
+        conn.execute(
+            "INSERT INTO notification_deliveries "
+            "(delivery_id, status, dedupe_key, created_at, updated_at) "
+            "VALUES ('legacy', 'FAILED', '', 'old', 'old')"
+        )
+        conn.execute("CREATE TABLE portfolio_guard (value TEXT)")
+        conn.execute("INSERT INTO portfolio_guard VALUES ('unchanged')")
+    tables = ("watch_events", "notification_deliveries", "stock_pools",
+              "stock_pool_members", "portfolio_guard")
+    with sqlite3.connect(db_path) as conn:
+        before = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        other = conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date=?", (trigger_date,)
+        ).fetchall()
+    assert engine.run_daily(zone_date, historical=True)["success"] is True
+    with sqlite3.connect(db_path) as conn:
+        after = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot WHERE trade_date=?", (trigger_date,)
+        ).fetchall() == other
+    assert after == before
+
+
+def test_historical_cooldown_uses_snapshots_and_ignores_future_events(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    assert engine.run_daily(zone_date, historical=True)["success"]
+    _add_historical_day(db_path, trigger_date)
+    assert engine.run_daily(trigger_date, historical=True)["success"]
+    later_date = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, later_date, close=90)
+    with sqlite3.connect(db_path) as conn:
+        engine.ensure_schema(conn)
+        engine._event(
+            conn, dedupe_key="future", trade_date="2099-01-01", event_type="TRIGGERED",
+            severity="HIGH", title="future", message="future", symbol="688001",
+            setup_id=f"688001:{zone_date}",
+        )
+    assert engine.run_daily(later_date, historical=True)["success"]
+    with sqlite3.connect(db_path) as conn:
+        state, factors = conn.execute(
+            "SELECT watch_state, factors FROM watch_daily_snapshot WHERE trade_date=?",
+            (later_date,),
+        ).fetchone()
+    assert state == "TRIGGERED"
+    assert json.loads(factors)["watch_rebuild"]["trigger_date"] == trigger_date
+    assert engine.check_historical_snapshots(later_date)["trusted"]
+
+
+@pytest.mark.parametrize("change", ["prices", "lifecycle", "rules", "previous", "output"])
+def test_historical_signatures_detect_changed_inputs_and_output(watch_db, change):
+    from quant_engine.watch.engine import WatchEngine
+    from quant_engine.watch.rules import load_active_rules
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    with sqlite3.connect(db_path) as conn:
+        load_active_rules(conn)
+    engine.run_daily(zone_date, historical=True)
+    _add_historical_day(db_path, trigger_date)
+    engine.run_daily(trigger_date, historical=True)
+    assert engine.check_historical_snapshots(trigger_date)["trusted"]
+    with sqlite3.connect(db_path) as conn:
+        if change == "prices":
+            conn.execute("UPDATE stock_daily_prices SET volume=volume+1 WHERE trade_date=?",
+                         (_trade_dates()[0],))
+        elif change == "lifecycle":
+            conn.execute("UPDATE stock_lifecycle_state SET structure_score=79 WHERE trade_date=?",
+                         (trigger_date,))
+        elif change == "rules":
+            conn.execute("UPDATE watch_rule_configs SET config_json=? WHERE version=1",
+                         (json.dumps({"rps50_min": 95}),))
+        elif change == "previous":
+            conn.execute("UPDATE watch_daily_snapshot SET trigger_price=1 WHERE trade_date=?",
+                         (zone_date,))
+        else:
+            conn.execute("UPDATE watch_daily_snapshot SET current_price=1 WHERE trade_date=?",
+                         (trigger_date,))
+    assert engine.check_historical_snapshots(trigger_date)["trusted"] is False
+
+
+def test_historical_rules_are_pinned_and_legacy_seed_requires_same_version(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+    from quant_engine.watch.rules import save_rule_config
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run(zone_date)
+    _legacy_quality(db_path, zone_date)
+    _add_historical_day(db_path, trigger_date)
+    assert engine.check_historical_snapshots(zone_date)["trusted"] is False
+    assert engine.run_daily(trigger_date, historical=True)["rule_version"] == 1
+    with sqlite3.connect(db_path) as conn:
+        previous_state = conn.execute(
+            "SELECT previous_state FROM watch_daily_snapshot WHERE trade_date=?", (trigger_date,)
+        ).fetchone()[0]
+        save_rule_config(conn, {"rps50_min": 95}, activate=True)
+    assert previous_state == "IN_ZONE"
+    assert engine.run_daily(trigger_date, historical=True)["rule_version"] == 1
+    blocked = WatchEngine(db_path, rule_version=2).run_daily(trigger_date, historical=True)
+    assert blocked["rule_version"] == 2
+    assert blocked["success"] is False
+
+
+@pytest.mark.parametrize("env_name", ["LOCAL_DB_PATH", "EVOALPHA_DB_PATH"])
+def test_historical_cli_uses_env_and_returns_failure_for_unknown(watch_db, env_name):
+    db_path, zone_date, trigger_date = watch_db
+    env = dict(os.environ, **{env_name: str(db_path)})
+    env.pop("EVOALPHA_DB_PATH" if env_name == "LOCAL_DB_PATH" else "LOCAL_DB_PATH", None)
+    for trade_date, expected in ((zone_date, 0), (trigger_date, 1)):
+        completed = subprocess.run(
+            [sys.executable, "-m", "quant_engine.watch.engine", "--mode", "daily",
+             "--trade-date", trade_date, "--historical"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode == expected, completed.stderr
+        result = json.loads(completed.stdout)
+        assert result["trade_date"] == trade_date
+        assert result["success"] is (expected == 0)
+
+
+@pytest.mark.parametrize("trade_date", [None, "bad-date", "2026-01-01suffix"])
+def test_historical_requires_explicit_exact_date_without_writes(watch_db, trade_date):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, _, _ = watch_db
+    before = db_path.read_bytes()
+    assert WatchEngine(db_path).run_daily(trade_date, historical=True)["success"] is False
+    assert db_path.read_bytes() == before
+
+
+def test_historical_stale_predecessor_blocks_until_ascending_rebuild(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run_daily(zone_date, historical=True)
+    _add_historical_day(db_path, trigger_date)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE stock_lifecycle_state SET structure_score=79 WHERE trade_date=?",
+                     (zone_date,))
+    blocked = engine.run_daily(trigger_date, historical=True)
+    assert blocked["success"] is False
+    assert "previous_snapshot_untrusted" in blocked["blocked_reasons"]
+    assert engine.run_daily(zone_date, historical=True)["success"]
+    assert engine.run_daily(trigger_date, historical=True)["success"]
+    assert engine.check_historical_snapshots(trigger_date)["trusted"]
+
+
+def test_historical_snapshot_trigger_cannot_mutate_other_tables(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, _ = watch_db
+    engine = WatchEngine(db_path)
+    engine.run_daily(zone_date, historical=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            "CREATE TABLE protected_state (value INTEGER);"
+            "INSERT INTO protected_state VALUES (1);"
+            "CREATE TRIGGER forbidden AFTER INSERT ON watch_daily_snapshot BEGIN "
+            "UPDATE protected_state SET value=2; END;"
+        )
+        before = conn.execute("SELECT * FROM watch_daily_snapshot").fetchall()
+    assert engine.run_daily(zone_date, historical=True)["success"] is False
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT value FROM protected_state").fetchone() == (1,)
+        assert conn.execute("SELECT * FROM watch_daily_snapshot").fetchall() == before
+
+
+def test_historical_snapshot_trigger_cannot_write_another_date(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run_daily(zone_date, historical=True)
+    _add_historical_day(db_path, trigger_date)
+    engine.run_daily(trigger_date, historical=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            "CREATE TRIGGER forbidden_other_date AFTER INSERT ON watch_daily_snapshot BEGIN "
+            f"DELETE FROM watch_daily_snapshot WHERE trade_date='{trigger_date}'; END;"
+        )
+        before = conn.execute("SELECT * FROM watch_daily_snapshot ORDER BY trade_date").fetchall()
+    assert engine.run_daily(zone_date, historical=True)["success"] is False
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT * FROM watch_daily_snapshot ORDER BY trade_date"
+        ).fetchall() == before
+
+
+def test_historical_cooldown_expires_without_formal_trigger_event(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run_daily(zone_date, historical=True)
+    _add_historical_day(db_path, trigger_date)
+    engine.run_daily(trigger_date, historical=True)
+    current = date.fromisoformat(trigger_date)
+    states = []
+    while len(states) < 7:
+        current += timedelta(days=1)
+        if current.weekday() >= 5:
+            continue
+        trade_date = current.isoformat()
+        _add_historical_day(db_path, trade_date, close=90)
+        assert engine.run_daily(trade_date, historical=True)["success"]
+        with sqlite3.connect(db_path) as conn:
+            states.append(conn.execute(
+                "SELECT watch_state FROM watch_daily_snapshot WHERE trade_date=?", (trade_date,)
+            ).fetchone()[0])
+    assert states[:6] == ["TRIGGERED"] * 6
+    assert states[-1] == "WATCHING"
+
+
+def test_live_day_after_historical_rebuild_keeps_snapshot_cooldown(watch_db):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run_daily(zone_date, historical=True)
+    _add_historical_day(db_path, trigger_date)
+    engine.run_daily(trigger_date, historical=True)
+    next_date = (date.fromisoformat(trigger_date) + timedelta(days=1)).isoformat()
+    _add_historical_day(db_path, next_date, close=90)
+    assert engine.run_daily(next_date)["success"]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT watch_state FROM watch_daily_snapshot WHERE trade_date=?", (next_date,)
+        ).fetchone() == ("TRIGGERED",)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM watch_events WHERE event_type='TRIGGERED'"
+        ).fetchone() == (0,)
+
+
+def test_historical_check_ignores_future_inputs_and_unmonitored_stocks(watch_db, monkeypatch):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, trigger_date = watch_db
+    engine = WatchEngine(db_path)
+    engine.run_daily(zone_date, historical=True)
+    _add_historical_day(db_path, trigger_date)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO stock_pools VALUES ('disabled', 'disabled', 0, 0)")
+        conn.execute("INSERT INTO stock_pool_members VALUES ('disabled', '600519', '2026-01-01')")
+    seen = []
+    original = engine._prices
+
+    def prices(conn, symbol, trade_date):
+        seen.append(symbol)
+        result = original(conn, symbol, trade_date)
+        assert len(result) <= 121
+        return result
+
+    monkeypatch.setattr(engine, "_prices", prices)
+    assert engine.check_historical_snapshots(zone_date)["trusted"]
+    assert seen == ["688001"]
+
+
+def test_historical_run_and_check_close_connections(watch_db, monkeypatch):
+    from quant_engine.watch.engine import WatchEngine
+
+    db_path, zone_date, _ = watch_db
+    connections = []
+    original = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        connection = original(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    engine = WatchEngine(db_path)
+    assert engine.run_daily(zone_date, historical=True)["success"]
+    assert engine.check_historical_snapshots(zone_date)["trusted"]
+    assert len(connections) == 2
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
 
 
 def test_monitored_manual_stock_enters_zone_and_schema_is_created(watch_db):

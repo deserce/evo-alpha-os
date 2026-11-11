@@ -1,8 +1,32 @@
 import sqlite3
+from types import SimpleNamespace
 
 from scripts import repair_stock_daily_quality as repair
 from scripts import repair_stock_daily_gaps as gap_repair
 from data_core.schema import ensure_data_core_schema
+
+
+def test_targeted_quality_repair_fetches_historical_holes_even_when_max_is_newer(tmp_path, monkeypatch):
+    symbols = tmp_path / 'symbols.txt'
+    symbols.write_text('600001\n')
+    monkeypatch.setattr(repair, 'write_symbols_file', lambda rows: symbols)
+    calls = []
+    monkeypatch.setattr(repair.subprocess, 'run', lambda command, **kw:
+                        calls.append(command) or SimpleNamespace(returncode=0))
+    args = repair.build_parser().parse_args(['--date','2026-10-22'])
+    assert repair.run_targeted_redownload(['600001'], args) == 0
+    assert '--force-window' in calls[0]
+
+
+def test_quality_repair_selects_cross_stock_clones():
+    with sqlite3.connect(':memory:') as conn:
+        conn.execute('''CREATE TABLE stock_daily_prices(symbol TEXT,trade_date TEXT,
+            open REAL,high REAL,low REAL,close REAL,volume REAL,amount REAL,
+            turnover_rate REAL,market TEXT,source TEXT,adjustment_mode TEXT)''')
+        conn.executemany('INSERT INTO stock_daily_prices VALUES (?, ?,10,11,9,10,5000,50000,1,?,?,?)',
+                         [(s,'2026-10-22','SH','tdx_mootdx_qfq','qfq')
+                          for s in ('600001','600002','600003')])
+        assert repair.abnormal_symbols(conn,'2026-10-22') == {'600001','600002','600003'}
 
 
 def test_repair_turnover_from_previous_valuation(tmp_path, monkeypatch):

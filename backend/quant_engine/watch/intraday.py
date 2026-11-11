@@ -30,7 +30,7 @@ BACKEND_DIR = CURRENT_DIR.parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from data_job.core.tdx_adapter import TdxAdapter, get_tdx_adapter
+from data_job.core.mootdx_adapter import MootdxAdapter, get_mootdx_adapter
 from data_core.market_calendar import is_a_share_session
 from portfolio.exit_engine import PortfolioExitEngine
 
@@ -49,7 +49,7 @@ class IntradayWatchMonitor:
     def __init__(
         self,
         db_path: str | Path | None = None,
-        adapter: TdxAdapter | None = None,
+        adapter: MootdxAdapter | None = None,
         now_provider: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         notifier: Callable[[str], Any] | None = None,
@@ -57,6 +57,7 @@ class IntradayWatchMonitor:
     ):
         self.db_path = Path(db_path) if db_path else DB_PATH
         self.adapter = adapter
+        self._poll_adapter: MootdxAdapter | None = None
         self.now_provider = now_provider or (lambda: datetime.now(SHANGHAI))
         self.sleep = sleep
         self.notifier = notifier
@@ -668,7 +669,8 @@ class IntradayWatchMonitor:
                     "portfolio_omitted": portfolio_omitted,
                 }
 
-            adapter = self.adapter or get_tdx_adapter()
+            adapter = self.adapter or get_mootdx_adapter()
+            self._poll_adapter = adapter
             completed_symbols: set[str] = set()
             for symbol in selected_symbols:
                 row = ready_by_symbol.get(symbol)
@@ -916,7 +918,18 @@ class IntradayWatchMonitor:
 
     def run_once(self, now: datetime | None = None) -> dict[str, Any]:
         """Run one poll and dispatch newly persisted urgent events immediately."""
-        result = self._run_once(now)
+        try:
+            result = self._run_once(now)
+        finally:
+            # TDX servers expire idle streams before the next five-minute poll.
+            # Close cleanly instead of penalizing a healthy node for idle expiry.
+            adapter = self._poll_adapter
+            self._poll_adapter = None
+            if adapter is not None:
+                try:
+                    adapter.disconnect()
+                except Exception:
+                    logger.warning("盘中本轮行情连接关闭失败", exc_info=True)
         if self.notifier and (
             result.get("triggered")
             or result.get("portfolio_triggered")

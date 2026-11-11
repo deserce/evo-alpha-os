@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 
 from quant_engine.calculators.risk_plan_calculator import RiskPlanCalculator
 
@@ -64,11 +65,12 @@ def test_active_plan_is_revalued_on_latest_stock_date(tmp_path):
     assert plan["r_multiple"] == 1.0
 
 
-def test_orphan_plans_are_removed_during_refresh(tmp_path):
+def test_orphan_plans_outside_target_are_preserved_during_refresh(tmp_path):
     db_path = tmp_path / "risk.db"
     seed_database(db_path)
     calculator = RiskPlanCalculator(str(db_path))
-    calculator._create_table(sqlite3.connect(db_path))
+    with closing(sqlite3.connect(db_path)) as conn:
+        calculator._create_table(conn)
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -87,4 +89,20 @@ def test_orphan_plans_are_removed_during_refresh(tmp_path):
         orphan_count = conn.execute(
             "SELECT COUNT(*) FROM trade_plans WHERE plan_id='orphan'"
         ).fetchone()[0]
-    assert orphan_count == 0
+    assert orphan_count == 1
+
+
+def test_orphan_plans_on_target_are_removed_during_refresh(tmp_path):
+    db_path = tmp_path / "risk.db"
+    seed_database(db_path)
+    calculator = RiskPlanCalculator(str(db_path))
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        calculator._create_table(conn)
+        conn.execute(
+            "INSERT INTO trade_plans (plan_id,signal_id,trade_date,symbol) "
+            "VALUES ('orphan','missing-signal','2026-01-05','000001')"
+        )
+
+    assert calculator.run_daily()["success"]
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trade_plans WHERE plan_id='orphan'").fetchone()[0] == 0

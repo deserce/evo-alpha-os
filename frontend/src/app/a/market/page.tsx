@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { RefreshCw } from 'lucide-react';
 import { marketApi } from '@/lib/api';
@@ -129,7 +130,16 @@ function MarketBreadthCards({ breadth }: { breadth?: MarketBreadth }) {
   );
 }
 
+const marketViews = [
+  ['breadth', '市场宽度'],
+  ['trend', '宽度趋势'],
+  ['limits', '涨跌停'],
+  ['diffusion', '强势扩散'],
+  ['amount', '成交与风险'],
+] as const;
+
 export default function MarketPage() {
+  const [view, setView] = useState<(typeof marketViews)[number][0]>('breadth');
   const { globalDate, setGlobalDate } = useGlobalStore();
 
   const datesQuery = useQuery({
@@ -194,7 +204,7 @@ export default function MarketPage() {
   }
 
   return (
-    <main className="dashboard-page">
+    <main className="dashboard-page market-overview">
       <div className="dashboard-grid">
         <section className="dashboard-header dashboard-span-12">
           <div>
@@ -219,7 +229,7 @@ export default function MarketPage() {
           </div>
         </section>
 
-        <div className="dashboard-panel-span-full">
+        <div className="dashboard-panel-span-full market-overview-hero">
           <MarketOverviewCard
             state={hero.marketState}
             score={hero.marketStrengthScore}
@@ -239,29 +249,26 @@ export default function MarketPage() {
           />
         </div>
 
-        <div className="dashboard-panel-span-7">
+        <div className="dashboard-panel-span-7 market-overview-index">
           <MarketIndexPanel
             indices={dashboard.indices}
             defaultIndexCode={dashboard.defaultIndexCode}
             tradeDate={dashboard.tradeDate}
           />
         </div>
-        <div className="dashboard-panel-span-5">
-          <MarketBreadthCards breadth={dashboard.breadth} />
-        </div>
-
-        <div className="dashboard-panel-span-6">
-          <MarketBreadthTrend breadthHistory={dashboard.breadthHistory} />
-        </div>
-        <div className="dashboard-panel-span-6">
-          <LimitMoodChart limitStatsHistory={dashboard.limitStatsHistory} />
-        </div>
-
-        <div className="dashboard-panel-span-6">
-          <StrengthDiffusionChart strengthDiffusionHistory={dashboard.strengthDiffusionHistory} />
-        </div>
-        <div className="dashboard-panel-span-6">
-          <AmountAndRiskPanel amountHistory={dashboard.amountHistory} riskNotes={dashboard.riskNotes} />
+        <div className="dashboard-panel-span-5 market-overview-detail">
+          <div className="dashboard-tabs" role="group" aria-label="市场分析视图">
+            {marketViews.map(([key, label]) => (
+              <button key={key} type="button" aria-pressed={view === key}
+                className={view === key ? 'is-active' : ''}
+                onClick={() => setView(key)}>{label}</button>
+            ))}
+          </div>
+          {view === 'breadth' && <MarketBreadthCards breadth={dashboard.breadth} />}
+          {view === 'trend' && <MarketBreadthTrend breadthHistory={dashboard.breadthHistory} />}
+          {view === 'limits' && <LimitMoodChart limitStatsHistory={dashboard.limitStatsHistory} />}
+          {view === 'diffusion' && <StrengthDiffusionChart strengthDiffusionHistory={dashboard.strengthDiffusionHistory} />}
+          {view === 'amount' && <AmountAndRiskPanel amountHistory={dashboard.amountHistory} riskNotes={dashboard.riskNotes} />}
         </div>
       </div>
     </main>

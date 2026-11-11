@@ -5,10 +5,11 @@ EvoAlpha OS - 生命周期状态机计算器
 预选信号串成统一的 stock_lifecycle_state。
 """
 
+from contextlib import closing
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,9 @@ if str(BACKEND_DIR) not in sys.path:
 
 from quant_engine.common import setup_logger
 from quant_engine.utils.calculation_dates import resolve_dense_output_dates
+from data_core.repair_plan import (
+    _date_members, _mrgc_audit, _task_audit, read_frozen_members,
+)
 
 
 DB_PATH = BACKEND_DIR / "data" / "local_quant.db"
@@ -198,10 +202,55 @@ class LifecycleStateCalculator:
         output_dates: list[str],
         symbols: list[str] | None = None,
     ) -> pd.DataFrame:
-        pool = self._read_pool(conn)
-        if symbols is not None:
-            pool = pool[pool["symbol"].isin(symbols)].copy()
-        if pool.empty:
+        current_pool = self._read_pool(conn)
+        current_members = set(current_pool["symbol"])
+        frozen = read_frozen_members(conn, min(output_dates), max(output_dates))
+        frames = []
+        for trade_date in output_dates:
+            audited = (_task_audit(conn, "lifecycle_state", trade_date)
+                       and _mrgc_audit(conn, trade_date))
+            members = _date_members(
+                conn, trade_date, "lifecycle", current_members, frozen, audited=audited
+            )
+            historical = trade_date < date.today().isoformat() and (
+                (trade_date, "lifecycle") in frozen or audited
+            )
+            if historical and not members and (trade_date, "lifecycle") in frozen:
+                raise ValueError("empty_frozen_lifecycle_members")
+            if symbols is not None:
+                members = members.intersection(symbols)
+            if not members:
+                continue
+            if historical:
+                day = pd.DataFrame({"symbol": sorted(members)})
+                placeholders = ",".join("?" for _ in members)
+                params = sorted(members)
+                names = {}
+                if self._table_exists(conn, "stock_info"):
+                    names = dict(conn.execute(
+                        f"SELECT symbol,name FROM stock_info WHERE symbol IN ({placeholders})",
+                        params,
+                    ))
+                metadata = self._empty_frame(["symbol", "name", "universe_source"])
+                if self._table_exists(conn, self.target_table):
+                    source = ("universe_source" if "universe_source" in
+                              self._table_columns(conn, self.target_table) else "'frozen'")
+                    metadata = pd.read_sql_query(
+                        f"SELECT symbol,name,{source} AS universe_source "
+                        f"FROM {self.target_table} WHERE trade_date>=? "
+                        f"AND trade_date<date(?,'+1 day') AND symbol IN ({placeholders})",
+                        conn, params=[trade_date, trade_date, *params],
+                    )
+                day = day.merge(metadata, on="symbol", how="left")
+                day["name"] = day["name"].fillna(day["symbol"].map(names)).fillna(day["symbol"])
+                day["universe_source"] = day["universe_source"].fillna("frozen")
+            else:
+                day = current_pool[current_pool["symbol"].isin(members)].copy()
+            day["trade_date"] = trade_date
+            frames.append(day)
+        if not frames:
+            if symbols is not None:
+                raise ValueError("symbols_not_in_output_universe")
             logger.warning("核心池与手工分组均为空，生命周期无数据可算")
             return pd.DataFrame()
 
@@ -340,11 +389,6 @@ class LifecycleStateCalculator:
             pd.DataFrame(columns=["trade_date", "symbol", "signal_type", "entry_reason"])
         )
 
-        frames = []
-        for trade_date in output_dates:
-            day = pool.copy()
-            day["trade_date"] = trade_date
-            frames.append(day)
         result = pd.concat(frames, ignore_index=True)
         result = result.merge(daily, on=["trade_date", "symbol"], how="left")
         result = result.merge(rps, on=["trade_date", "symbol"], how="left")
@@ -441,27 +485,25 @@ class LifecycleStateCalculator:
             return
         dates = sorted(df["trade_date"].dropna().unique().tolist())
         with conn:
-            for trade_date in dates:
-                if symbols is None:
+            if symbols is None:
+                for trade_date in dates:
                     conn.execute(
                         f"DELETE FROM {self.target_table} WHERE trade_date = ?",
                         (trade_date,),
                     )
-                else:
-                    placeholders = ",".join("?" for _ in symbols)
-                    conn.execute(
-                        f"DELETE FROM {self.target_table} "
-                        f"WHERE trade_date = ? AND symbol IN ({placeholders})",
-                        (trade_date, *symbols),
-                    )
-        df.to_sql(
-            self.target_table,
-            conn,
-            if_exists="append",
-            index=False,
-            method="multi",
-            chunksize=1000,
-        )
+            else:
+                conn.executemany(
+                    f"DELETE FROM {self.target_table} WHERE trade_date=? AND symbol=?",
+                    df[["trade_date", "symbol"]].itertuples(index=False, name=None),
+                )
+            # pandas.to_sql commits SQLite inserts itself, breaking delete/insert rollback.
+            columns = ",".join(f'"{column}"' for column in df.columns)
+            placeholders = ",".join("?" for _ in df.columns)
+            values = df.astype(object).where(pd.notna(df), None)
+            conn.executemany(
+                f"INSERT INTO {self.target_table} ({columns}) VALUES ({placeholders})",
+                values.itertuples(index=False, name=None),
+            )
         logger.info(
             "stock_lifecycle_state: saved %s rows, range %s..%s",
             f"{len(df):,}",
@@ -497,6 +539,12 @@ class LifecycleStateCalculator:
     ) -> dict:
         start_time = time.time()
         try:
+            if target_dates is not None:
+                if not target_dates or any(
+                    not isinstance(value, str) or date.fromisoformat(value).isoformat() != value
+                    for value in target_dates
+                ):
+                    raise ValueError("target_dates must contain ISO dates")
             normalized_symbols = None
             if symbols is not None:
                 normalized_symbols = list(
@@ -513,14 +561,17 @@ class LifecycleStateCalculator:
                         "records": 0,
                         "elapsed": time.time() - start_time,
                     }
-            with sqlite3.connect(self.db_path) as conn:
-                self._create_table(conn)
+                if any(len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit()
+                       for symbol in normalized_symbols):
+                    raise ValueError("symbols must contain six ASCII digits")
+            with closing(sqlite3.connect(self.db_path)) as conn:
                 output_dates = resolve_dense_output_dates(
                     conn,
                     target_dates=target_dates,
                     fallback=lambda: self._get_output_dates(conn, mode, days),
                     target_tables=(self.target_table,),
-                    missing_only=missing_only,
+                    missing_only=(missing_only and normalized_symbols is None
+                                  and self._table_exists(conn, self.target_table)),
                     limit=(
                         max(7, len(target_dates or []))
                         if normalized_symbols is not None
@@ -542,6 +593,7 @@ class LifecycleStateCalculator:
                     output_dates,
                     symbols=normalized_symbols,
                 )
+                self._create_table(conn)
                 self._save(conn, result, symbols=normalized_symbols)
             elapsed = time.time() - start_time
             return {"success": True, "records": len(result), "elapsed": elapsed}
@@ -565,7 +617,7 @@ class LifecycleStateCalculator:
         )
         normalized_dates = sorted(
             {
-                str(trade_date)[:10]
+                str(trade_date)
                 for trade_date in trade_dates
                 if str(trade_date).strip()
             }

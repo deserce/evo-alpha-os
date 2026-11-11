@@ -10,6 +10,8 @@ Key behaviors:
 
 import argparse
 import json
+import math
+import os
 import re
 import sqlite3
 import sys
@@ -19,8 +21,17 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
+from threading import Condition
 from typing import Optional
+
+# Must precede pandas/numpy imports in the standalone entry point.
+for _thread_env in (
+    "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS",
+):
+    os.environ[_thread_env] = "1"
+del _thread_env
 
 import pandas as pd
 from tqdm import tqdm
@@ -32,6 +43,7 @@ if str(backend_dir) not in sys.path:
 from app.core.config import settings
 from data_core.bse_codes import TDX_STANDARD_BJ_SOURCE_NAME
 from data_core.schema import ensure_data_core_schema, log_data_source_run
+from data_core.market_calendar import is_a_share_session
 from data_core.symbols import MARKET_BSE, MARKET_SH, MARKET_SZ, P0_MARKETS, infer_market, is_p0_symbol
 from data_job.core.mootdx_adapter import MootdxAdapter
 from data_job.core.mootdx_qfq import apply_mootdx_qfq
@@ -108,37 +120,89 @@ class SourceOutageCircuitBreaker:
 
 
 class AdapterPool:
-    """A simple mootdx adapter pool with startup retries."""
+    """One bounded discovery round, followed by clean streams to its validated node."""
+
+    MAX_SIZE = 8
+    STARTUP_BUDGET_SECONDS = 30.0
 
     def __init__(self, size: int, timeout: int, max_retries: int, retry_delay: float):
+        if not isinstance(size, int) or not 1 <= size <= self.MAX_SIZE:
+            raise ValueError(f"pool size must be between 1 and {self.MAX_SIZE}")
         self._queue: Queue[MootdxAdapter] = Queue(maxsize=size)
+        self._condition = Condition()
+        self._closed = False
+        self._owned: dict[int, MootdxAdapter] = {}
+        self._leased: set[int] = set()
         self.failures: list[str] = []
-
+        deadline = time.monotonic() + self.STARTUP_BUDGET_SECONDS
+        seed = None
+        # Legacy retry arguments are intentionally not multiplied by pool slots.
         for slot in range(size):
-            for attempt in range(1, max_retries + 1):
-                adapter = MootdxAdapter(timeout=timeout)
-                if adapter.is_available():
-                    self._queue.put(adapter)
-                    break
-
-                self.failures.append(f"slot={slot + 1}, attempt={attempt}")
+            if time.monotonic() >= deadline:
+                self.failures.append(f"slot={slot + 1}, startup budget exhausted")
+                break
+            try:
+                adapter = (
+                    MootdxAdapter(timeout=timeout, max_retries=1, connection_deadline=deadline,
+                                  managed_recovery=True)
+                    if seed is None else seed.fork_connection(connection_deadline=deadline)
+                )
+            except Exception as exc:
+                self.failures.append(f"slot={slot + 1}, startup {type(exc).__name__}")
+                break
+            if not adapter.is_available():
+                self.failures.append(f"slot={slot + 1}, discovery/connection unavailable")
                 adapter.disconnect()
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
+                break
+            self._owned[id(adapter)] = adapter
+            self._queue.put_nowait(adapter)
+            seed = adapter
 
     @property
     def available(self) -> int:
         return self._queue.qsize()
 
     def acquire(self, timeout: int = 30) -> MootdxAdapter:
-        return self._queue.get(timeout=timeout)
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("acquire timeout must be nonnegative and finite")
+        deadline = time.monotonic() + min(30.0, timeout)
+        with self._condition:
+            while self._queue.empty() and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._owned:
+                    raise Empty("no adapter available")
+                self._condition.wait(remaining)
+            if self._closed:
+                raise RuntimeError("adapter pool is closed")
+            adapter = self._queue.get_nowait()
+            self._leased.add(id(adapter))
+            return adapter
 
     def release(self, adapter: MootdxAdapter):
-        self._queue.put(adapter)
+        with self._condition:
+            if id(adapter) not in self._leased:
+                raise ValueError("adapter is not leased from this pool")
+            self._leased.remove(id(adapter))
+            should_close = self._closed
+            if should_close:
+                self._owned.pop(id(adapter), None)
+            else:
+                self._queue.put_nowait(adapter)
+            self._condition.notify()
+        if should_close:
+            adapter.disconnect()
 
     def close(self):
-        while not self._queue.empty():
-            adapter = self._queue.get_nowait()
+        idle = []
+        with self._condition:
+            self._closed = True
+            while not self._queue.empty():
+                adapter = self._queue.get_nowait()
+                self._owned.pop(id(adapter), None)
+                idle.append(adapter)
+            self._condition.notify_all()
+        for adapter in idle:
             adapter.disconnect()
 
     def failure_summary(self) -> str:
@@ -337,6 +401,85 @@ def load_last_dates(conn: sqlite3.Connection, table_name: str) -> dict[str, date
     return dict(zip(df["symbol"], df["last_date"]))
 
 
+def select_resume_symbols(
+    conn: sqlite3.Connection,
+    table_name: str,
+    raw_table_name: str,
+    symbols: list[str],
+    target: date,
+    *, restrict_to_symbols: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Inspect one indexed date in both tables; never infer completeness from MAX(date)."""
+    validate_target_tables(table_name, raw_table_name)
+    start, end = target.isoformat(), (target + timedelta(days=1)).isoformat()
+
+    def read_rows(table: str, required: tuple[str, ...]) -> dict[str, list[dict]]:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not set(required).issubset(columns):
+            return {}
+        rows: dict[str, list[dict]] = {}
+        chunks = [symbols[i:i + 500] for i in range(0, len(symbols), 500)] if restrict_to_symbols else [None]
+        for chunk in chunks:
+            condition = (" AND symbol IN (" + ",".join("?" for _ in chunk) + ")"
+                         if chunk is not None else "")
+            cursor = conn.execute(
+                f"SELECT {','.join(required)} FROM {table} WHERE trade_date>=? AND trade_date<?" + condition,
+                (start, end, *(chunk or [])),
+            )
+            for values in cursor:
+                row = dict(zip(required, values))
+                rows.setdefault(str(row["symbol"]), []).append(row)
+        return rows
+
+    adjusted = read_rows(table_name, (
+        "symbol", "open", "high", "low", "close", "volume", "amount",
+        "turnover_rate", "source", "adjustment_mode", "quality_flag",
+    ))
+    raw = read_rows(raw_table_name, (
+        "symbol", "close", "source", "adjustment_mode", "quality_flag",
+    ))
+
+    def finite(value: object, *, positive: bool = False) -> bool:
+        try:
+            number = float(value)
+            return math.isfinite(number) and (number > 0 if positive else number >= 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    accepted_flags = {"ok", "ok_unadjusted", "legacy_ok", "pass"}
+    complete = []
+    pending = []
+    for symbol in dedupe_symbols(symbols):
+        price_rows, raw_rows = adjusted.get(symbol, []), raw.get(symbol, [])
+        valid = len(price_rows) == len(raw_rows) == 1
+        if valid:
+            price, unadjusted = price_rows[0], raw_rows[0]
+            bse = infer_market(symbol) == MARKET_BSE
+            valid = (
+                all(finite(price[key], positive=True) for key in ("open", "high", "low", "close"))
+                and all(finite(price[key]) for key in ("volume", "amount"))
+                and finite(unadjusted["close"], positive=True)
+                and price["source"] == (TDX_STANDARD_BJ_SOURCE_NAME if bse else SOURCE_NAME)
+                and price["adjustment_mode"] == ("none" if bse else "qfq")
+                and unadjusted["source"] == RAW_SOURCE_NAME
+                and unadjusted["adjustment_mode"] == "none"
+                and math.isclose(float(price["close"]), float(unadjusted["close"]),
+                                 rel_tol=1e-5, abs_tol=0.011)
+                and str(price["quality_flag"]).lower() in accepted_flags
+                and str(unadjusted["quality_flag"]).lower() in accepted_flags
+            )
+            if valid:
+                low, high = float(price["low"]), float(price["high"])
+                valid = (
+                    low <= float(price["open"]) <= high
+                    and low <= float(price["close"]) <= high
+                    and (bse or float(price["volume"]) == 0
+                         or finite(price["turnover_rate"], positive=True))
+                )
+        (complete if valid else pending).append(symbol)
+    return pending, complete
+
+
 def choose_start_date(
     default_start: date,
     end_date: date,
@@ -364,6 +507,26 @@ def choose_start_date(
         return default_start
 
     return max(default_start, last_date - timedelta(days=lookback_days))
+
+
+def choose_request_max_bars(
+    default_start: date,
+    end_date: date,
+    start_date: date,
+    last_date: Optional[date],
+    full_refresh: bool,
+    force_window: bool,
+    max_bars: Optional[int],
+) -> Optional[int]:
+    """Bound recent exact-day repairs without truncating older historical targets."""
+    if (not full_refresh and force_window and default_start == end_date
+            and max_bars is not None and max_bars > 0
+            and 0 <= (date.today() - end_date).days <= max_bars - 2):
+        # At most one daily bar per calendar day, plus a seed-bar margin.
+        return max_bars
+    if full_refresh or last_date is None or start_date == default_start:
+        return None
+    return max_bars
 
 
 def seed_incremental_pct_chg(data: pd.DataFrame, previous_close: object) -> pd.DataFrame:
@@ -450,7 +613,10 @@ def fetch_one_symbol(
                     reason="up-to-date",
                 )
 
-            request_max_bars = None if full_refresh or last_date is None or start_date == default_start else max_bars
+            request_max_bars = choose_request_max_bars(
+                default_start, end_date, start_date, last_date,
+                full_refresh, force_window, max_bars,
+            )
             raw_df = adapter.get_stock_kline(
                 symbol=symbol,
                 start_date=start_date.isoformat(),
@@ -576,7 +742,10 @@ def fetch_one_symbol(
         if start_date is None:
             return FetchResult(symbol=symbol, status="skip", market=market, reason="up-to-date")
 
-        request_max_bars = None if full_refresh or last_date is None or start_date == default_start else max_bars
+        request_max_bars = choose_request_max_bars(
+            default_start, end_date, start_date, last_date,
+            full_refresh, force_window, max_bars,
+        )
         raw_df = adapter.get_stock_kline(
             symbol=symbol,
             start_date=start_date.isoformat(),
@@ -680,6 +849,7 @@ def save_batch(
         return 0
 
     delete_ranges = []
+    delete_days = []
     delete_keys = []
     insert_rows = []
 
@@ -688,7 +858,7 @@ def save_batch(
             continue
 
         data = result.data
-        if result.write_policy in {"new_only", "replace_window"}:
+        if result.write_policy in {"new_only", "replace_window", "repair", "resume_target"}:
             previous = conn.execute(
                 f"""
                 SELECT close
@@ -700,7 +870,10 @@ def save_batch(
                 (result.symbol, result.start_date.isoformat()),
             ).fetchone()
             data = seed_incremental_pct_chg(data, previous[0] if previous else None)
-        if result.write_policy == "repair":
+        if result.write_policy == "resume_target":
+            delete_days.append((result.symbol, result.end_date.isoformat(),
+                                (result.end_date + timedelta(days=1)).isoformat()))
+        elif result.write_policy == "repair":
             existing_rows = conn.execute(
                 f"""
                 SELECT trade_date, open, close, high, low, volume, amount,
@@ -788,6 +961,11 @@ def save_batch(
         return 0
 
     def write_rows() -> None:
+        if delete_days:
+            conn.executemany(
+                f"DELETE FROM {table_name} WHERE symbol=? AND trade_date>=? AND trade_date<?",
+                delete_days,
+            )
         if delete_ranges:
             conn.executemany(
                 f"DELETE FROM {table_name} WHERE symbol = ? AND trade_date BETWEEN ? AND ?",
@@ -829,6 +1007,7 @@ def save_raw_batch(
         return 0
 
     delete_ranges: list[tuple[str, str, str]] = []
+    delete_days: list[tuple[str, str, str]] = []
     delete_keys: list[tuple[str, str]] = []
     insert_rows = []
 
@@ -836,7 +1015,10 @@ def save_raw_batch(
         if result.raw_data is None or result.raw_data.empty:
             continue
         data = result.raw_data
-        if result.write_policy == "repair":
+        if result.write_policy == "resume_target":
+            delete_days.append((result.symbol, result.end_date.isoformat(),
+                                (result.end_date + timedelta(days=1)).isoformat()))
+        elif result.write_policy == "repair":
             delete_keys.extend(
                 (result.symbol, value.isoformat())
                 for value in data["trade_date"].tolist()
@@ -873,6 +1055,11 @@ def save_raw_batch(
         return 0
 
     def write_rows() -> None:
+        if delete_days:
+            conn.executemany(
+                f"DELETE FROM {table_name} WHERE symbol=? AND trade_date>=? AND trade_date<?",
+                delete_days,
+            )
         if delete_ranges:
             conn.executemany(
                 f"""
@@ -954,7 +1141,17 @@ def save_dual_batch(
     validate_target_tables(table_name, raw_table_name)
     validate_batch_results(results)
     for result in results:
-        if result.anchor_date is not None and result.anchor_raw_close is not None:
+        resuming_target = result.write_policy == "resume_target"
+        if resuming_target:
+            if result.start_date != result.end_date or result.end_date is None:
+                raise ValueError("resume target validation requires one date")
+            for data in (result.data, result.raw_data):
+                if (data is None or len(data) != 1
+                        or set(data["symbol"].astype(str)) != {result.symbol}
+                        or set(pd.to_datetime(data["trade_date"]).dt.date) != {result.end_date}):
+                    raise ValueError("resume target data validation failed")
+        if (result.anchor_date is not None and result.anchor_raw_close is not None
+                and not (resuming_target and result.anchor_date == result.end_date)):
             existing_anchor = conn.execute(
                 f"SELECT close FROM {raw_table_name} WHERE symbol = ? AND trade_date = ?",
                 (result.symbol, result.anchor_date.isoformat()),
@@ -987,6 +1184,13 @@ def save_dual_batch(
             results,
             manage_transaction=False,
         )
+        for target in {r.end_date for r in results if r.write_policy == "resume_target"}:
+            symbols = [r.symbol for r in results if r.write_policy == "resume_target" and r.end_date == target]
+            pending, _ = select_resume_symbols(
+                conn, table_name, raw_table_name, symbols, target, restrict_to_symbols=True,
+            )
+            if pending:
+                raise ValueError("resume post-write validation failed: " + ",".join(pending[:10]))
     return qfq_rows, raw_rows
 
 
@@ -1054,6 +1258,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-bars", type=int, default=DEFAULT_MAX_BARS, help="recent bars fetched for incremental updates")
     parser.add_argument("--submit-window", type=int, default=256, help="max pending futures")
     parser.add_argument("--force-window", action="store_true", help="fetch recent window even when a symbol is already up to date")
+    parser.add_argument("--resume-target-day", action="store_true",
+                        help="skip verified raw/qfq pairs for the latest completed session")
     parser.add_argument("--market", choices=["ALL", "SH", "SZ", "BSE"], default="ALL", help="market filter for smoke/debug")
     parser.add_argument("--diagnostic-only", action="store_true", help="fetch and log source results without writing K-line rows")
     parser.add_argument("--result-json", help="optional JSON path for per-symbol fetch results")
@@ -1084,17 +1290,21 @@ def log_source_summary(
             "success": 0,
             "fail": 0,
             "skip": 0,
+            "non_data_fail": 0,
             "errors": [],
         }
         for market in P0_MARKETS
     }
     for result in results:
         key = (result.source, result.market)
-        market_stats = stats.setdefault(key, {"success": 0, "fail": 0, "skip": 0, "errors": []})
+        market_stats = stats.setdefault(
+            key, {"success": 0, "fail": 0, "skip": 0, "non_data_fail": 0, "errors": []},
+        )
         if result.status == "success":
             market_stats["success"] += 1
         elif result.status == "fail":
             market_stats["fail"] += 1
+            market_stats["non_data_fail"] += int(result.reason != "no raw data")
             if result.reason and len(market_stats["errors"]) < 10:
                 market_stats["errors"].append(f"{result.symbol}:{result.reason}")
         else:
@@ -1104,6 +1314,8 @@ def log_source_summary(
         processed = item["success"] + item["fail"]
         fail_rate = item["fail"] / processed if processed else 0.0
         status = "PASS" if item["fail"] == 0 else ("WARNING" if fail_rate <= 0.02 else "FAIL")
+        if item["fail"] and not item["non_data_fail"]:
+            status = "WARNING"
         log_data_source_run(
             conn,
             run_id=run_id,
@@ -1121,6 +1333,163 @@ def log_source_summary(
         )
 
 
+@dataclass
+class CollectionOutcome:
+    results: list[FetchResult]
+    saved_rows: int
+    raw_saved_rows: int
+    elapsed: float
+    outage: bool
+    recoveries: int
+
+
+def collect_with_recovery(
+    args: argparse.Namespace,
+    conn: sqlite3.Connection,
+    symbols: list[str],
+    last_dates: dict[str, date],
+    pool: AdapterPool | None,
+    default_start: date,
+    end_date: date,
+    complete_symbols: list[str] | None = None,
+) -> CollectionOutcome:
+    """Drain workers and commit successes before one coordinator replaces the pool."""
+    started = time.monotonic()
+    results = {
+        symbol: FetchResult(
+            symbol, "skip", infer_market(symbol),
+            source=TDX_STANDARD_BJ_SOURCE_NAME if infer_market(symbol) == MARKET_BSE else SOURCE_NAME,
+            reason="up-to-date",
+        )
+        for symbol in (complete_symbols or [])
+    }
+    counts = Counter(result.status for result in results.values())
+    saved_rows = raw_saved_rows = recoveries = 0
+    remaining = list(symbols)
+    outage = False
+    pending_save: list[FetchResult] = []
+
+    def flush() -> None:
+        nonlocal saved_rows, raw_saved_rows, pending_save
+        if pending_save and not args.diagnostic_only:
+            saved, raw_saved = save_dual_batch(conn, args.table, args.raw_table, pending_save)
+            saved_rows += saved
+            raw_saved_rows += raw_saved
+            pending_save = []
+
+    try:
+        with tqdm(total=len(symbols) + len(results), initial=len(results),
+                  desc="collect", unit="symbol", mininterval=1.0) as progress:
+            while remaining:
+                if pool is None or pool.available == 0:
+                    outage = True
+                    break
+                workers = max(1, min(max(1, args.workers), pool.available))
+                submit_window = max(workers, min(8, int(args.submit_window or workers)))
+                breaker = SourceOutageCircuitBreaker(args.source_outage_threshold)
+                next_index = 0
+                paused = False
+                in_flight: dict[Future, str] = {}
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    while next_index < len(remaining) or in_flight:
+                        while (not paused and next_index < len(remaining)
+                               and len(in_flight) < submit_window):
+                            symbol = remaining[next_index]
+                            future = executor.submit(
+                                fetch_one_symbol, symbol, end_date, default_start,
+                                last_dates.get(symbol), args.lookback_days, args.full_refresh,
+                                pool, max(1, args.max_bars) if args.max_bars else None,
+                                bse_pool=None, force_window=args.force_window,
+                            )
+                            in_flight[future] = symbol
+                            next_index += 1
+                        if not in_flight:
+                            break
+                        done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+                        for future in done:
+                            in_flight.pop(future)
+                            result = future.result()
+                            if result.status == "success" and getattr(args, "resume_target_day", False):
+                                for attribute in ("data", "raw_data"):
+                                    data = getattr(result, attribute)
+                                    if data is None:
+                                        raise ValueError("resume target data validation failed")
+                                    selected = data.loc[pd.to_datetime(data["trade_date"]).dt.date == end_date].copy()
+                                    if len(selected) != 1:
+                                        raise ValueError("resume target data validation failed")
+                                    setattr(result, attribute, selected)
+                                result.start_date = result.end_date = end_date
+                                result.write_policy = "resume_target"
+                            previous = results.get(result.symbol)
+                            if previous is not None:
+                                counts[previous.status] -= 1
+                            counts[result.status] += 1
+                            # Keep only status metadata after each bounded save batch.
+                            results[result.symbol] = FetchResult(
+                                result.symbol, result.status, result.market,
+                                source=result.source, reason=result.reason,
+                            )
+                            if result.status == "success" and not args.diagnostic_only:
+                                pending_save.append(result)
+                                if len(pending_save) >= max(1, args.batch_size):
+                                    flush()
+                            if breaker.observe(result):
+                                paused = True
+                                next_index = len(remaining)
+                                for pending in list(in_flight):
+                                    if pending.cancel():
+                                        in_flight.pop(pending)
+                            progress.update(int(previous is None))
+                            elapsed = max(time.monotonic() - started, 1e-6)
+                            progress.set_postfix(
+                                success=counts["success"], fail=counts["fail"], skip=counts["skip"],
+                                rows=saved_rows,
+                                sym_s=f"{(counts['success'] + counts['fail']) / elapsed:.2f}",
+                                refresh=False,
+                            )
+                flush()
+                retry = [symbol for symbol in remaining if symbol not in results
+                         or results[symbol].reason == "source unavailable"]
+                outage = bool(retry)
+                if not retry or recoveries >= 1:
+                    break
+                # No old lease is active here. Discovery runs once, not once per worker.
+                pool.close()
+                recoveries += 1
+                print(f"source_recovery=begin round={recoveries} remaining={len(retry)} "
+                      f"budget_seconds={AdapterPool.STARTUP_BUDGET_SECONDS}", flush=True)
+                pool = AdapterPool(
+                    size=max(1, args.pool_size), timeout=args.timeout,
+                    max_retries=1, retry_delay=0,
+                )
+                if pool.available == 0:
+                    print("source_recovery=failed remaining_deferred=" + str(len(retry)), flush=True)
+                    break
+                print(f"source_recovery=connected adapters={pool.available}", flush=True)
+                remaining = retry
+        return CollectionOutcome(
+            list(results.values()), saved_rows, raw_saved_rows,
+            time.monotonic() - started, outage, recoveries,
+        )
+    finally:
+        if pool is not None:
+            pool.close()
+
+
+def validate_resume_request(start: date, end: date, full_refresh: bool,
+                            now: datetime | None = None) -> None:
+    current = now or datetime.now()
+    completed = current.date()
+    if (current.hour, current.minute) < (15, 30):
+        completed -= timedelta(days=1)
+    while not is_a_share_session(completed):
+        completed -= timedelta(days=1)
+    if full_refresh or start != end or end != completed:
+        raise ValueError("resume-target-day requires the latest completed single session; "
+                         "use the anchored gap repair path for older history")
+
+
 def main():
     args = build_parser().parse_args()
     validate_target_tables(args.table, args.raw_table)
@@ -1134,6 +1503,10 @@ def main():
         raise ValueError("invalid start/end date")
     if default_start > end_date:
         raise ValueError("start date must be <= end date")
+    if args.resume_target_day:
+        validate_resume_request(default_start, end_date, args.full_refresh)
+        if not args.force_window or not args.max_bars or not 2 <= args.max_bars <= DEFAULT_MAX_BARS:
+            raise ValueError("resume-target-day requires --force-window and bounded seed bars")
 
     ensure_data_core_schema(settings.LOCAL_DB_PATH)
     read_conn = get_db_connection()
@@ -1141,14 +1514,32 @@ def main():
     init_raw_target_table(read_conn, args.raw_table)
 
     symbols = load_symbols(read_conn, args.symbol, args.symbols_file, args.limit, args.market)
-    last_dates = load_last_dates(read_conn, args.table)
-
     if not symbols:
         print("No symbols found.")
         read_conn.close()
         return 1
 
+    complete_symbols = []
+    all_symbol_count = len(symbols)
     market_counts = expected_market_counts(symbols)
+    if args.resume_target_day:
+        symbols, complete_symbols = select_resume_symbols(
+            read_conn, args.table, args.raw_table, symbols, end_date,
+        )
+        last_dates = {}
+        # Read only one indexed seed date per candidate, not a whole-history GROUP BY.
+        for symbol in symbols:
+            row = read_conn.execute(
+                f"SELECT trade_date FROM {args.table} WHERE symbol=? AND trade_date<? "
+                "ORDER BY trade_date DESC LIMIT 1",
+                (symbol, (end_date + timedelta(days=1)).isoformat()),
+            ).fetchone()
+            if row:
+                last_dates[symbol] = parse_date(row[0])
+        print(f"resume_target_day={end_date} total={all_symbol_count} "
+              f"complete={len(complete_symbols)} pending={len(symbols)}", flush=True)
+    else:
+        last_dates = load_last_dates(read_conn, args.table)
     needs_standard_tdx = any(infer_market(symbol) in P0_MARKETS for symbol in symbols)
     requested_pool_size = max(1, args.pool_size)
     pool: AdapterPool | None = None
@@ -1175,6 +1566,7 @@ def main():
             end_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         read_conn.commit()
+        pool.close()
         read_conn.close()
         raise RuntimeError("no available TDX connections; HTTP fallback is disabled")
     if pool is not None and pool.available < requested_pool_size:
@@ -1187,7 +1579,7 @@ def main():
     if available_slots == 0:
         available_slots = max(1, args.workers)
     effective_workers = max(1, min(max(1, args.workers), available_slots))
-    submit_window = max(effective_workers, int(args.submit_window or effective_workers))
+    submit_window = max(effective_workers, min(8, int(args.submit_window or effective_workers)))
 
     print("=" * 72)
     print("mootdx qfq collector")
@@ -1205,119 +1597,21 @@ def main():
     print(f"raw target table: {args.raw_table}")
     print("=" * 72)
 
-    started_at = time.time()
-    pending_save: list[FetchResult] = []
-    saved_rows = 0
-    raw_saved_rows = 0
-    success = 0
-    fail = 0
-    skip = 0
-    failed_symbols: list[str] = []
-    completed_results: list[FetchResult] = []
-    outage_breaker = SourceOutageCircuitBreaker(args.source_outage_threshold)
-    source_outage_tripped = False
-
-    def submit_fetch(executor: ThreadPoolExecutor, symbol: str) -> Future:
-        return executor.submit(
-            fetch_one_symbol,
-            symbol,
-            end_date,
-            default_start,
-            last_dates.get(symbol),
-            args.lookback_days,
-            args.full_refresh,
-            pool,
-            max(1, args.max_bars) if args.max_bars else None,
-            bse_pool=None,
-            force_window=args.force_window,
+    try:
+        outcome = collect_with_recovery(
+            args, read_conn, symbols, last_dates, pool, default_start, end_date, complete_symbols,
         )
-
-    next_index = 0
-    in_flight: dict[Future, str] = {}
-
-    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-        while next_index < len(symbols) and len(in_flight) < submit_window:
-            symbol = symbols[next_index]
-            in_flight[submit_fetch(executor, symbol)] = symbol
-            next_index += 1
-
-        with tqdm(total=len(symbols), desc="collect", unit="symbol") as progress:
-            while in_flight:
-                done, _ = wait(set(in_flight.keys()), return_when=FIRST_COMPLETED)
-                for future in done:
-                    in_flight.pop(future, None)
-                    result = future.result()
-                    completed_results.append(
-                        FetchResult(
-                            symbol=result.symbol,
-                            status=result.status,
-                            market=result.market,
-                            source=result.source,
-                            reason=result.reason,
-                        )
-                    )
-
-                    if result.status == "success":
-                        success += 1
-                        if not args.diagnostic_only:
-                            pending_save.append(result)
-                            if len(pending_save) >= max(1, args.batch_size):
-                                saved_qfq, saved_raw = save_dual_batch(
-                                    read_conn,
-                                    args.table,
-                                    args.raw_table,
-                                    pending_save,
-                                )
-                                saved_rows += saved_qfq
-                                raw_saved_rows += saved_raw
-                                pending_save = []
-                    elif result.status == "skip":
-                        skip += 1
-                    else:
-                        fail += 1
-                        failed_symbols.append(f"{result.symbol}:{result.reason}")
-
-                    if outage_breaker.observe(result) and not source_outage_tripped:
-                        source_outage_tripped = True
-                        next_index = len(symbols)
-                        for pending_future in list(in_flight):
-                            if pending_future.cancel():
-                                in_flight.pop(pending_future, None)
-
-                    elapsed = max(time.time() - started_at, 1e-6)
-                    symbol_speed = (success + fail + skip) / elapsed
-                    row_speed = saved_rows / elapsed
-
-                    progress.update(1)
-                    progress.set_postfix(
-                        success=success,
-                        fail=fail,
-                        skip=skip,
-                        rows=saved_rows,
-                        sym_s=f"{symbol_speed:.2f}",
-                        rows_s=f"{row_speed:.0f}",
-                    )
-
-                    while (
-                        not source_outage_tripped
-                        and next_index < len(symbols)
-                        and len(in_flight) < submit_window
-                    ):
-                        symbol = symbols[next_index]
-                        in_flight[submit_fetch(executor, symbol)] = symbol
-                        next_index += 1
-
-    if pending_save and not args.diagnostic_only:
-        saved_qfq, saved_raw = save_dual_batch(
-            read_conn,
-            args.table,
-            args.raw_table,
-            pending_save,
-        )
-        saved_rows += saved_qfq
-        raw_saved_rows += saved_raw
-
-    elapsed = time.time() - started_at
+    except BaseException:
+        read_conn.close()
+        raise
+    completed_results = outcome.results
+    counts = Counter(result.status for result in completed_results)
+    success, fail, skip = (counts[status] for status in ("success", "fail", "skip"))
+    failed_symbols = [f"{result.symbol}:{result.reason}" for result in completed_results
+                      if result.status == "fail"]
+    saved_rows, raw_saved_rows = outcome.saved_rows, outcome.raw_saved_rows
+    elapsed = outcome.elapsed
+    source_outage_tripped = outcome.outage
     log_source_summary(
         read_conn,
         run_id=args.run_id,
@@ -1335,14 +1629,15 @@ def main():
     print(f"skip: {skip}")
     print(f"saved rows: {saved_rows}")
     print(f"raw saved rows: {raw_saved_rows}")
+    print(f"source recovery rounds: {outcome.recoveries}")
     print(f"elapsed: {elapsed:.2f}s")
-    print(f"symbols/s: {(success + fail + skip) / max(elapsed, 1e-6):.2f}")
+    print(f"symbols/s (fetched): {(success + fail) / max(elapsed, 1e-6):.2f}")
     print(f"rows/s: {saved_rows / max(elapsed, 1e-6):.0f}")
     if source_outage_tripped:
         processed = success + fail + skip
         print(
             "source outage circuit breaker tripped: "
-            f"threshold={outage_breaker.threshold}, unprocessed={len(symbols) - processed}"
+            f"threshold={args.source_outage_threshold}, unprocessed={all_symbol_count - processed}"
         )
     if failed_symbols:
         print("failed reason top:")
@@ -1369,6 +1664,8 @@ def main():
                     "saved_rows": saved_rows,
                     "raw_saved_rows": raw_saved_rows,
                     "elapsed": elapsed,
+                    "recovery_rounds": outcome.recoveries,
+                    "unprocessed_symbols": sorted(set(symbols) - {r.symbol for r in completed_results}),
                     "results": [
                         {
                             "symbol": result.symbol,

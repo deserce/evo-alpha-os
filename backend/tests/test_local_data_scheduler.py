@@ -79,6 +79,26 @@ def test_local_skill_workflow_commands_include_strategy_and_lightweight_health(m
     assert health == []
 
 
+def test_routine_modes_use_shared_recent_repair_not_a_second_scheduler():
+    for mode in ('morning','daily','retry'):
+        command = local_skill.build_workflow_command(mode,'2026-10-23')
+        assert '--repair-recent' in command
+    assert '--repair-recent' not in local_skill.build_workflow_command('catchup','2026-10-23')
+
+
+@pytest.mark.parametrize('mode,explicit,current,expected', [
+    ('daily', False, True, True), ('retry', False, True, True),
+    ('retry', False, False, False), ('retry', True, True, False),
+    ('morning', False, True, False), ('health', False, True, False),
+])
+def test_historical_and_manual_repairs_do_not_kick_material_queue(
+    mode, explicit, current, expected
+):
+    target = datetime.now().date().isoformat() if current else '2020-01-01'
+    assert local_skill.should_kick_material_queue(
+        mode, target, explicit_target=explicit) is expected
+
+
 def test_watch_post_workflow_commands_leave_digest_to_fixed_evening_job():
     daily = local_skill.build_watch_post_command("daily", "2026-07-13")
     retry = local_skill.build_watch_post_command("retry", "2026-07-13")
@@ -87,6 +107,51 @@ def test_watch_post_workflow_commands_leave_digest_to_fixed_evening_job():
     assert retry[-2:] == ["--mode", "retry"]
     assert local_skill.build_watch_post_command("early", "2026-07-13") == []
     assert local_skill.build_watch_post_command("health", "2026-07-13") == []
+
+
+@pytest.mark.parametrize('mode,explicit,current,workflow_code,verified,expected', [
+    ('daily', False, True, 1, False, 1),
+    ('retry', False, True, 0, False, 1),
+    ('daily', False, True, 0, True, 1),
+    ('daily', True, True, 1, False, 0),
+    ('retry', False, False, 1, False, 0),
+    ('morning', False, True, 1, False, 0),
+])
+def test_material_queue_runs_after_workflow_even_when_market_verification_fails(
+    monkeypatch, mode, explicit, current, workflow_code, verified, expected
+):
+    target = datetime.now().date().isoformat() if current else '2020-01-01'
+    argv = ['run_local_data_skill.py', '--mode', mode, '--skip-notifications']
+    if explicit:
+        argv.extend(['--target', target])
+    monkeypatch.setattr(sys, 'argv', argv)
+    monkeypatch.setattr(local_skill, 'resolve_target', lambda value: target)
+    monkeypatch.setattr(local_skill, 'build_workflow_command', lambda *a, **kw: ['workflow'])
+    monkeypatch.setattr(local_skill, 'local_only_env', lambda: {})
+    monkeypatch.setattr(local_skill, 'is_a_share_session', lambda day: True)
+    monkeypatch.setattr(local_skill, 'run_preflight', lambda *a, **kw: None)
+    monkeypatch.setattr(local_skill, 'ensure_database_backup', lambda *a, **kw:
+                        SimpleNamespace(path='backup', method='test', reused=True))
+    for name in ('run_retention_maintenance', 'mark_stale_pipeline_runs',
+                 'write_status_report', 'record_pipeline_phase_timings'):
+        monkeypatch.setattr(local_skill, name, lambda *a, **kw: None)
+    calls = []
+
+    def run(command, env, **kwargs):
+        calls.append(command)
+        return workflow_code if command == ['workflow'] else 0
+
+    def verify(*a, **kw):
+        assert len(calls) == 1 + expected
+        return SimpleNamespace(ok=verified, messages=[])
+
+    monkeypatch.setattr(local_skill, 'run_command', run)
+    monkeypatch.setattr(local_skill, 'verify_after_run', verify)
+    assert local_skill.main() == (workflow_code or (0 if verified else 3))
+    assert calls[0] == ['workflow']
+    assert len(calls) == 1 + expected
+    if expected:
+        assert calls[1][-3:] == ['-m', 'data_job.auto_f10', '--kick']
 
 
 def test_skip_notifications_propagates_and_suppresses_retry_dispatch():
@@ -1677,6 +1742,29 @@ def test_verification_accepts_repaired_sector_target_when_newer_data_exists(
     missing_target = local_skill.verify_after_run("2026-06-04")
     assert not missing_target.ok
     assert any("RPS freshness failed" in item for item in missing_target.messages)
+
+
+def test_verification_rejects_partial_exact_date_despite_latest_dates(tmp_path, monkeypatch):
+    from data_core import repair_plan
+
+    db_path = tmp_path / "partial.db"
+    _create_status_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE trading_calendar (trade_date TEXT, is_open INTEGER);
+            CREATE TABLE stock_info (symbol TEXT);
+            CREATE TABLE stock_daily_prices_raw (symbol TEXT, trade_date TEXT);
+        """)
+    monkeypatch.setattr(local_skill, "DB_PATH", db_path)
+    monkeypatch.setattr(repair_plan, "build_repair_plan", lambda *a, **k: {
+        "dates": [{"trade_date": "2026-06-04", "pending": ["stock_rps", "watch"],
+                   "datasets": {"stock_rps": {"category": "core"},
+                                "watch": {"category": "monitoring"}}}]
+    })
+    result = local_skill.verify_after_run("2026-06-04")
+    assert not result.ok
+    assert any("exact-date core coverage failed" in item for item in result.messages)
+    assert any("watch" in item and "advisory" in item for item in result.messages)
 
 
 def test_mark_stale_pipeline_runs_only_after_expiry(tmp_path, monkeypatch):

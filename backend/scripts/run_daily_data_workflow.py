@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import selectors
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Sequence
+from threading import current_thread, main_thread
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -85,6 +87,7 @@ class Task:
     timeout_seconds: int | None = None
     independent: bool = False
     run_if_failed: str | None = None
+    trade_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +250,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kline-end", help="optional K-line end date, e.g. 2026-04-27")
     parser.add_argument("--morning", action="store_true", help="run bounded previous-day gap repair")
     parser.add_argument("--retry", action="store_true", help="run only target-date stale tasks")
+    parser.add_argument("--repair-recent", action="store_true",
+                        help="use calendar-driven dataset repair with historical isolation")
     parser.add_argument(
         "--pending-days",
         type=int,
@@ -2232,7 +2237,180 @@ def finish_pipeline_log(
         conn.commit()
 
 
+def load_repair_plan(args: argparse.Namespace) -> dict:
+    from data_core.repair_plan import build_repair_plan
+    with closing(sqlite3.connect(DB_PATH.resolve().as_uri()+'?mode=ro', uri=True)) as conn:
+        return build_repair_plan(conn, args.kline_end or latest_completed_trading_date(),
+                                 limit=args.pending_days)
+
+
+def repair_dataset_for(task_name: str) -> str | None:
+    return {
+        'data_core_stock_daily_quality': 'stock', 'stock_valuation': 'valuation',
+        'sector_composite_daily': 'sector', 'sector_rps_v2': 'sector_rps',
+        'rps_features': 'stock_rps', 'index_daily': 'index', 'etf_daily_prices': 'etf',
+        'etf_rps_features': 'etf_rps', 'strength_features': 'strength',
+        'structure_health': 'structure', 'lifecycle_state': 'lifecycle',
+        'mrgc_preselect': 'mrgc', 'timing_signals': 'timing', 'risk_plans': 'risk',
+        'watch_engine': 'watch', 'structure_monitor': 'c',
+        'three_group_report_prepare': 'report',
+    }.get(task_name.split('@',1)[0])
+
+
+def make_repair_tasks(args: argparse.Namespace) -> list[Task]:
+    """Explicit bounded dates; never use MAX(date) to infer historical continuity."""
+    plan = load_repair_plan(args)
+    args.repair_plan = plan
+    tasks = []
+    source_dirty = watch_dirty = False
+    for row in plan['dates']:
+        day, pending = row['trade_date'], set(row['pending'])
+        source_dirty = source_dirty or row['source_changed'] or 'stock' in pending
+        historical = day != datetime.now().date().isoformat()
+
+        def add(name, command, *, critical=False, independent=False, timeout=180,
+                run_if_failed=None):
+            tasks.append(Task(name+'@'+day, tuple(command), critical=critical,
+                              independent=independent, timeout_seconds=timeout,
+                              run_if_failed=(run_if_failed+'@'+day if run_if_failed else None),
+                              trade_date=day))
+
+        def feature(name, calculator, *, critical=True):
+            add(name, (sys.executable, '-m', 'quant_engine.runner.feature_runner',
+                       '--mode', 'daily', '--calculators', calculator, '--target-dates', day),
+                critical=critical, timeout=300)
+
+        if 'stock' in pending and not args.skip_kline:
+            if day == latest_completed_trading_date():
+                # Fetch this exact missing session before the quality command refreshes
+                # the persisted calendar from observed prices. Never backfill years
+                # merely because a symbol has no previous local row.
+                add('mootdx_qfq_stock_kline',
+                    (sys.executable, 'scripts/standalone/collect_stock_kline_mootdx_qfq.py',
+                     '--start', day, '--end', day, '--force-window', '--resume-target-day',
+                     '--workers', str(min(4, args.kline_workers)),
+                     '--pool-size', str(min(4, args.kline_pool_size)),
+                     '--batch-size', str(args.kline_batch_size),
+                     '--lookback-days', '1', '--max-bars', str(args.kline_max_bars),
+                     '--submit-window', str(min(8, args.kline_submit_window)),
+                     '--market', args.kline_market, '--timeout', str(args.kline_timeout),
+                     '--connect-retries', str(args.kline_connect_retries),
+                     '--max-fail-rate', str(args.kline_max_fail_rate)), critical=True, timeout=900)
+            add('data_core_stock_daily_quality_preview',
+                (sys.executable,'-m','data_core.quality','--date',day,'--fail-on-fail'))
+            add('stock_daily_quality_repair',
+                (sys.executable,'scripts/repair_stock_daily_quality.py','--date',day),
+                run_if_failed='data_core_stock_daily_quality_preview', timeout=600)
+            add('stock_daily_gap_repair',
+                (sys.executable,'scripts/repair_stock_daily_gaps.py','--end-date',day,
+                 '--window-trading-days','1','--max-bars','40','--workers','2',
+                 '--pool-size','2','--submit-window','8'),
+                run_if_failed='data_core_stock_daily_quality_preview', timeout=180)
+            add('data_core_stock_daily_quality',
+                (sys.executable,'-m','data_core.quality','--date',day,'--fail-on-fail'),
+                critical=True, timeout=60)
+        if 'valuation' in pending or source_dirty:
+            add('stock_valuation', (sys.executable,'-m',
+                'data_job.collectors.stock_valuation_collector','--target-date',day))
+        if 'index' in pending and not args.skip_market_side:
+            add('index_daily', (sys.executable,'-m','data_job.collectors.index_data_collector',
+                '--start',day,'--end',day,'--max-bars','20'), independent=True)
+        if ('sector' in pending or source_dirty) and not args.skip_sector_composite \
+                and not args.skip_market_side:
+            add('sector_composite_daily',(sys.executable,'scripts/rebuild_sector_composite.py',
+                '--target-date',day,'--membership-status','daily_snapshot'),
+                critical=True, timeout=300)
+            add('sector_composite_quality',(sys.executable,'-m','data_core.quality',
+                '--module',MODULE_SECTOR_COMPOSITE,'--date',day,'--fail-on-fail'),
+                critical=True, timeout=60)
+        if not args.skip_rps:
+            if 'stock_rps' in pending or source_dirty:
+                feature('rps_features','stock')
+            if 'sector_rps' in pending or 'sector' in pending or source_dirty:
+                feature('sector_rps_v2','sector_composite')
+                add('sector_rps_v2_quality',(sys.executable,'-m','data_core.quality',
+                    '--module',MODULE_SECTOR_RPS,'--date',day,'--fail-on-fail'),
+                    critical=True, timeout=60)
+        strength_dirty = source_dirty or bool(pending & {
+            'stock_rps','sector_rps','sector','strength','index'})
+        lifecycle_dirty = source_dirty or bool(pending & {
+            'stock_rps','sector_rps','sector','strength','structure','lifecycle','mrgc','index'})
+        core_changed = lifecycle_dirty or bool(pending & {'timing','risk'})
+        if not historical and source_dirty and not args.skip_p0:
+            add('core_stock_pool',(sys.executable,'-m','quant_engine.pool.maintain_pool'),
+                critical=True,timeout=120)
+        if not args.skip_p0:
+            if strength_dirty:
+                feature('strength_features','strength')
+            if 'structure' in pending or source_dirty:
+                feature('structure_health','structure')
+            if lifecycle_dirty:
+                feature('lifecycle_state_base','lifecycle')
+        if not args.skip_p1:
+            if args.include_strategy and ('mrgc' in pending or lifecycle_dirty):
+                add('mrgc_preselect',(sys.executable,'-m','quant_engine.runner.strategy_runner',
+                    '--strategy','mrgc','--dates',day), critical=True, timeout=300)
+            if args.include_strategy:
+                formula_flags = () if source_dirty or 'stock_rps' in pending else ('--missing-only',)
+                add('formula_preselect', (sys.executable, '-m',
+                    'quant_engine.runner.strategy_runner', '--strategy', 'formulas',
+                    '--dates', day, *formula_flags), timeout=180)
+            if 'timing' in pending or core_changed:
+                feature('timing_signals','timing')
+            if 'risk' in pending or core_changed:
+                feature('risk_plans','risk')
+        if not args.skip_p0 and core_changed:
+            feature('lifecycle_state','lifecycle')
+        watch_dirty = watch_dirty or 'watch' in pending or core_changed
+        if not args.skip_watch:
+            if watch_dirty:
+                add('watch_engine',(sys.executable,'-m','quant_engine.watch.engine',
+                    '--mode','daily','--trade-date',day,*(['--historical'] if historical else [])),
+                    critical=True)
+            if 'c' in pending or core_changed:
+                add('structure_monitor',(sys.executable,'scripts/run_structure_monitor.py',
+                    '--trade-date',day,*(['--historical'] if historical else []),'--workflow-child'),
+                    timeout=120)
+            if pending & {'report', 'c'} or watch_dirty or core_changed:
+                add('three_group_report_prepare',(sys.executable,'-m',
+                    'quant_engine.watch.three_group_daily','--trade-date',day,
+                    '--mode','prepare','--workflow-child'))
+            if not historical and watch_dirty and not args.skip_notifications:
+                add('watch_email_digest',(sys.executable,'-m','quant_engine.watch.dispatcher',
+                    '--mode','digest','--trade-date',day,'--require-trusted'),timeout=60)
+        if not args.skip_market_side and 'etf' in pending:
+            add('etf_daily_prices',(sys.executable,'-m','data_job.collectors.etf_kline_collector',
+                '--start',day,'--end',day,'--max-bars','20'),independent=True,timeout=240)
+        if not args.skip_rps and ('etf_rps' in pending or 'etf' in pending):
+            add('etf_rps_features',(sys.executable,'-m','quant_engine.runner.feature_runner',
+                '--mode','daily','--calculators','etf','--target-dates',day), independent=True)
+        if not historical and core_changed and not args.skip_portfolio:
+            add('portfolio_daily_snapshots',(sys.executable,'scripts/build_portfolio_snapshots.py',
+                '--trade-date',day),timeout=60)
+            add('portfolio_exit_engine',(sys.executable,'scripts/run_portfolio_exit_engine.py',
+                '--trade-date',day),timeout=60)
+            if not args.skip_notifications:
+                add('portfolio_exit_digest',(sys.executable,'-m',
+                    'quant_engine.watch.dispatcher','--mode','portfolio-digest',
+                    '--trade-date',day),timeout=60)
+        if not historical and core_changed and not args.skip_p1 and not args.morning:
+            feature('research_snapshot','research',critical=False)
+        if not historical and not args.retry and not args.morning and source_dirty:
+            for name, module in (('limit_boards','limit_boards_collector'),
+                                 ('news','news_collector'),('macro_indicators','macro_data_collector')):
+                if not args.skip_market_side:
+                    add(name,(sys.executable,'-m','data_job.collectors.'+module),independent=True)
+            if not args.skip_enrichment:
+                add('stock_enrichment_core',(sys.executable,'-m',
+                    'data_job.collectors.stock_enrichment_collector','--mode','core',
+                    '--trade-date',day,'--limit',str(args.enrichment_limit)),
+                    independent=True,timeout=60)
+    return tasks
+
+
 def make_tasks(args: argparse.Namespace) -> list[Task]:
+    if args.repair_recent:
+        return make_repair_tasks(args)
     python = sys.executable
     tasks: list[Task] = []
     target_trade_date = args.kline_end or latest_completed_trading_date()
@@ -2749,6 +2927,13 @@ def make_tasks(args: argparse.Namespace) -> list[Task]:
                     critical=True,
                 )
             )
+            p1_tasks.append(Task(
+                name="formula_preselect",
+                command=(python, "-m", "quant_engine.runner.strategy_runner",
+                         "--strategy", "formulas", "--dates", *calculation_target_dates,
+                         "--missing-only"),
+                timeout_seconds=180,
+            ))
         p1_tasks.extend(
             [
                 Task(
@@ -2835,7 +3020,7 @@ def make_tasks(args: argparse.Namespace) -> list[Task]:
             ]
         )
 
-    if run_p0 and not args.morning:
+    if run_p0:
         tasks.append(
             Task(
                 name="structure_monitor",
@@ -3038,6 +3223,23 @@ def make_tasks(args: argparse.Namespace) -> list[Task]:
     return tasks
 
 
+def _stop_task_group(process: subprocess.Popen) -> None:
+    """Reap nested collectors too, so a timed-out parent cannot keep writing."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def run_task(task: Task, log_file, allow_model_calls: bool = False) -> TaskResult:
     start = time.perf_counter()
 
@@ -3060,6 +3262,7 @@ def run_task(task: Task, log_file, allow_model_calls: bool = False) -> TaskResul
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
 
     assert process.stdout is not None
@@ -3067,6 +3270,13 @@ def run_task(task: Task, log_file, allow_model_calls: bool = False) -> TaskResul
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     timed_out = False
+    previous_handler = None
+    if current_thread() is main_thread():
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        def cancel_task(signum, frame):
+            _stop_task_group(process)
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, cancel_task)
 
     try:
         while process.poll() is None:
@@ -3076,12 +3286,7 @@ def run_task(task: Task, log_file, allow_model_calls: bool = False) -> TaskResul
                     log_file,
                     f"任务超时，准备终止: {task.name} timeout={task.timeout_seconds}s",
                 )
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    log_line(log_file, f"任务未响应 SIGTERM，强制结束: {task.name}")
-                    process.kill()
+                _stop_task_group(process)
                 break
 
             for key, _events in selector.select(timeout=0.5):
@@ -3097,6 +3302,11 @@ def run_task(task: Task, log_file, allow_model_calls: bool = False) -> TaskResul
             log_file.write(line)
             log_file.flush()
     finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
+        if process.poll() is None:
+            _stop_task_group(process)
+        process.stdout.close()
         selector.close()
 
     returncode = process.wait()
@@ -3120,6 +3330,7 @@ def run_tasks_until_blocked(
     results: list[TaskResult] = []
     results_by_name: dict[str, TaskResult] = {}
     core_blocked = False
+    blocked_dates: set[str] = set()
 
     for task in tasks:
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
@@ -3138,7 +3349,7 @@ def run_tasks_until_blocked(
                 on_result(result)
             continue
 
-        if core_blocked and not task.independent:
+        if (core_blocked or task.trade_date in blocked_dates) and not task.independent:
             result = TaskResult(
                 name=task.name,
                 returncode=0,
@@ -3179,7 +3390,10 @@ def run_tasks_until_blocked(
             on_result(result)
 
         if result.failed and result.critical and not task.independent:
-            core_blocked = True
+            if task.trade_date:
+                blocked_dates.add(task.trade_date)
+            else:
+                core_blocked = True
             log_line(log_file, f"关键任务失败，递延依赖任务: {task.name}")
 
     return results
@@ -3222,7 +3436,7 @@ def main() -> int:
     run_id = datetime.now().strftime(f"{workflow_mode}_%Y%m%d_%H%M%S")
     run_started_at = time.perf_counter()
 
-    with open(LOCK_PATH, "w") as lock_file, open(log_path, "w", encoding="utf-8") as log_file:
+    with open(LOCK_PATH, "a+") as lock_file, open(log_path, "w", encoding="utf-8") as log_file:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -3278,7 +3492,13 @@ def main() -> int:
             return 0
 
         deadline_monotonic = None
-        if args.morning and args.time_budget_minutes > 0:
+        if args.repair_recent:
+            from data_core.repair_plan import persist_pending_states
+            scheduled = {(task.trade_date, stage) for task in tasks
+                         if (stage := repair_dataset_for(task.name)) and task.trade_date}
+            with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                persist_pending_states(conn, args.repair_plan, additional=scheduled)
+        if (args.morning or args.repair_recent) and args.time_budget_minutes > 0:
             deadline_monotonic = run_started_at + args.time_budget_minutes * 60
         results = run_tasks_until_blocked(
             tasks,
@@ -3292,16 +3512,32 @@ def main() -> int:
                 lock_file,
                 run_id=run_id,
                 mode=workflow_mode,
-                target_trade_date=target_trade_date,
-                stage=task.name,
+                target_trade_date=task.trade_date or target_trade_date,
+                stage=task.name.split('@', 1)[0],
             ),
             on_result=lambda result: record_pipeline_task(
                 run_id,
-                target_trade_date,
+                result.name.split('@',1)[1] if '@' in result.name else target_trade_date,
                 result,
             ),
             deadline_monotonic=deadline_monotonic,
         )
+
+        repair_pending = []
+        if args.repair_recent:
+            from data_core.repair_plan import build_repair_plan, persist_ready_states
+            completed = {(result.name.split('@',1)[1], repair_dataset_for(result.name))
+                         for result in results if result.ok and '@' in result.name
+                         and repair_dataset_for(result.name)}
+            with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+                final_plan = build_repair_plan(conn, target_trade_date,
+                                              limit=args.pending_days, completed=completed)
+                persist_ready_states(conn, final_plan)
+            repair_pending = [dict(trade_date=row['trade_date'], pending=row['pending'])
+                              for row in final_plan['dates'] if row['pending']]
+            log_line(log_file, 'recent_repair_remaining='+json.dumps(repair_pending,ensure_ascii=False))
+            write_lock_metadata(lock_file,run_id=run_id,mode=workflow_mode,
+                                target_trade_date=target_trade_date,stage='verification')
 
         after = snapshot_tables(target_trade_date)
         print_snapshot(log_file, "After Snapshot", after)
@@ -3370,7 +3606,7 @@ def main() -> int:
         log_line(log_file, "EvoAlpha daily data workflow finished.")
         finish_pipeline_log(
             run_id,
-            "success_with_warnings" if failed or deferred else "success",
+            "success_with_warnings" if failed or deferred or repair_pending else "success",
             run_started_at,
             [],
             [result.name for result in failed],

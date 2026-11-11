@@ -25,6 +25,22 @@ def task_names(argv: list[str]) -> list[str]:
     return [task.name for task in make_tasks(args)]
 
 
+def test_competing_workflow_preserves_active_owner_metadata(tmp_path, monkeypatch):
+    import fcntl
+    import sys
+
+    lock = tmp_path / "workflow.lock"
+    owner = '{"pid":123,"stage":"stock_daily"}'
+    lock.write_text(owner)
+    monkeypatch.setattr(workflow, "LOCK_PATH", lock)
+    monkeypatch.setattr(workflow, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["workflow", "--check-only"])
+    with lock.open("a+") as active:
+        fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert workflow.main() == 2
+        assert lock.read_text() == owner
+
+
 def test_skip_p0_does_not_skip_p1_tasks():
     names = task_names(["--skip-p0"])
 
@@ -706,6 +722,18 @@ def test_run_task_returns_failure_on_timeout():
 
     assert result.failed
     assert result.returncode != 0
+
+
+def test_task_timeout_reaps_descendants_instead_of_holding_workflow_lock():
+    import time
+    task = Task('nested_timeout',(workflow.sys.executable,'-c',
+        "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',"
+        "'import time;time.sleep(4)']); print('started',flush=True);time.sleep(4)"),
+        timeout_seconds=0.2)
+    started = time.monotonic()
+    result = run_task(task,StringIO())
+    assert result.failed
+    assert time.monotonic()-started < 2
 
 
 def test_valuation_runs_when_kline_will_update(tmp_path, monkeypatch):
@@ -1502,10 +1530,54 @@ def test_skip_watch_keeps_c_monitor_without_sending_combined_digest():
     assert "watch_email_digest" not in names
 
 
-def test_morning_does_not_run_c_monitor_or_combined_digest():
-    names = task_names(["--morning"])
-    assert "structure_monitor" not in names
+def test_morning_recomputes_c_after_core_without_combined_digest(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow, "DB_PATH", tmp_path / "missing.db")
+    args = build_parser().parse_args([
+        "--morning", "--skip-kline", "--force-valuation", "--kline-end", "2026-10-23",
+    ])
+    tasks = make_tasks(args)
+    names = [task.name for task in tasks]
+    monitor = next(task for task in tasks if task.name == "structure_monitor")
+    assert names.index("lifecycle_state") < names.index("structure_monitor")
+    assert monitor.command[-3:] == ("--trade-date", "2026-10-23", "--workflow-child")
+    assert not monitor.critical and monitor.independent
+    assert monitor.timeout_seconds == 120
     assert "watch_email_digest" not in names
+    assert "watch_engine" not in names
+    assert all("quant_engine.watch.dispatcher" not in task.command for task in tasks)
+
+
+def test_morning_c_is_deferred_without_starting_when_budget_is_exhausted(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow, "DB_PATH", tmp_path / "missing.db")
+    args = build_parser().parse_args(["--morning", "--skip-kline", "--force-valuation"])
+    monitor = next(task for task in make_tasks(args) if task.name == "structure_monitor")
+
+    def must_not_start(*_args):
+        raise AssertionError("C replay must not start after the morning budget")
+
+    result = run_tasks_until_blocked(
+        [monitor], StringIO(), runner=must_not_start, deadline_monotonic=0,
+    )[0]
+    assert result.deferred and result.deferred_reason == "time_budget_exhausted"
+
+
+def test_morning_c_failure_does_not_block_other_work(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow, "DB_PATH", tmp_path / "missing.db")
+    args = build_parser().parse_args(["--morning", "--skip-kline", "--force-valuation"])
+    monitor = next(task for task in make_tasks(args) if task.name == "structure_monitor")
+    calls = []
+
+    def runner(task, _output):
+        calls.append(task.name)
+        return TaskResult(task.name, 1 if task.name == "structure_monitor" else 0,
+                          0.01, task.critical)
+
+    results = run_tasks_until_blocked(
+        [monitor, Task("after_monitor", ("python",), critical=True)],
+        StringIO(), runner=runner,
+    )
+    assert calls == ["structure_monitor", "after_monitor"]
+    assert results[0].failed and results[1].ok
 
 
 def test_three_group_prepare_is_after_c_monitor_and_deterministic():
@@ -1523,3 +1595,156 @@ def test_three_group_prepare_is_after_c_monitor_and_deterministic():
 def test_three_group_prepare_excluded_from_morning_and_skip_watch():
     assert "three_group_report_prepare" not in task_names(["--morning"])
     assert "three_group_report_prepare" not in task_names(["--skip-watch"])
+
+
+def test_recent_repair_explicit_dates_and_safe_local_reporting(monkeypatch):
+    args = build_parser().parse_args(['--repair-recent','--morning','--kline-end','2026-10-23'])
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date':'2026-10-22','pending':['stock_rps','watch','c','report'],
+                   'source_changed':False,'datasets':{}}]})
+    tasks = make_tasks(args)
+    rps = next(task for task in tasks if task.name == 'rps_features@2026-10-22')
+    assert rps.command[-2:] == ('--target-dates','2026-10-22')
+    assert '--missing-only' not in rps.command
+    for name in ('watch_engine','structure_monitor'):
+        task = next(t for t in tasks if t.name == name+'@2026-10-22')
+        assert '--historical' in task.command
+        assert task.trade_date == '2026-10-22'
+        assert task.timeout_seconds <= 180
+    report = next(t for t in tasks if t.name == 'three_group_report_prepare@2026-10-22')
+    assert '--send' not in report.command
+    assert not any('dispatcher' in token for t in tasks for token in t.command)
+    assert not any('portfolio' in t.name or t.name.startswith('core_stock_pool') for t in tasks)
+
+
+def test_recent_repair_fresh_dates_do_no_work(monkeypatch):
+    args = build_parser().parse_args(['--repair-recent','--kline-end','2026-10-23'])
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates':[{'trade_date':'2026-10-23','pending':[],'source_changed':False,'datasets':{}}]})
+    assert make_tasks(args) == []
+
+
+def test_c_only_repair_also_refreshes_local_report(monkeypatch):
+    args = build_parser().parse_args(['--repair-recent', '--kline-end', '2026-10-23'])
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': '2026-10-23', 'source_changed': False, 'pending': ['c']}]
+    })
+    names = [task.name for task in make_tasks(args)]
+    assert names == ['structure_monitor@2026-10-23',
+                     'three_group_report_prepare@2026-10-23']
+
+
+def test_core_failure_isolated_by_repair_date():
+    tasks = [Task('bad@2026-10-22',('python',),critical=True,trade_date='2026-10-22'),
+             Task('blocked@2026-10-22',('python',),trade_date='2026-10-22'),
+             Task('good@2026-10-23',('python',),critical=True,trade_date='2026-10-23')]
+    calls = []
+    def runner(task, output):
+        calls.append(task.name)
+        return TaskResult(task.name, int(task.name.startswith('bad')), 0.01, task.critical)
+    results = run_tasks_until_blocked(tasks,StringIO(),runner=runner)
+    assert results[1].deferred and results[2].ok
+    assert calls == ['bad@2026-10-22','good@2026-10-23']
+
+
+def test_only_final_lifecycle_can_complete_repair_manifest():
+    assert workflow.repair_dataset_for('lifecycle_state_base@2026-10-23') is None
+    assert workflow.repair_dataset_for('lifecycle_state@2026-10-23') == 'lifecycle'
+
+
+def test_recent_repair_collects_missing_session_before_quality(monkeypatch):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 26, 16, 0, tzinfo=tz)
+
+    monkeypatch.setattr(workflow, 'datetime', FixedDatetime)
+    args = build_parser().parse_args(['--repair-recent', '--kline-end', '2026-10-26'])
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': '2026-10-26', 'pending': ['stock'],
+                   'source_changed': False}]})
+    tasks = make_tasks(args)
+    source = next(t for t in tasks if t.name == 'mootdx_qfq_stock_kline@2026-10-26')
+    assert tasks.index(source) < next(i for i,t in enumerate(tasks)
+                                    if t.name.startswith('data_core_stock_daily_quality_preview'))
+    assert source.critical and source.timeout_seconds <= 900
+    for flag in ('--start', '--end'):
+        assert source.command[source.command.index(flag)+1] == '2026-10-26'
+    assert '--force-window' in source.command
+    assert '--resume-target-day' in source.command
+
+
+@pytest.mark.parametrize('mode', [[], ['--retry'], ['--morning']])
+def test_recent_repair_resumes_friday_on_weekend_without_repricing_older_history(monkeypatch, mode):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 31, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr(workflow, 'datetime', FixedDatetime)
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': day, 'pending': ['stock'], 'source_changed': False}
+                  for day in ('2026-10-29', '2026-10-30')]})
+    tasks = make_tasks(build_parser().parse_args(
+        ['--repair-recent', '--kline-end', '2026-10-30', *mode]))
+    sources = [task for task in tasks if task.name.startswith('mootdx_qfq_stock_kline@')]
+    assert len(sources) == 1
+    assert sources[0].trade_date == '2026-10-30'
+    assert '--resume-target-day' in sources[0].command
+
+
+def test_recent_repair_skip_kline_does_not_fetch(monkeypatch):
+    args = build_parser().parse_args(['--repair-recent', '--skip-kline'])
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': '2026-10-26', 'pending': ['stock'],
+                   'source_changed': False}]})
+    assert not any('collect_stock_kline' in token for t in make_tasks(args) for token in t.command)
+
+
+def test_recent_repair_current_report_requires_trusted_watch(monkeypatch):
+    day = datetime.now().date().isoformat()
+    args = build_parser().parse_args(['--repair-recent', '--kline-end', day])
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': day, 'pending': ['watch', 'report'],
+                   'source_changed': False}]})
+    tasks = make_tasks(args)
+    watch = next(t for t in tasks if t.name.startswith('watch_engine@'))
+    digest = next(t for t in tasks if t.name.startswith('watch_email_digest@'))
+    assert watch.critical
+    assert '--require-trusted' in digest.command
+    results = run_tasks_until_blocked(tasks, StringIO(), runner=lambda t, out:
+                                     TaskResult(t.name, int(t is watch), 0.01, t.critical))
+    assert next(r for r in results if r.name == digest.name).deferred
+
+
+def test_recent_repair_preserves_current_portfolio_and_research_steps(monkeypatch):
+    day = datetime.now().date().isoformat()
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': day, 'pending': ['lifecycle'], 'source_changed': False}]})
+    tasks = make_tasks(build_parser().parse_args(['--repair-recent']))
+    names = [t.name.split('@')[0] for t in tasks]
+    assert names.index('portfolio_exit_engine') < names.index('portfolio_exit_digest')
+    assert 'research_snapshot' in names
+    isolated = make_tasks(build_parser().parse_args(
+        ['--repair-recent', '--skip-notifications', '--skip-p1']))
+    assert not any(t.name.startswith(('portfolio_exit_digest@', 'research_snapshot@'))
+                   for t in isolated)
+
+
+def test_recent_repair_profile_refresh_cannot_delay_reports_for_ten_minutes(monkeypatch):
+    day = datetime.now().date().isoformat()
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': day, 'pending': ['stock'], 'source_changed': False}]})
+    tasks = make_tasks(build_parser().parse_args(['--repair-recent']))
+    task = next(t for t in tasks if t.name.startswith('stock_enrichment_core@'))
+    assert not task.critical and task.independent
+    assert task.timeout_seconds <= 60
+
+
+def test_historical_quality_recheck_does_not_reprice_with_single_day_qfq(monkeypatch):
+    monkeypatch.setattr(workflow, 'load_repair_plan', lambda args: {
+        'dates': [{'trade_date': '2026-10-19', 'pending': ['stock'],
+                   'source_changed': False}]})
+    tasks = make_tasks(build_parser().parse_args(['--repair-recent']))
+    assert not any(t.name.startswith('mootdx_qfq_stock_kline@') for t in tasks)
+    assert tasks[0].name == 'data_core_stock_daily_quality_preview@2026-10-19'

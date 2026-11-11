@@ -1227,7 +1227,7 @@ def test_exit_get_endpoints_are_read_only_and_account_scoped(api_client):
 
 
 def test_exit_daily_evaluation_and_event_transitions(api_client):
-    client, _ = api_client
+    client, db_path = api_client
     account = _create_account(client)
     trade = _post_trade(
         client,
@@ -1266,6 +1266,23 @@ def test_exit_daily_evaluation_and_event_transitions(api_client):
     assert event["event_type"] == "HARD_STOP_TRIGGERED"
     assert event["observed_price_micros"] == 12_000_000
 
+    summary = client.get("/portfolio/risk-summary", params={"trade_date": "2026-07-23"})
+    assert summary.status_code == 200, summary.text
+    assert summary.json()["snapshot_ready"] is False
+    assert summary.json()["rows"] == []
+
+    snapshot = client.post(
+        f"/portfolio/accounts/{account['id']}/performance/snapshots/2026-07-23"
+    )
+    assert snapshot.status_code == 201, snapshot.text
+    summary = client.get("/portfolio/risk-summary", params={"trade_date": "2026-07-23"}).json()
+    assert summary["snapshot_ready"] is True
+    assert summary["position_count"] == 1
+    assert summary["counts"] == {"executable": 1, "watch": 0, "blocked": 0}
+    assert summary["rows"][0]["account_name"] == "主账户"
+    assert summary["rows"][0]["name"] == "贵州茅台"
+    assert summary["rows"][0]["available_quantity"] == 100
+
     acknowledged = client.post(
         f"/portfolio/exit-events/{event['id']}/acknowledge"
     )
@@ -1276,6 +1293,31 @@ def test_exit_daily_evaluation_and_event_transitions(api_client):
     )
     assert resolved.status_code == 200
     assert resolved.json()["event_status"] == "RESOLVED"
+
+
+    resolved_summary = client.get(
+        "/portfolio/risk-summary", params={"trade_date": "2026-07-23"}
+    ).json()
+    assert resolved_summary["rows"][0]["event_status"] == "RESOLVED"
+
+    next_day = client.get("/portfolio/risk-summary", params={"trade_date": "2026-07-24"}).json()
+    assert next_day["trade_date"] == "2026-07-24"
+    assert next_day["snapshot_ready"] is False
+    assert next_day["rows"] == []
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE portfolio_position_daily_snapshots
+            SET position_revision = position_revision + 1
+            WHERE account_id = ? AND snapshot_date = '2026-07-23'
+            """,
+            (account["id"],),
+        )
+    replaced = client.get("/portfolio/risk-summary", params={"trade_date": "2026-07-23"}).json()
+    assert replaced["snapshot_ready"] is True
+    assert replaced["counts"] == {"executable": 0, "watch": 0, "blocked": 0}
+    assert replaced["rows"] == []
 
 
 def test_exit_api_maps_invalid_missing_and_busy_errors(api_client, monkeypatch):

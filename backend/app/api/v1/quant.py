@@ -18,7 +18,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
@@ -87,7 +87,7 @@ MONITOR_TABLES = (
     ("structure_health_daily", "trade_date", ("symbol", "trade_date"), True),
     ("stock_lifecycle_state", "trade_date", ("symbol", "trade_date"), True),
     ("timing_signals_daily", "trade_date", ("symbol", "trade_date", "signal_type"), True),
-    ("trade_plans", "trade_date", ("signal_id",), True),
+    ("trade_plans", "trade_date", ("trade_date", "signal_id"), True),
     ("watch_daily_snapshot", "trade_date", ("symbol", "trade_date"), True),
     ("watch_events", "trade_date", ("dedupe_key",), True),
     ("notification_deliveries", "created_at", ("dedupe_key",), False),
@@ -481,10 +481,18 @@ class QuantTaskRunRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class _QuantConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _connect() -> sqlite3.Connection:
     if not DB_PATH.exists():
         raise HTTPException(status_code=404, detail=f"本地数据库不存在: {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, factory=_QuantConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -599,7 +607,11 @@ def _normalize_explicit_trade_date(trade_date: str) -> str:
         raise HTTPException(status_code=400, detail=f"无效交易日期: {trade_date}") from exc
 
 
-def _resolve_trade_date(conn: sqlite3.Connection, trade_date: str | None) -> str:
+def _resolve_trade_date(
+    conn: sqlite3.Connection, trade_date: str | None, *, exact_date: bool = False
+) -> str:
+    if exact_date and trade_date:
+        return _normalize_explicit_trade_date(trade_date)
     cache_key = trade_date or "__latest__"
     now = time.time()
     cached = _trade_date_cache.get(cache_key)
@@ -2110,16 +2122,20 @@ async def get_quant_dates(limit: int = Query(60, ge=1, le=300)):
         return _cache_set(
             _strategy_page_cache,
             cache_key,
-            ApiResponse(data={"dates": dates, "latest": dates[0] if dates else None}),
+            ApiResponse(data={
+                "dates": dates,
+                "latest": dates[0] if dates else None,
+                "latest_quant": _latest_date(conn, "stock_lifecycle_state"),
+            }),
         )
 
 
 @router.get("/dashboard", response_model=ApiResponse)
-async def get_quant_dashboard(trade_date: str | None = None, limit: int = Query(20, ge=1, le=100)):
+async def get_quant_dashboard(trade_date: str | None = None, limit: int = Query(20, ge=1, le=100), exact_date: bool = False):
     """工作台总览：市场状态、生命周期分布、买点和交易计划。"""
     limit = _limit(limit, 100)
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
 
         market = _one(conn.execute(
             f"""
@@ -2128,7 +2144,7 @@ async def get_quant_dashboard(trade_date: str | None = None, limit: int = Query(
                    limit_up_count, limit_down_count, total_amount, amount_ratio_20,
                    rps90_count, market_strength_score, market_state
             FROM market_strength_daily
-            WHERE trade_date <= ?
+            WHERE trade_date {"=" if exact_date else "<="} ?
             ORDER BY trade_date DESC,
                      {market_order_case("index_code")}
             LIMIT 1
@@ -2182,7 +2198,7 @@ async def get_quant_dashboard(trade_date: str | None = None, limit: int = Query(
             LIMIT ?
             """,
             (date, limit),
-        ).fetchall()) if _table_exists(conn, "industry_strength_daily") else []
+        ).fetchall()) if not exact_date and _table_exists(conn, "industry_strength_daily") else []
 
         opportunities = _rows(conn.execute(
             """
@@ -2199,6 +2215,7 @@ async def get_quant_dashboard(trade_date: str | None = None, limit: int = Query(
              AND COALESCE(s.is_invalidated, 0) = 0
             LEFT JOIN trade_plans p
               ON s.signal_id = p.signal_id
+             AND s.trade_date = p.trade_date
             WHERE l.trade_date = ?
               AND l.state_rank >= 4
             ORDER BY COALESCE(s.signal_score, 0) DESC,
@@ -2207,7 +2224,35 @@ async def get_quant_dashboard(trade_date: str | None = None, limit: int = Query(
             LIMIT ?
             """,
             (date, limit),
-        ).fetchall()) if _table_exists(conn, "stock_lifecycle_state") else []
+        ).fetchall()) if not exact_date and _table_exists(conn, "stock_lifecycle_state") else []
+
+        if exact_date:
+            industry_counts = _rows(conn.execute(
+                "SELECT industry_state, COUNT(*) AS count FROM industry_strength_daily "
+                "WHERE trade_date = ? GROUP BY industry_state",
+                (date,),
+            ).fetchall()) if _table_exists(conn, "industry_strength_daily") else []
+            signals_ready = bool(signal_counts) or (
+                _table_exists(conn, "timing_signals_daily")
+                and conn.execute(
+                    "SELECT 1 FROM timing_signals_daily WHERE trade_date = ? LIMIT 1", (date,)
+                ).fetchone() is not None
+            )
+            if not signals_ready and _table_exists(conn, "pipeline_task_log"):
+                signals_ready = conn.execute(
+                    "SELECT 1 FROM pipeline_task_log WHERE task_name IN ('timing_signals', ?) "
+                    "AND status = 'success' AND target_dates = ? LIMIT 1",
+                    (f"timing_signals@{date}", date),
+                ).fetchone() is not None
+            return ApiResponse(data={
+                "trade_date": date,
+                "market": market,
+                "lifecycle_counts": lifecycle_counts,
+                "signal_counts": signal_counts,
+                "signals_ready": signals_ready,
+                "plan_counts": plan_counts,
+                "industry_counts": industry_counts,
+            })
 
         # 获取所有指数数据 - 从 market_strength_daily 获取（包含均线数据）
         indices = []
@@ -2577,17 +2622,18 @@ async def get_alpha_opportunities(
     rps_period: int = Query(20),
     state: str | None = None,
     limit: int = Query(200, ge=1, le=1000),
+    exact_date: bool = False,
 ):
     """Alpha 机会池：真实生命周期 S4/S5 机会，按选定 RPS 排序。"""
     limit = _limit(limit, 1000)
     period = _rps_period(rps_period)
-    cache_key = _strategy_cache_key("alpha", trade_date or "", period, state or "", limit)
+    cache_key = _strategy_cache_key("alpha", trade_date or "", exact_date, period, state or "", limit)
     cached = _cache_get(_strategy_page_cache, cache_key, _STRATEGY_PAGE_CACHE_TTL)
     if cached is not None:
         return cached
 
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
         has_rps = _table_exists(conn, "quant_feature_rps")
         has_watch_meta = _table_has_columns(
             conn,
@@ -2760,16 +2806,17 @@ async def get_signals(
     trade_date: str | None = None,
     signal_type: str | None = None,
     limit: int = Query(200, ge=1, le=1000),
+    exact_date: bool = False,
 ):
     """买点信号明细。"""
     limit = _limit(limit, 1000)
-    cache_key = _strategy_cache_key("signals", trade_date or "", signal_type or "", limit)
+    cache_key = _strategy_cache_key("signals", trade_date or "", exact_date, signal_type or "", limit)
     cached = _cache_get(_strategy_page_cache, cache_key, _STRATEGY_PAGE_CACHE_TTL)
     if cached is not None:
         return cached
 
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
         has_rps = _table_exists(conn, "quant_feature_rps")
         has_prices = _table_has_columns(conn, "stock_daily_prices", {"close", "pct_chg", "amount"})
         params: list[Any] = [date]
@@ -2851,16 +2898,24 @@ async def get_trade_plans(
     trade_date: str | None = None,
     status: str | None = None,
     limit: int = Query(200, ge=1, le=1000),
+    exact_date: bool = False,
 ):
     """交易计划与动态风控明细。"""
     limit = _limit(limit, 1000)
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
         params: list[Any] = [date]
         where = "WHERE p.trade_date = ?"
         if status:
             where += " AND p.plan_status = ?"
             params.append(status)
+        if exact_date and not _table_exists(conn, "trade_plans"):
+            return ApiResponse(data={"trade_date": date, "rows": []})
+        if exact_date:
+            where += (
+                " AND (COALESCE(p.risk_status, 'normal') <> 'normal' "
+                "OR p.plan_status IN ('exit_pending', 'reduce'))"
+            )
         rows = conn.execute(
             f"""
             SELECT p.plan_id, p.signal_id, p.trade_date, p.symbol, l.name, l.sector_name,
@@ -2894,13 +2949,14 @@ async def get_industry_strength(
     sort_by: str | None = Query("industry_strength_score"),
     sort_dir: str | None = Query("desc"),
     limit: int = Query(100, ge=1, le=300),
+    exact_date: bool = False,
 ):
     """行业强度排行。"""
     limit = _limit(limit, 300)
     sort_by = getattr(sort_by, "default", sort_by)
     sort_dir = getattr(sort_dir, "default", sort_dir)
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
         sector_rps_table = (
             "quant_feature_sector_rps_v2"
             if _table_exists(conn, "quant_feature_sector_rps_v2")
@@ -2961,7 +3017,17 @@ async def get_industry_strength(
             """,
             tuple(params),
         ).fetchall()
-        return ApiResponse(data={"trade_date": date, "rows": _rows(rows)})
+        results = _rows(rows)
+        symbols = sorted({row["leader_symbol"] for row in results if row["leader_symbol"]})
+        if symbols and _table_has_columns(conn, "stock_info", {"symbol", "name"}):
+            placeholders = ", ".join("?" for _ in symbols)
+            names = dict(conn.execute(
+                f"SELECT symbol, name FROM stock_info WHERE symbol IN ({placeholders})",
+                symbols,
+            ).fetchall())
+            for row in results:
+                row["leader_name"] = names.get(row["leader_symbol"])
+        return ApiResponse(data={"trade_date": date, "rows": results})
 
 
 @router.get("/sector-rps-heatmap", response_model=ApiResponse)
@@ -3636,11 +3702,32 @@ async def get_industry_stocks(
 
 
 @router.get("/research/snapshot", response_model=ApiResponse)
-async def get_research_snapshot(trade_date: str | None = None, limit: int = Query(200, ge=1, le=1000)):
+async def get_research_snapshot(trade_date: str | None = None, limit: int = Query(200, ge=1, le=1000), exact_date: bool = False):
     """研究池快照。"""
     limit = _limit(limit, 1000)
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
+        if exact_date:
+            configured = _table_exists(conn, "research_watchlist") and conn.execute(
+                "SELECT 1 FROM research_watchlist LIMIT 1"
+            ).fetchone() is not None
+            themes = _rows(conn.execute(
+                """
+                SELECT theme_name, COUNT(*) AS stock_count,
+                       SUM(CASE WHEN lifecycle_state = 'S3' THEN 1 ELSE 0 END) AS s3,
+                       SUM(CASE WHEN lifecycle_state = 'S4' THEN 1 ELSE 0 END) AS s4,
+                       SUM(CASE WHEN lifecycle_state = 'S5' THEN 1 ELSE 0 END) AS s5,
+                       SUM(CASE WHEN lifecycle_state IN ('S4', 'S5')
+                                OR timing_signal_count > 0 THEN 1 ELSE 0 END) AS core
+                FROM research_stock_daily_snapshot
+                WHERE trade_date = ?
+                GROUP BY theme_name
+                ORDER BY core DESC, SUM(timing_signal_count) DESC, theme_name
+                LIMIT ?
+                """,
+                (date, limit),
+            ).fetchall()) if _table_exists(conn, "research_stock_daily_snapshot") else []
+            return ApiResponse(data={"trade_date": date, "configured": configured, "themes": themes})
         if not _table_exists(conn, "research_stock_daily_snapshot"):
             return ApiResponse(data={"trade_date": date, "rows": []})
         rows = conn.execute(
@@ -3792,17 +3879,17 @@ async def get_backtest_summary(
 
 
 @router.get("/ai/brief", response_model=ApiResponse)
-async def get_ai_brief(trade_date: str | None = None):
+async def get_ai_brief(trade_date: str | None = None, exact_date: bool = False):
     """本地规则版 AI 摘要占位，后续可接 GLM/OpenAI。"""
     with _connect() as conn:
-        date = _resolve_trade_date(conn, trade_date)
+        date = _resolve_trade_date(conn, trade_date, exact_date=exact_date)
         market = _one(conn.execute(
             f"""
             SELECT trade_date, index_code, index_name,
                    market_state, market_strength_score, up_count, down_count,
                    limit_up_count, limit_down_count
             FROM market_strength_daily
-            WHERE trade_date <= ?
+            WHERE trade_date {"=" if exact_date else "<="} ?
             ORDER BY trade_date DESC, {market_order_case("index_code")}
             LIMIT 1
             """,
@@ -3844,8 +3931,9 @@ async def get_ai_brief(trade_date: str | None = None):
             bullets.append(
                 f"最强行业为 {top_industry['sector_name']}，行业状态 {top_industry['industry_state']}，强度分 {top_industry['industry_strength_score']}。"
             )
-        bullets.append(f"当日有效买点 {signals} 个，活跃交易计划 {active_plans} 个。")
-        bullets.append("建议先审查 reduce/exit_pending 计划，再看 S4/S5 与高分行业共振标的。")
+        if not exact_date or market or top_industry or signals or active_plans:
+            bullets.append(f"当日有效买点 {signals} 个，活跃交易计划 {active_plans} 个。")
+            bullets.append("建议先审查 reduce/exit_pending 计划，再看 S4/S5 与高分行业共振标的。")
 
         return ApiResponse(
             data={
@@ -3887,34 +3975,71 @@ async def get_sync_status():
     )
 
 
+FORMULA_STRATEGY_NAMES = (
+    "rps_acceleration_v1",
+    "rps_platform_breakout_v1",
+    "rps_long_pullback_v1",
+    "rps_resonance_v1",
+    "monthly_reversal_v65",
+    "near_year_high_v1",
+)
+
+
+@router.get("/strategy/formula-runs", response_model=ApiResponse)
+async def get_formula_strategy_runs(trade_date: str):
+    """Return the six formula run states for one exact date without loading picks."""
+    date = _normalize_explicit_trade_date(trade_date)
+    runs = {name: {"status": "not_run", "signal_count": None} for name in FORMULA_STRATEGY_NAMES}
+    with closing(_connect()) as conn:
+        if _table_exists(conn, "strategy_run_log"):
+            for name in FORMULA_STRATEGY_NAMES:
+                row = conn.execute(
+                    """
+                    SELECT status, signal_count
+                    FROM strategy_run_log
+                    WHERE strategy_name = ? AND trade_date >= ?
+                      AND trade_date < DATE(?, '+1 day')
+                    ORDER BY finished_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (name, date, date),
+                ).fetchone()
+                if row is not None:
+                    runs[name] = dict(row)
+    return ApiResponse(data={"date": date, "runs": runs})
+
+
 @router.get("/strategy/results", response_model=ApiResponse)
 async def get_strategy_results(
     trade_date: str | None = None,
     strategy_name: str | None = None,
     limit: int = Query(500, ge=1, le=2000),
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
 ):
-    """策略预选结果：查 quant_preselect_results 表，按日期和策略名返回。
-
-    可通过 strategy_name 过滤（如 mrgc_v1），不传则返回所有策略。
-    结果会 JOIN stock_basic_info 补充股票名称，JOIN stock_lifecycle_state 补充生命周期状态。
-    """
+    """Return exact-date strategy picks with stock information and the run state."""
     limit = _limit(limit, 2000)
-    cache_key = _strategy_cache_key("strategy_results", trade_date or "", strategy_name or "", limit)
-    cached = _cache_get(_strategy_page_cache, cache_key, _STRATEGY_PAGE_CACHE_TTL)
+    formula = strategy_name in FORMULA_STRATEGY_NAMES
+    result_table = "quant_formula_results" if formula else "quant_preselect_results"
+    cache_key = _strategy_cache_key(
+        "strategy_results", trade_date or "", strategy_name or "", limit, offset
+    )
+    cached = None if formula else _cache_get(_strategy_page_cache, cache_key, _STRATEGY_PAGE_CACHE_TTL)
     if cached is not None:
         return cached
 
-    with _connect() as conn:
-        date = (
-            _normalize_explicit_trade_date(trade_date)
-            if trade_date
-            else _resolve_trade_date(conn, None)
-        )
+    with closing(_connect()) as conn:
+        if trade_date:
+            date = _normalize_explicit_trade_date(trade_date)
+        elif formula and _table_exists(conn, "stock_daily_prices"):
+            latest = conn.execute("SELECT MAX(trade_date) FROM stock_daily_prices").fetchone()[0]
+            date = str(latest)[:10] if latest else None
+        else:
+            date = _resolve_trade_date(conn, None)
 
-        if not _table_exists(conn, "quant_preselect_results"):
+        table_exists = _table_exists(conn, result_table)
+        if not table_exists and not formula:
             return ApiResponse(data={"date": date, "rows": [], "total": 0})
 
-        strategy_filter = "AND strategy_name = ?" if strategy_name else ""
+        strategy_filter = "AND qpr.strategy_name = ?" if strategy_name else ""
         join_params: list = []
 
         has_lifecycle = _table_exists(conn, "stock_lifecycle_state")
@@ -3994,22 +4119,23 @@ async def get_strategy_results(
                    {lifecycle_cols}
                    {rps_cols}
                    {price_cols}
-            FROM quant_preselect_results qpr
+            FROM {result_table} qpr
             {joins}
             WHERE qpr.trade_date = ?
             {strategy_filter}
-            ORDER BY qpr.created_at DESC
-            LIMIT ?
+            ORDER BY qpr.created_at DESC, qpr.symbol
+            LIMIT ? OFFSET ?
         """
         params: list = [*join_params, date]
         if strategy_name:
             params.append(strategy_name)
-        params.append(limit)
+        params.extend([limit, offset])
 
         try:
-            cursor = conn.execute(sql, params)
-            results = [dict(row) for row in cursor.fetchall()]
+            results = [dict(row) for row in conn.execute(sql, params)] if table_exists else []
         except Exception as exc:
+            if formula:
+                raise HTTPException(status_code=500, detail="公式策略结果读取失败") from exc
             return ApiResponse(code=1, message=f"查询策略结果失败: {exc}", data={"date": date, "rows": [], "total": 0})
 
         # parse meta_info JSON
@@ -4030,11 +4156,11 @@ async def get_strategy_results(
                 SELECT status, signal_count, error_message, started_at, finished_at
                 FROM strategy_run_log
                 WHERE strategy_name = ?
-                  AND DATE(trade_date) = DATE(?)
-                ORDER BY finished_at DESC
+                  AND trade_date >= ? AND trade_date < DATE(?, '+1 day')
+                ORDER BY finished_at DESC, rowid DESC
                 LIMIT 1
                 """,
-                (strategy_name, date),
+                (strategy_name, date, date),
             ).fetchone()
 
         run_data = dict(run_row) if run_row else None
@@ -4055,17 +4181,14 @@ async def get_strategy_results(
             "finished_at": run_data.get("finished_at") if run_data else None,
         }
 
-        return _cache_set(
-            _strategy_page_cache,
-            cache_key,
-            ApiResponse(data={
-                "date": date,
-                "strategy_name": strategy_name,
-                "total": len(results),
-                "rows": results,
-                "calculation": calculation,
-            }),
-        )
+        response = ApiResponse(data={
+            "date": date,
+            "strategy_name": strategy_name,
+            "total": calculation["signal_count"] if formula and calculated else len(results),
+            "rows": results,
+            "calculation": calculation,
+        })
+        return response if formula else _cache_set(_strategy_page_cache, cache_key, response)
 
 
 @router.get("/strategy/meta", response_model=ApiResponse)

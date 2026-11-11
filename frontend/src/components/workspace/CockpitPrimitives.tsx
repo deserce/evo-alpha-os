@@ -111,14 +111,14 @@ export function WorkbenchPage({
   return (
     <AppShell>
       <div className="evo-command-space">
-        <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="mb-2 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div className="min-w-0">
-            <h1 className="text-center text-[18px] font-black tracking-normal text-white lg:text-left">
-              <span className="font-mono">{index}</span> {title}
+            <h1 className="evo-page-title">
+              <span className="evo-page-index">{index}</span> {title}
             </h1>
-            {subtitle && <div className="mt-1 text-center text-[11px] text-text-secondary lg:text-left">{subtitle}</div>}
+            {subtitle && <div className="mt-0.5 text-[11px] text-text-secondary">{subtitle}</div>}
           </div>
-          <div className="flex flex-wrap items-center justify-center gap-2 lg:justify-end">
+          <div className="flex flex-wrap items-center gap-2 lg:justify-end">
             {dates && onDateChange && (
               <DateSelect value={date} dates={dates} onChange={onDateChange} />
             )}

@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import os
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -44,8 +47,13 @@ class WatchMember:
 class WatchEngine:
     """计算启用持续跟踪的股票池成员的盘后状态。"""
 
-    def __init__(self, db_path: str | Path | None = None):
-        self.db_path = Path(db_path) if db_path else DB_PATH
+    def __init__(
+        self, db_path: str | Path | None = None, *, rule_version: int | None = None
+    ):
+        self.db_path = Path(
+            db_path or os.getenv("EVOALPHA_DB_PATH") or os.getenv("LOCAL_DB_PATH") or DB_PATH
+        )
+        self._historical_rule_version = rule_version
 
     @staticmethod
     def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -71,8 +79,8 @@ class WatchEngine:
             if name not in columns:
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
 
-    def ensure_schema(self, conn: sqlite3.Connection) -> None:
-        """创建表，并为早期本地表安全补列。"""
+    def ensure_schema(self, conn: sqlite3.Connection, *, historical: bool = False) -> None:
+        """历史模式只准备快照表；正式模式保留原有迁移。"""
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS watch_daily_snapshot (
@@ -103,6 +111,11 @@ class WatchEngine:
                 updated_at TEXT,
                 PRIMARY KEY (trade_date, symbol)
             );
+            """
+        )
+        if not historical:
+            conn.executescript(
+                """
             CREATE TABLE IF NOT EXISTS watch_events (
                 event_id TEXT PRIMARY KEY,
                 dedupe_key TEXT NOT NULL UNIQUE,
@@ -138,7 +151,7 @@ class WatchEngine:
                 updated_at TEXT NOT NULL
             );
             """
-        )
+            )
         self._ensure_columns(
             conn,
             "watch_daily_snapshot",
@@ -168,6 +181,12 @@ class WatchEngine:
                 "updated_at": "TEXT",
             },
         )
+        if historical:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_watch_snapshot_symbol "
+                "ON watch_daily_snapshot (symbol, trade_date)"
+            )
+            return
         self._ensure_columns(
             conn,
             "watch_events",
@@ -526,17 +545,38 @@ class WatchEngine:
     ) -> int:
         if not setup_id:
             return 999
+        _, range_end = self._day_bounds(trade_date)
         row = conn.execute(
             """
             SELECT trade_date FROM watch_events
-            WHERE symbol=? AND setup_id=? AND event_type='TRIGGERED'
+            WHERE symbol=? AND setup_id=? AND event_type='TRIGGERED' AND trade_date<?
             ORDER BY trade_date DESC LIMIT 1
             """,
-            (symbol, setup_id),
+            (symbol, setup_id, range_end),
         ).fetchone()
-        if not row or not self._table_exists(conn, "stock_daily_prices"):
+        trigger_date = str(row[0])[:10] if row else None
+        if trigger_date is None and self._table_exists(conn, "watch_daily_snapshot"):
+            cursor = conn.execute(
+                "SELECT * FROM watch_daily_snapshot WHERE symbol=? AND setup_id=? "
+                "AND trade_date<? AND watch_state='TRIGGERED' AND data_status='OK' "
+                "ORDER BY trade_date LIMIT 1", (symbol, setup_id, range_end),
+            )
+            saved = cursor.fetchone()
+            if saved:
+                snapshot = dict(zip((column[0] for column in cursor.description), saved))
+                metadata = self._mapping(
+                    self._mapping(snapshot.get("factors")).get("watch_rebuild")
+                )
+                candidate = str(metadata.get("trigger_date") or "")
+                if (
+                    metadata.get("mode") == "historical"
+                    and metadata.get("output_signature") == self._snapshot_signature(snapshot)
+                    and len(candidate) == 10 and candidate <= str(snapshot["trade_date"])[:10]
+                ):
+                    trigger_date = candidate
+        if trigger_date is None or not self._table_exists(conn, "stock_daily_prices"):
             return 999
-        _, range_start = self._day_bounds(str(row[0]))
+        _, range_start = self._day_bounds(trigger_date)
         _, range_end = self._day_bounds(trade_date)
         count = conn.execute(
             """
@@ -1612,7 +1652,7 @@ class WatchEngine:
         """运行一个交易日；指定股票时只刷新成员且不改动全局数据事件。"""
         started = time.time()
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 self.ensure_schema(conn)
                 rules = load_active_rules(conn)
@@ -1697,9 +1737,768 @@ class WatchEngine:
                 "elapsed": time.time() - started,
             }
 
-    def run_daily(self, trade_date: str | None = None) -> dict[str, Any]:
-        """供每日工作流调用的稳定入口。"""
-        return self.run(trade_date)
+    @staticmethod
+    def _exact_historical_date(trade_date: str | None) -> str:
+        if not isinstance(trade_date, str) or len(trade_date) != 10:
+            raise ValueError("historical 必须指定精确交易日 YYYY-MM-DD")
+        parsed = date.fromisoformat(trade_date).isoformat()
+        if parsed != trade_date:
+            raise ValueError("historical 必须指定精确交易日 YYYY-MM-DD")
+        return parsed
+
+    def _historical_rules(self, conn: sqlite3.Connection) -> LowBuyRules:
+        """只读加载并固定版本；历史重建不初始化或激活规则。"""
+        row = None
+        version = self._historical_rule_version
+        if version is not None and (type(version) is not int or version < 1):
+            raise ValueError("历史规则版本必须是正整数")
+        has_configs = False
+        if self._table_exists(conn, "watch_rule_configs"):
+            has_configs = conn.execute("SELECT 1 FROM watch_rule_configs LIMIT 1").fetchone() is not None
+            if version is None:
+                row = conn.execute(
+                    "SELECT version, config_json FROM watch_rule_configs "
+                    "WHERE status='ACTIVE' ORDER BY version DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT version, config_json FROM watch_rule_configs WHERE version=?",
+                    (version,),
+                ).fetchone()
+        if row is None:
+            if version not in (None, 1) or has_configs:
+                raise ValueError(f"规则版本 {version} 不存在")
+            rules = LowBuyRules.from_mapping(version=1)
+        else:
+            rules = LowBuyRules.from_mapping(json.loads(row[1]), version=int(row[0]))
+        self._historical_rule_version = rules.version
+        return rules
+
+    @staticmethod
+    def _mapping(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        try:
+            parsed = json.loads(value or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _signature(value: Any) -> str:
+        encoded = json.dumps(
+            value, sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _snapshot_signature(cls, snapshot: dict[str, Any] | None) -> str | None:
+        if snapshot is None:
+            return None
+        values = {
+            key: value for key, value in snapshot.items()
+            if key not in {"created_at", "updated_at", "state"}
+        }
+        factors = dict(cls._mapping(values.get("factors")))
+        metadata = dict(cls._mapping(factors.get("watch_rebuild")))
+        metadata.pop("output_signature", None)
+        if metadata:
+            factors["watch_rebuild"] = metadata
+        values["factors"] = factors
+        return cls._signature(values)
+
+    @classmethod
+    def _legacy_value_matches(cls, actual: Any, expected: Any) -> bool:
+        if isinstance(expected, dict):
+            return isinstance(actual, dict) and all(
+                key in actual and cls._legacy_value_matches(actual[key], value)
+                for key, value in expected.items()
+            )
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            number = cls._number(actual)
+            return number is not None and math.isclose(number, expected, rel_tol=1e-9, abs_tol=1e-8)
+        if isinstance(expected, bool):
+            return isinstance(actual, bool) and actual == expected
+        return actual == expected
+
+    def _legacy_quality(self, conn: sqlite3.Connection, symbol: str, day: str) -> dict:
+        columns = self._columns(conn, "data_quality_report")
+        if not {"trade_date", "module", "market", "status"} <= columns:
+            raise ValueError("quality_missing")
+        market = (
+            "SH" if symbol.startswith("6") else "SZ" if symbol.startswith(("0", "3"))
+            else "BSE" if symbol.startswith(("4", "8", "92")) else "UNKNOWN"
+        )
+        statuses = {}
+        start, end = self._day_bounds(day)
+        order = "created_at DESC, rowid DESC" if "created_at" in columns else "rowid DESC"
+        for scope in (market, "ALL"):
+            aliases = ("BJ", "BSE") if scope == "BSE" else (scope, scope)
+            row = conn.execute(
+                "SELECT UPPER(status) FROM data_quality_report WHERE trade_date>=? "
+                "AND trade_date<? AND module='stock_daily' AND UPPER(market) IN (?, ?) "
+                f"ORDER BY {order} LIMIT 1", (start, end, *aliases),
+            ).fetchone()
+            if row:
+                statuses[scope] = row[0]
+        if market not in statuses:
+            raise ValueError("quality_missing")
+        if any(status not in {"PASS", "OK", "WARNING"} for status in statuses.values()):
+            raise ValueError("quality_failed")
+        return statuses
+
+    def _validate_historical_source(
+        self, prices: list[dict[str, Any]], lifecycle: dict[str, Any] | None, day: str,
+    ) -> None:
+        """旧种子与内存重放共用完整来源校验，不放宽历史窗口中的坏行情。"""
+        if self._data_errors(lifecycle, prices, day):
+            raise ValueError("source_or_lifecycle_incomplete")
+        if (lifecycle.get("market_state") not in {"M0", "M1", "M2", "M3", "M4"}
+                or lifecycle.get("industry_state") not in {"I0", "I1", "I2", "I3", "I4"}
+                or any(self._number(lifecycle.get(key)) is None
+                       or not 0 <= float(lifecycle[key]) <= 100
+                       for key in ("rps_50", "structure_score"))):
+            raise ValueError("lifecycle_invalid")
+        dates = [row["trade_date"] for row in prices]
+        if dates != sorted(set(dates)):
+            raise ValueError("source_duplicate_or_unordered")
+        for row in prices:
+            values = [
+                self._number(row.get(key)) for key in ("open", "high", "low", "close", "volume")
+            ]
+            if any(value is None for value in values):
+                raise ValueError("source_invalid_number")
+            opening, high, low, close, volume = values
+            if not (0 < low <= min(opening, close) <= max(opening, close) <= high and volume >= 0):
+                raise ValueError("source_invalid_ohlcv")
+
+    def _legacy_evidence(
+        self, conn: sqlite3.Connection, member: WatchMember, snapshot: dict[str, Any],
+        rules: LowBuyRules, *, price_budget: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """核验一个旧状态的当日输入；不沿其前态递归。"""
+        day = self._exact_historical_date(snapshot.get("trade_date"))
+        if (snapshot.get("data_status") != "OK" or snapshot.get("data_reason")
+                or snapshot.get("rule_version") != rules.version
+                or snapshot.get("watch_state") not in VALID_WATCH_STATES - {"UNKNOWN"}):
+            raise ValueError("status_or_rule_version")
+        quality = self._legacy_quality(conn, member.symbol, day)
+        if price_budget is not None:
+            if price_budget["remaining"] <= 0:
+                raise ValueError("price_window_budget_exhausted")
+            price_budget["remaining"] -= 1
+        prices = self._prices(conn, member.symbol, day)
+        lifecycle = self._lifecycle(conn, member.symbol, day)
+        self._validate_historical_source(prices, lifecycle, day)
+        current_factors = self._factors(prices, lifecycle, rules)
+        factors = current_factors
+        saved_factors = self._mapping(snapshot.get("factors"))
+        saved_metadata = self._mapping(saved_factors.get("watch_rebuild"))
+        if "watch_rebuild" in saved_factors and (
+            saved_metadata.get("format_version") != 1
+            or saved_metadata.get("mode") != "historical"
+            or saved_metadata.get("output_signature") != self._snapshot_signature(snapshot)
+        ):
+            raise ValueError("snapshot_signature_invalid")
+        ratio = 1.0
+        verification_prices = prices
+        window_evidence = []
+        if not self._legacy_value_matches(saved_factors, factors):
+            old_close = self._number(saved_factors.get("close"))
+            if old_close is None or old_close <= 0:
+                raise ValueError("factors_changed")
+            ratio = factors["close"] / old_close
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise ValueError("rebase_invalid_ratio")
+            # 所有价格输入一起还原，量能、无量纲因子与形态布尔值不允许放宽。
+            verification_prices = [
+                {**row, **{key: round(row[key] / ratio, 10)
+                           for key in ("open", "high", "low", "close")}}
+                for row in prices
+            ]
+            factors = self._factors(verification_prices, lifecycle, rules)
+            if not self._legacy_value_matches(saved_factors, factors):
+                raise ValueError("factors_changed")
+            by_date = {row["trade_date"]: row for row in verification_prices}
+            witnesses = conn.execute(
+                "SELECT trade_date,factors FROM watch_daily_snapshot WHERE symbol=? "
+                "AND rule_version=? AND data_status='OK' AND trade_date>=? AND trade_date<=? "
+                "ORDER BY trade_date LIMIT 121",
+                (member.symbol, rules.version, prices[0]["trade_date"], day),
+            ).fetchall()
+            for witness in witnesses:
+                old_factors = self._mapping(witness["factors"])
+                old_prices = by_date.get(witness["trade_date"])
+                if old_prices is None:
+                    raise ValueError("rebase_window_gap")
+                values = {
+                    key: old_prices[key] for key in ("open", "high", "low", "close", "volume")
+                }
+                if not self._legacy_value_matches(old_factors, values):
+                    raise ValueError("rebase_window_changed")
+                window_evidence.append({"trade_date": witness["trade_date"], **values})
+        levels = {
+            "current_price": round(factors["close"], 3),
+            "zone_high": round(factors["zone_high"], 3),
+            "zone_low": round(factors["high_60"] * (1 - (
+                rules.repair_pullback_max_pct
+                if saved_factors.get("setup_path") == "REPAIR_REVERSAL"
+                else rules.pullback_max_pct
+            ) / 100), 3),
+            "intraday_trigger_price": round(factors["intraday_trigger_price"], 3),
+        }
+        if snapshot["watch_state"] != "INVALIDATED":
+            levels["invalidation_price"] = round(factors["invalidation_price"], 3)
+        if not self._legacy_value_matches(snapshot, levels):
+            raise ValueError("price_levels_changed")
+        return {"snapshot": self._snapshot_signature(snapshot), "quality": quality,
+                "prices": prices, "lifecycle": lifecycle, "factors": factors,
+                "verification_prices": verification_prices, "current_factors": current_factors,
+                "price_rebase_ratio": ratio, "window_evidence": window_evidence}
+
+    @classmethod
+    def _legacy_rebase_snapshot(cls, snapshot: dict[str, Any], evidence: dict[str, Any]) -> dict:
+        """旧行已通过旧尺度核验；只在副本中转换有价格量纲的值。"""
+        ratio = evidence["price_rebase_ratio"]
+        result = dict(snapshot)
+        for key in ("current_price", "zone_low", "zone_high", "trigger_price",
+                    "intraday_trigger_price", "invalidation_price"):
+            if result.get(key) is not None:
+                result[key] = round(float(result[key]) * ratio, 3)
+        factors = dict(cls._mapping(result.get("factors")))
+        for key in ("open", "high", "low", "close", "prev_close", "prev_high", "ma_10",
+                    "ma_20", "ma_50", "high_60", "atr_20", "low_20", "zone_low", "zone_high",
+                    "trigger_price", "intraday_trigger_price", "invalidation_price",
+                    "first_swing_low", "second_swing_low", "macd_dif", "macd_dea",
+                    "macd_hist", "macd_hist_previous", "confirmation_trigger_price"):
+            if factors.get(key) is not None:
+                factors[key] = float(factors[key]) * ratio
+        result["factors"] = json.dumps(factors, ensure_ascii=False)
+        # 从未舍入因子生成日线价位，避免把旧三位小数的误差放大后继续传递。
+        current = evidence["current_factors"]
+        for key, factor in (("current_price", "close"), ("zone_high", "zone_high"),
+                            ("intraday_trigger_price", "intraday_trigger_price")):
+            result[key] = round(current[factor], 3)
+        if result["watch_state"] != "INVALIDATED":
+            result["invalidation_price"] = round(current["invalidation_price"], 3)
+        return result
+
+    def _legacy_seed(
+        self, conn: sqlite3.Connection, member: WatchMember, trade_date: str,
+        snapshot: dict[str, Any], rules: LowBuyRules, *, allow_warmup: bool = True,
+        price_budget: dict[str, int] | None = None,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """有界核验正式旧种子、直接前态和必要触发锚点，只返回内存副本。"""
+        if price_budget is None:
+            price_budget = {"remaining": 81}  # 为最终 target 日保留一次价格窗读取。
+        try:
+            day = self._exact_historical_date(snapshot.get("trade_date"))
+            if day >= trade_date:
+                raise ValueError("not_before_target")
+            calendar = {"trade_date", "is_open"} <= self._columns(conn, "trading_calendar")
+            previous_day = conn.execute(
+                "SELECT MAX(trade_date) FROM trading_calendar WHERE is_open=1 AND trade_date<?"
+                if calendar else
+                "SELECT MAX(trade_date) FROM stock_daily_prices WHERE symbol=? AND trade_date<?",
+                (trade_date,) if calendar else (member.symbol, trade_date),
+            ).fetchone()
+            if not previous_day or str(previous_day[0])[:10] != day:
+                raise ValueError("not_previous_trade_day")
+            evidence = self._legacy_evidence(conn, member, snapshot, rules, price_budget=price_budget)
+            cache = {day: evidence}
+            prices, lifecycle = evidence["verification_prices"], evidence["lifecycle"]
+            parent = self._previous_snapshot(conn, member.symbol, day)
+            if parent:
+                if parent["trade_date"] != prices[-2]["trade_date"]:
+                    raise ValueError("parent_gap")
+                cache[parent["trade_date"]] = self._legacy_evidence(
+                    conn, member, parent, rules, price_budget=price_budget
+                )
+            elif snapshot.get("previous_state") != "WATCHING":
+                raise ValueError("parent_missing")
+            setup_ids = {snapshot.get("setup_id"), (parent or {}).get("setup_id")} - {None, ""}
+            for saved_setup in setup_ids:
+                prefix, setup_date = str(saved_setup).rsplit(":", 1)
+                self._exact_historical_date(setup_date)
+                if prefix != member.symbol or not prices[0]["trade_date"] <= setup_date <= day:
+                    raise ValueError("setup_outside_window")
+            setup_id = (
+                parent.get("setup_id") if (parent or {}).get("watch_state") == "TRIGGERED"
+                else snapshot.get("setup_id") or (parent or {}).get("setup_id")
+            )
+            trigger_date = None
+            if (snapshot["watch_state"] == "TRIGGERED"
+                    or (parent or {}).get("watch_state") == "TRIGGERED"):
+                anchor = conn.execute(
+                    "SELECT * FROM watch_daily_snapshot WHERE symbol=? AND setup_id=? "
+                    "AND watch_state='TRIGGERED' AND previous_state='IN_ZONE' "
+                    "AND trade_date>=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1",
+                    (member.symbol, setup_id, prices[0]["trade_date"], day),
+                ).fetchone()
+                if anchor is None:
+                    raise ValueError("trigger_anchor_missing")
+                anchor = dict(anchor)
+                trigger_date = anchor["trade_date"]
+                anchor_evidence = cache.get(trigger_date)
+                if anchor_evidence is None:
+                    anchor_evidence = self._legacy_evidence(
+                        conn, member, anchor, rules, price_budget=price_budget
+                    )
+                    cache[trigger_date] = anchor_evidence
+                anchor_parent = (
+                    parent if trigger_date == day else
+                    self._previous_snapshot(conn, member.symbol, trigger_date)
+                )
+                if (not anchor_parent or anchor_parent.get("watch_state") != "IN_ZONE"
+                        or anchor_parent.get("setup_id") != setup_id
+                        or anchor_parent.get("data_status") != "OK"
+                        or anchor_parent.get("rule_version") != rules.version
+                        or anchor_parent.get("trade_date")
+                        != anchor_evidence["prices"][-2]["trade_date"]):
+                    raise ValueError("trigger_anchor_parent_invalid")
+                anchor_factors = anchor_evidence["factors"]
+                path = self._mapping(anchor["factors"]).get("setup_path")
+                confirmed, chase, threshold, _ = self._confirmed(
+                    anchor_factors, rules, setup_path=path
+                )
+                score = self._repair_setup_score(anchor_factors, rules)
+                if path == "REPAIR_REVERSAL":
+                    blockers = {"disabled", "market", "industry", "ma50", "stop", "anchor"}
+                    quality = (
+                        rules.repair_path_enabled
+                        and not blockers.intersection(score["blocked_by"])
+                        and score["total"] >= max(rules.repair_setup_score_min - 15, 0)
+                    )
+                else:
+                    quality = (
+                        (anchor_factors["rps_50"] or 0) >= rules.rps50_min
+                        and (anchor_factors["structure_score"] or 0) >= rules.structure_score_min
+                    )
+                anchor_age = self._trade_days_since_setup(conn, setup_id, trigger_date)
+                if (not confirmed or chase or not 0 < anchor_age <= rules.setup_valid_days
+                        or not self._confirmation_quality_ok(path, quality, score, rules)):
+                    raise ValueError("trigger_anchor_invalid")
+                if not self._legacy_value_matches(
+                    anchor.get("trigger_price"), round(threshold, 3)
+                ):
+                    raise ValueError("trigger_anchor_invalid")
+                # 通知可能被盘中报价更新；仅同日、同转折且价位一致的日线事件可作旁证。
+                if self._table_exists(conn, "watch_events"):
+                    start, end = self._day_bounds(trigger_date)
+                    event = conn.execute(
+                        "SELECT payload FROM watch_events WHERE symbol=? AND setup_id=? "
+                        "AND event_type='TRIGGERED' AND dedupe_key LIKE 'state:%' "
+                        "AND from_state='IN_ZONE' AND to_state='TRIGGERED' "
+                        "AND trade_date>=? AND trade_date<? "
+                        "ORDER BY trade_date DESC, event_id DESC LIMIT 1",
+                        (member.symbol, setup_id, start, end),
+                    ).fetchone()
+                    payload = self._mapping(event[0]) if event else {}
+                    anchor_evidence["daily_event_corroborated"] = bool(payload) and (
+                        payload.get("source") != "intraday_5min" and all(
+                            key in payload and self._legacy_value_matches(payload[key], anchor[key])
+                            for key in ("current_price", "trigger_price", "invalidation_price")
+                        )
+                    )
+            cooldown = self._trade_days_since_setup(
+                conn, f"trigger:{trigger_date}" if trigger_date else None, day
+            )
+            replay = self._evaluate(
+                conn, member, day, lifecycle, prices, parent, rules,
+                cooldown_days_override=cooldown,
+                setup_age_days_override=self._trade_days_since_setup(
+                    conn, (parent or {}).get("setup_id"), day
+                ),
+            )
+            keys = ("watch_state", "previous_state", "setup_id", "current_price", "zone_low",
+                    "zone_high", "trigger_price", "intraday_trigger_price", "invalidation_price",
+                    "distance_to_trigger_pct")
+            if not self._legacy_value_matches(snapshot, {key: replay[key] for key in keys}):
+                raise ValueError("state_replay_mismatch")
+            if not self._legacy_value_matches(
+                self._mapping(snapshot["factors"]), self._mapping(replay["factors"])
+            ):
+                raise ValueError("state_factors_changed")
+            seed = dict(snapshot)
+            ratio = evidence["price_rebase_ratio"]
+            if any(not self._legacy_value_matches(item["price_rebase_ratio"], ratio)
+                   for item in cache.values()):
+                raise ValueError("rebase_ratio_conflict")
+            if ratio != 1.0:
+                rebased_parent = (
+                    self._legacy_rebase_snapshot(parent, cache[parent["trade_date"]])
+                    if parent else None
+                )
+                if rebased_parent and parent["watch_state"] == "TRIGGERED":
+                    new_anchor_factors = cache[trigger_date]["current_factors"]
+                    _, _, threshold, _ = self._confirmed(
+                        new_anchor_factors, rules,
+                        setup_path=self._mapping(anchor["factors"]).get("setup_path"),
+                    )
+                    rebased_parent["trigger_price"] = round(threshold, 3)
+                rebased = self._evaluate(
+                    conn, member, day, lifecycle, evidence["prices"], rebased_parent, rules,
+                    cooldown_days_override=cooldown,
+                    setup_age_days_override=self._trade_days_since_setup(
+                        conn, (parent or {}).get("setup_id"), day
+                    ),
+                )
+                expected = self._legacy_rebase_snapshot(snapshot, evidence)
+                if (not self._legacy_value_matches(
+                        expected, {key: rebased[key] for key in keys[:3]})
+                        or not self._legacy_value_matches(
+                            self._mapping(expected["factors"]), self._mapping(rebased["factors"])
+                        )):
+                    raise ValueError("rebase_state_changed")
+                for key in keys[3:]:
+                    actual, value = expected.get(key), rebased.get(key)
+                    tolerance = 0.011 if key == "distance_to_trigger_pct" else 0.00051 * (1 + ratio)
+                    if actual != value and (
+                        self._number(actual) is None or self._number(value) is None
+                        or not math.isclose(float(actual), float(value), rel_tol=0, abs_tol=tolerance)
+                    ):
+                        raise ValueError("rebase_price_changed")
+                seed = {**snapshot, **{key: rebased[key] for key in keys},
+                        "factors": rebased["factors"]}
+            factors = dict(self._mapping(seed["factors"]))
+            factors["watch_rebuild"] = {
+                "format_version": 1, "mode": "legacy_verified", "trade_date": day,
+                "rule_version": rules.version,
+                "price_rebase_ratio": ratio,
+                "trigger_date": trigger_date if seed["watch_state"] == "TRIGGERED" else None,
+                "input_signature": self._signature({"evidence": cache, "rules": rules.to_dict(),
+                                                     "rule_version": rules.version}),
+            }
+            source_metadata = self._mapping(self._mapping(snapshot["factors"]).get("watch_rebuild"))
+            if source_metadata:
+                factors["watch_rebuild"]["source_output_signature"] = source_metadata["output_signature"]
+            seed["factors"] = json.dumps(factors, ensure_ascii=False)
+            return seed, []
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            if allow_warmup and str(exc) in {
+                "factors_changed", "state_factors_changed", "state_replay_mismatch",
+                "rebase_window_changed", "rebase_ratio_conflict", "rebase_state_changed",
+                "rebase_price_changed",
+            }:
+                return self._historical_warmup(
+                    conn, member, trade_date, rules, str(exc), price_budget
+                )
+            return None, [f"legacy_seed_untrusted:{exc}"]
+
+    def _historical_inputs(
+        self, conn: sqlite3.Connection, member: WatchMember, trade_date: str,
+        rules: LowBuyRules, previous: dict[str, Any] | None, *,
+        price_budget: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        if price_budget is not None:
+            if price_budget["remaining"] <= 0:
+                raise ValueError("price_window_budget_exhausted")
+            price_budget["remaining"] -= 1
+        previous_metadata = self._mapping(
+            self._mapping((previous or {}).get("factors")).get("watch_rebuild")
+        )
+        trigger_date = None
+        if (previous or {}).get("watch_state") == "TRIGGERED":
+            trigger_date = self._exact_historical_date(previous_metadata.get("trigger_date"))
+            if trigger_date > str(previous["trade_date"]):
+                raise ValueError("历史冷却起点晚于前态日期")
+        setup_id = (previous or {}).get("setup_id")
+        return {
+            "format_version": 1,
+            "trade_date": trade_date,
+            "rule_version": rules.version,
+            "member": asdict(member),
+            "rules": rules.to_dict(),
+            "prices": self._prices(conn, member.symbol, trade_date),
+            "lifecycle": self._lifecycle(conn, member.symbol, trade_date),
+            "previous_signature": self._snapshot_signature(previous),
+            "previous_trade_date": (previous or {}).get("trade_date"),
+            "cooldown_trigger_date": trigger_date,
+            "cooldown_days": self._trade_days_since_setup(
+                conn, f"trigger:{trigger_date}" if trigger_date else None, trade_date
+            ),
+            "setup_age_days": (
+                self._trade_days_since_setup(conn, setup_id, trade_date)
+                if (previous or {}).get("watch_state") == "IN_ZONE" else 999
+            ),
+        }
+
+    def _historical_warmup(
+        self, conn: sqlite3.Connection, member: WatchMember, trade_date: str,
+        rules: LowBuyRules, reason: str, price_budget: dict[str, int],
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """最多一个短交易日窗口；候选禁止再次 warmup，所有重放仅存于内存。"""
+        day = trade_date
+        try:
+            limit = min(82, rules.setup_valid_days + rules.cooldown_trade_days + 2)
+            calendar = {"trade_date", "is_open"} <= self._columns(conn, "trading_calendar")
+            rows = conn.execute(
+                "SELECT DISTINCT trade_date FROM trading_calendar WHERE is_open=1 AND trade_date<? "
+                "ORDER BY trade_date DESC LIMIT ?" if calendar else
+                "SELECT DISTINCT substr(trade_date,1,10) FROM stock_daily_prices "
+                "WHERE symbol=? AND trade_date<? ORDER BY trade_date DESC LIMIT ?",
+                (trade_date, limit) if calendar else (member.symbol, trade_date, limit),
+            ).fetchall()
+            days = [self._exact_historical_date(str(row[0])[:10]) for row in reversed(rows)]
+            if not days or days != sorted(set(days)):
+                raise ValueError("trading_days_missing")
+            seed = None
+            for index in range(len(days) - 2, -1, -1):
+                day = days[index]
+                row = conn.execute(
+                    "SELECT * FROM watch_daily_snapshot WHERE symbol=? AND trade_date=?",
+                    (member.symbol, day),
+                ).fetchone()
+                if row is None:
+                    continue
+                candidate, errors = self._legacy_seed(
+                    conn, member, days[index + 1], dict(row), rules, allow_warmup=False,
+                    price_budget=price_budget,
+                )
+                if not errors:
+                    seed = candidate
+                    replay_days = days[index + 1:]
+                    break
+                if price_budget["remaining"] <= 0:
+                    raise ValueError("price_window_budget_exhausted")
+            if seed is None:
+                raise ValueError("no_verified_seed")
+            provenance = {
+                "source": "current_historical_inputs", "reason": reason,
+                "seed_date": seed["trade_date"], "seed_signature": self._snapshot_signature(seed),
+                "start_date": replay_days[0], "trade_day_limit": limit,
+                "input_signature": self._signature({"seed": self._snapshot_signature(seed)}),
+            }
+            previous = seed
+            for step, day in enumerate(replay_days, 1):
+                quality = self._legacy_quality(conn, member.symbol, day)
+                inputs = self._historical_inputs(
+                    conn, member, day, rules, previous, price_budget=price_budget
+                )
+                self._validate_historical_source(inputs["prices"], inputs["lifecycle"], day)
+                snapshot = self._evaluate(
+                    conn, member, day, inputs["lifecycle"], inputs["prices"], previous, rules,
+                    cooldown_days_override=inputs["cooldown_days"],
+                    setup_age_days_override=inputs["setup_age_days"],
+                )
+                trigger_date = None
+                if snapshot["watch_state"] == "TRIGGERED":
+                    trigger_date = inputs["cooldown_trigger_date"] or day
+                signature = self._signature(inputs)
+                provenance = {
+                    **provenance, "end_date": day, "steps": step,
+                    "input_signature": self._signature({
+                        "previous": provenance["input_signature"], "day": day,
+                        "inputs": signature, "quality": quality,
+                    }),
+                }
+                factors = self._mapping(snapshot["factors"])
+                metadata = {
+                    "format_version": 1, "mode": "warmup_verified", "rule_version": rules.version,
+                    "previous_trade_date": previous["trade_date"], "trigger_date": trigger_date,
+                    "input_signature": signature, "warmup": provenance,
+                }
+                factors["watch_rebuild"] = metadata
+                snapshot["factors"] = json.dumps(factors, ensure_ascii=False)
+                metadata["output_signature"] = self._snapshot_signature(snapshot)
+                snapshot["factors"] = json.dumps(factors, ensure_ascii=False)
+                previous = snapshot
+                del inputs
+            return previous, []
+        except (ValueError, TypeError, KeyError, IndexError, sqlite3.Error) as exc:
+            return None, [f"legacy_warmup_untrusted:{day}:{exc}"]
+
+    def _historical_matches(
+        self, conn: sqlite3.Connection, member: WatchMember, snapshot: dict[str, Any],
+        rules: LowBuyRules, *,
+        previous_context: tuple[dict[str, Any] | None, list[str]] | None = None,
+        price_budget: dict[str, int] | None = None,
+    ) -> bool:
+        """验证本格与直接前态，不递归读取全市场历史。"""
+        metadata = self._mapping(self._mapping(snapshot.get("factors")).get("watch_rebuild"))
+        if (
+            metadata.get("format_version") != 1 or metadata.get("mode") != "historical"
+            or snapshot.get("rule_version") != rules.version
+            or snapshot.get("data_status") != "OK"
+            or snapshot.get("watch_state") not in VALID_WATCH_STATES - {"UNKNOWN"}
+            or metadata.get("output_signature") != self._snapshot_signature(snapshot)
+        ):
+            return False
+        previous, errors = (
+            previous_context if previous_context is not None else self._historical_previous(
+                conn, member, snapshot["trade_date"], rules, verify_signed=False,
+                price_budget=price_budget,
+            )
+        )
+        if errors:
+            return False
+        inputs = self._historical_inputs(
+            conn, member, snapshot["trade_date"], rules, previous, price_budget=price_budget
+        )
+        return (
+            not self._data_errors(inputs["lifecycle"], inputs["prices"], snapshot["trade_date"])
+            and metadata.get("input_signature") == self._signature(inputs)
+        )
+
+    def _historical_previous(
+        self, conn: sqlite3.Connection, member: WatchMember, trade_date: str,
+        rules: LowBuyRules, *, verify_signed: bool = True,
+        price_budget: dict[str, int] | None = None,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        if price_budget is None:
+            price_budget = {"remaining": 81}
+        previous = self._previous_snapshot(conn, member.symbol, trade_date)
+        if previous is None:
+            return None, []
+        metadata = self._mapping(self._mapping(previous.get("factors")).get("watch_rebuild"))
+        if not metadata:
+            return self._legacy_seed(
+                conn, member, trade_date, previous, rules, price_budget=price_budget
+            )
+        if (metadata.get("format_version") != 1 or metadata.get("mode") != "historical"
+                or previous.get("data_status") != "OK"
+                or previous.get("watch_state") not in VALID_WATCH_STATES - {"UNKNOWN"}
+                or previous.get("rule_version") != rules.version
+                or metadata.get("output_signature") != self._snapshot_signature(previous)):
+            return None, ["previous_snapshot_untrusted"]
+        try:
+            matches = not verify_signed or self._historical_matches(
+                conn, member, previous, rules, price_budget=price_budget
+            )
+        except ValueError as exc:
+            return None, [f"legacy_warmup_untrusted:{trade_date}:{exc}"]
+        if not matches:
+            seed, errors = self._legacy_seed(
+                conn, member, trade_date, previous, rules, price_budget=price_budget
+            )
+            rebased = self._mapping(self._mapping((seed or {}).get("factors")).get("watch_rebuild"))
+            if errors and any(error.startswith("legacy_warmup_untrusted:") for error in errors):
+                return None, errors
+            if errors or self._legacy_value_matches(rebased.get("price_rebase_ratio"), 1.0):
+                return None, ["previous_snapshot_untrusted"]
+            return seed, []
+        return previous, []
+
+    def check_historical_snapshots(self, trade_date: str) -> dict[str, Any]:
+        """只读检查目标日监控池覆盖及输入签名；旧覆盖一律需要重算。"""
+        result: dict[str, Any] = {"trusted": False, "trade_date": trade_date, "pending": []}
+        try:
+            output_date = self._exact_historical_date(trade_date)
+            with closing(sqlite3.connect(
+                self.db_path.resolve().as_uri() + "?mode=ro", uri=True
+            )) as conn, conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN")
+                rules = self._historical_rules(conn)
+                members = self._monitored_members(conn)
+                result.update(records=len(members), rule_version=rules.version)
+                exists = self._table_exists(conn, "watch_daily_snapshot")
+                for member in members:
+                    row = conn.execute(
+                        "SELECT * FROM watch_daily_snapshot WHERE trade_date=? AND symbol=?",
+                        (output_date, member.symbol),
+                    ).fetchone() if exists else None
+                    reason = "snapshot_missing" if row is None else "snapshot_untrusted"
+                    if row is not None:
+                        context = self._historical_previous(conn, member, output_date, rules)
+                        if not context[1] and self._historical_matches(
+                            conn, member, dict(row), rules, previous_context=context
+                        ):
+                            continue
+                        if context[1]:
+                            reason = context[1][0]
+                    result["pending"].append({"symbol": member.symbol, "reason": reason})
+                result["trusted"] = bool(members) and not result["pending"]
+            return result
+        except (sqlite3.Error, TypeError, ValueError, KeyError) as exc:
+            return {**result, "error": str(exc)}
+
+    def _run_historical(self, trade_date: str | None) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            output_date = self._exact_historical_date(trade_date)
+            with closing(sqlite3.connect(
+                self.db_path.resolve().as_uri() + "?mode=rw", uri=True
+            )) as conn, conn:
+                conn.row_factory = sqlite3.Row
+                rules = self._historical_rules(conn)
+                self.ensure_schema(conn, historical=True)
+                conn.execute("BEGIN IMMEDIATE")
+                # 拒绝触发器或未来维护代码越界写正式事件、通知、池及持仓。
+                conn.set_authorizer(
+                    lambda action, table, column, database, trigger: (
+                        sqlite3.SQLITE_DENY
+                        if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE,
+                                      sqlite3.SQLITE_DELETE}
+                        and (table != "watch_daily_snapshot" or trigger is not None)
+                        else sqlite3.SQLITE_OK
+                    )
+                )
+                members = self._monitored_members(conn)
+                blocked: set[str] = set()
+                for member in members:
+                    previous, previous_errors = self._historical_previous(
+                        conn, member, output_date, rules
+                    )
+                    inputs = self._historical_inputs(conn, member, output_date, rules, previous)
+                    lifecycle, prices = inputs["lifecycle"], inputs["prices"]
+                    errors = self._data_errors(lifecycle, prices, output_date) + previous_errors
+                    if errors:
+                        snapshot = self._unknown_snapshot(
+                            member, output_date, lifecycle, prices, previous, errors, rules.version
+                        )
+                        blocked.update(errors)
+                    else:
+                        snapshot = self._evaluate(
+                            conn, member, output_date, lifecycle, prices, previous, rules,
+                            cooldown_days_override=inputs["cooldown_days"],
+                            setup_age_days_override=inputs["setup_age_days"],
+                        )
+                    trigger_date = inputs["cooldown_trigger_date"]
+                    if snapshot["watch_state"] == "TRIGGERED" and trigger_date is None:
+                        trigger_date = output_date
+                    factors = dict(self._mapping(snapshot["factors"]))
+                    factors["watch_rebuild"] = {
+                        "format_version": 1, "mode": "historical",
+                        "rule_version": rules.version,
+                        "previous_trade_date": inputs["previous_trade_date"],
+                        "trigger_date": trigger_date,
+                        "input_signature": self._signature(inputs),
+                    }
+                    previous_metadata = self._mapping(
+                        self._mapping((previous or {}).get("factors")).get("watch_rebuild")
+                    )
+                    legacy_seed = (
+                        previous_metadata if previous_metadata.get("mode") == "legacy_verified"
+                        else previous_metadata.get("legacy_seed")
+                    )
+                    if legacy_seed:
+                        factors["watch_rebuild"]["legacy_seed"] = legacy_seed
+                    if previous_metadata.get("warmup"):
+                        factors["watch_rebuild"]["warmup"] = previous_metadata["warmup"]
+                    snapshot["factors"] = json.dumps(factors, ensure_ascii=False)
+                    factors["watch_rebuild"]["output_signature"] = self._snapshot_signature(snapshot)
+                    snapshot["factors"] = json.dumps(factors, ensure_ascii=False)
+                    self._save_snapshot(conn, snapshot)
+                conn.commit()
+            return {
+                "success": bool(members) and not blocked, "historical": True,
+                "trade_date": output_date, "records": len(members), "events": 0,
+                "rule_version": rules.version, "blocked_reasons": sorted(blocked),
+                "elapsed": time.monotonic() - started,
+            }
+        except Exception as exc:
+            logger.exception("Watch 历史重建失败")
+            return {
+                "success": False, "historical": True, "error": str(exc),
+                "records": 0, "events": 0, "elapsed": time.monotonic() - started,
+            }
+
+    def run_daily(
+        self, trade_date: str | None = None, *, historical: bool = False
+    ) -> dict[str, Any]:
+        """历史模式仅重建精确日期快照，数据阻断返回失败。"""
+        return self._run_historical(trade_date) if historical else self.run(trade_date)
 
 
 def main() -> int:
@@ -1709,8 +2508,14 @@ def main() -> int:
         "--trade-date", help="指定交易日 YYYY-MM-DD；默认取最新日线日期"
     )
     parser.add_argument("--db-path", help="SQLite 数据库路径；默认使用本地量化库")
+    parser.add_argument("--historical", action="store_true", help="只重建指定日快照，不产生通知")
+    parser.add_argument("--rule-version", type=int, help="固定历史重建规则版本")
     args = parser.parse_args()
-    result = WatchEngine(args.db_path).run_daily(args.trade_date)
+    if args.rule_version is not None and not args.historical:
+        parser.error("--rule-version 仅用于 --historical")
+    result = WatchEngine(args.db_path, rule_version=args.rule_version).run_daily(
+        args.trade_date, historical=args.historical
+    )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("success") else 1
 

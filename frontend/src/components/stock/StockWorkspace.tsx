@@ -44,6 +44,7 @@ import StockChart from '@/components/stock/StockChart';
 import DailyHintsPanel, { type DailyHintsContext } from '@/components/stock/DailyHintsPanel';
 import type { DailyHintSignal } from '@/lib/dailyHints';
 import StockPerformanceChart from '@/components/stock/StockPerformanceChart';
+import { StockResearchPanel } from '@/components/research/StockResearchPanel';
 import WatchRuleScannerPanel from '@/components/stock/WatchRuleScannerPanel';
 import { setupPathCode } from '@/components/stock/watchRulePresentation';
 import { nextStockIndex } from '@/components/stock/stockTableNavigation';
@@ -227,7 +228,7 @@ const enrichmentTabs: Array<{ id: EnrichmentTab; label: string }> = [
 ];
 
 const enrichmentRefreshModules: Record<EnrichmentTab, string[]> = {
-  profile: ['profile', 'finance', 'concepts', 'research'],
+  profile: ['profile', 'finance', 'concepts'],
   finance: ['finance_summary'],
   f10: ['f10'],
   announcements: ['announcements'],
@@ -245,7 +246,7 @@ const enrichmentRefreshActions: Record<EnrichmentTab, string> = {
 };
 
 const enrichmentRefreshTitles: Record<EnrichmentTab, string> = {
-  profile: '同步当前股票基本资料',
+  profile: '同步基本资料、财务快照和概念；研报使用独立索引',
   finance: '更新并补齐当前股票业绩数据',
   f10: '同步当前股票F10资料',
   announcements: '同步当前股票公告',
@@ -555,43 +556,6 @@ function RpsStrip({
   );
 }
 
-function ResearchLinkList({
-  stockReports,
-  industryReports,
-}: {
-  stockReports: Row[];
-  industryReports: Row[];
-}) {
-  const reports = [...stockReports.slice(0, 2), ...industryReports.slice(0, 2)];
-  if (!reports.length) {
-    return <span className="text-[10px] text-text-tertiary">研报暂无缓存</span>;
-  }
-  return (
-    <div className="flex min-w-0 flex-wrap gap-1">
-      {reports.slice(0, 3).map((report, index) => {
-        const url = text(report.pdf_url || report.url, '');
-        const label = stockReports.includes(report) ? `研报${index + 1}` : `行业${index + 1}`;
-        return url ? (
-          <a
-            key={`${text(report.report_id)}-${index}`}
-            href={url}
-            target="_blank"
-            rel="noreferrer"
-            className="rounded border border-brand-blue/30 bg-brand-blue/10 px-1.5 py-0.5 text-[10px] font-bold text-brand-blue-light hover:border-brand-blue-light"
-            title={text(report.title, label)}
-          >
-            {label}
-          </a>
-        ) : (
-          <span key={`${text(report.report_id)}-${index}`} className="rounded border border-border-secondary px-1.5 py-0.5 text-[10px] text-text-secondary">
-            {label}
-          </span>
-        );
-      })}
-    </div>
-  );
-}
-
 function QuickLinks({ symbol, name }: { symbol: string; name: string }) {
   const queries = [
     ['超预期', `${symbol} ${name} 超预期`],
@@ -825,6 +789,7 @@ export function StockPoolAddMenu({
 export function StockEnrichmentPanel({
   symbol,
   selectedDate,
+  forceResearchAsOf = false,
   hidden = false,
   compact = false,
   onHiddenChange,
@@ -832,6 +797,7 @@ export function StockEnrichmentPanel({
 }: {
   symbol: string;
   selectedDate: string;
+  forceResearchAsOf?: boolean;
   hidden?: boolean;
   compact?: boolean;
   onHiddenChange?: (hidden: boolean) => void;
@@ -983,9 +949,6 @@ export function StockEnrichmentPanel({
   const snapshot = asRow(finance.snapshot);
   const reports = textRows(finance.reports);
   const financeSummary = textRows(finance.summary);
-  const research = asRow(payload.research);
-  const stockReports = textRows(research.stock_reports);
-  const industryReports = textRows(research.industry_reports);
   const f10Sections = textRows(payload.f10_sections);
   const announcements = textRows(payload.announcements);
   const funds = asRow(payload.funds);
@@ -1249,10 +1212,7 @@ export function StockEnrichmentPanel({
 
             <div className="rounded-md border border-border-secondary/60 bg-bg-primary/35 p-2">
               <div className="grid gap-1.5">
-                <div className="grid grid-cols-[54px_minmax(0,1fr)] items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-text-tertiary">研报</span>
-                  <ResearchLinkList stockReports={stockReports} industryReports={industryReports} />
-                </div>
+                <StockResearchPanel symbol={symbol} asOfDate={selectedDate} forceAsOf={forceResearchAsOf} />
                 <div className="grid grid-cols-[54px_minmax(0,1fr)] items-start gap-1.5">
                   <span className="pt-0.5 text-[10px] font-bold text-text-tertiary">问财</span>
                   <QuickLinks symbol={symbol} name={displayName} />
@@ -1428,6 +1388,7 @@ function EmptySelection() {
 export function StockDetailPanel({
   symbol,
   selectedDate,
+  forceResearchAsOf = false,
   showDetailLink = false,
   onSelectSymbol,
   unifiedHints,
@@ -1436,6 +1397,7 @@ export function StockDetailPanel({
 }: {
   symbol: string;
   selectedDate: string;
+  forceResearchAsOf?: boolean;
   showDetailLink?: boolean;
   onSelectSymbol?: (symbol: string) => void;
   unifiedHints?: DailyHintsContext;
@@ -1642,7 +1604,7 @@ export function StockDetailPanel({
           </div>
           {assistantOpen && <div className="min-h-0 flex-1"><MrgcDailyReportPanel date={selectedDate} currentSymbol={symbol} onSelectSymbol={onSelectSymbol} allowGroupFilter={Boolean(sidebarScopeKey && sidebarScopeKey !== '__single__')} unifiedHints={unifiedHints} expectUnifiedHints={Boolean(dailyHintsPanel)} onReturnHints={dailyHintsPanel ? () => setSidebarUi({ tab: 'hints', infoHidden: false }) : undefined} /></div>}
           {!analysisOpen && <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-            <StockEnrichmentPanel symbol={symbol} selectedDate={selectedDate} hidden={false} compact={showDetailLink} className="min-h-0 flex-1" />
+            <StockEnrichmentPanel symbol={symbol} selectedDate={selectedDate} forceResearchAsOf={forceResearchAsOf} hidden={false} compact={showDetailLink} className="min-h-0 flex-1" />
           </div>}
           {dailyHintsPanel && <div ref={hintsScroll.ref} onScroll={hintsScroll.onScroll} data-sidebar-scroll hidden={!hintsOpen} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain custom-scrollbar">{dailyHintsPanel}</div>}
           </div>
@@ -2603,8 +2565,8 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
           {sidebarCollapsed ? <ChevronRight size={14} className="mx-auto" /> : <ChevronLeft size={14} className="mx-auto" />}
         </button>
         <div className="min-w-0">
-          <h1 className="truncate text-[14px] font-black text-white">
-            Watchlist <span className="text-text-tertiary">自选股</span>
+          <h1 className="evo-page-title truncate">
+            <span className="evo-page-index">06</span> Watchlist <span className="text-text-tertiary">自选股</span>
           </h1>
           <div className="truncate text-[10px] text-text-secondary">
             {text(selectedPool?.name, '未选择')}
@@ -2727,16 +2689,16 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
   );
 }
 
-export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymbol, onContext, coverageStatus = '' }: {
+export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymbol, onContext, coverageStatus = '', summaryOnly = false }: {
   date: string; poolId: string; poolName: string; members: { symbol: string; name?: string }[];
-  onSelectSymbol: (symbol: string) => void; onContext: (context: DailyHintsContext) => void; coverageStatus?: string;
+  onSelectSymbol: (symbol: string) => void; onContext: (context: DailyHintsContext) => void; coverageStatus?: string; summaryOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const requestPoolId = ['__single__', '__all_watchlist__'].includes(poolId) ? undefined : poolId;
   const watchSummaryQuery = useQuery({
     queryKey: ['watchSummary', date, poolId],
     queryFn: () => watchApi.getSummary({ tradeDate: date, poolId: requestPoolId }),
-    enabled: Boolean(date && poolId) && poolId !== REPORT_LINKED_POOL_ID,
+    enabled: !summaryOnly && Boolean(date && poolId) && poolId !== REPORT_LINKED_POOL_ID,
     staleTime: 30_000,
   });
   const watchSnapshotsQuery = useQuery({
@@ -2827,7 +2789,7 @@ export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymb
   const scopedEvents = watchEvents.filter((event) => !event.symbol || memberSymbols.has(event.symbol));
   return <DailyHintsPanel date={date} poolId={poolId} poolName={poolName} members={members}
     watchSignals={watchHintSignals.filter((signal) => memberSymbols.has(signal.symbol))}
-    onSelectSymbol={onSelectSymbol} onContext={onContext}
+    onSelectSymbol={onSelectSymbol} onContext={onContext} summaryOnly={summaryOnly}
     watchStatus={coverageStatus || (watchSnapshotsQuery.isError ? '低吸状态读取失败' : watchSnapshotsQuery.isLoading ? '低吸状态读取中'
       : !scopedSnapshots.length ? '低吸所选日期暂无状态' : scopedEvents.some((event) => !event.symbol && event.trade_date === date && !['resolved', 'acknowledged'].includes(text(event.status, '').toLowerCase()) && !event.resolved_at && normalizedWatchEventType(event) === 'DATA_BLOCKED') ? '存在系统数据阻断，请查看历史提醒' : '')}
     legacyActions={<TodayActionBox compact scopeKey={poolId} tradeDate={date} poolName={poolId === '__single__' ? `${poolName} · 含系统提醒` : poolName}
@@ -2841,9 +2803,9 @@ export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymb
 }
 
 /** All real Watchlist pools share one deduplicated opportunity scope. */
-export function AllWatchlistDailyHints({ date, onSelectSymbol, onContext }: {
+export function AllWatchlistDailyHints({ date, onSelectSymbol, onContext, summaryOnly = false }: {
   date: string; onSelectSymbol: (symbol: string) => void;
-  onContext: (context: DailyHintsContext) => void;
+  onContext: (context: DailyHintsContext) => void; summaryOnly?: boolean;
 }) {
   const poolsQuery = useQuery({ queryKey: ['stockPools', date],
     queryFn: () => stockApi.getPools(date), enabled: Boolean(date), staleTime: 30_000 });
@@ -2871,6 +2833,6 @@ export function AllWatchlistDailyHints({ date, onSelectSymbol, onContext }: {
     if (!pending) onContext(context);
   }, [pending, onContext]);
   return <SharedDailyHints date={date} poolId="__all_watchlist__" poolName="Watchlist全部"
-    members={Array.from(bySymbol.values())} coverageStatus={coverageStatus}
+    members={Array.from(bySymbol.values())} coverageStatus={coverageStatus} summaryOnly={summaryOnly}
     onSelectSymbol={onSelectSymbol} onContext={forwardContext} />;
 }

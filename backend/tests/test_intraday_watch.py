@@ -769,7 +769,7 @@ def test_connection_blocks_recover_only_after_each_failed_symbol_has_valid_bar(
         ("2026-07-10", "600519", "IN_ZONE", 100.0, 92.0, "setup-1", 98.0, "manual"),
     ]
     _create_db(db_path, snapshots)
-    monkeypatch.setattr(intraday_module, "get_tdx_adapter", lambda: None)
+    monkeypatch.setattr(intraday_module, "get_mootdx_adapter", lambda: None)
     adapter = FakeAdapter(error=ConnectionError("offline"))
     monitor = IntradayWatchMonitor(
         db_path=db_path, adapter=adapter if reason == "tdx_request_failed" else None
@@ -1076,3 +1076,43 @@ def test_run_until_close_polls_each_completed_five_minute_bar_once(tmp_path):
 
     assert result["runs"] == 2
     assert [item.strftime("%H:%M:%S") for item in polled] == ["10:01:00", "10:05:30"]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_poll_closes_actual_adapter_even_on_error(monkeypatch, failure):
+    """No quote socket may survive the five-minute sleep between polls."""
+    from unittest.mock import Mock
+
+    adapter = Mock()
+    monitor = IntradayWatchMonitor()
+
+    def poll(now):
+        monitor._poll_adapter = adapter
+        if failure:
+            raise RuntimeError("poll failed")
+        return {"triggered": 0, "blocked": 0}
+
+    monkeypatch.setattr(monitor, "_run_once", poll)
+    if failure:
+        with pytest.raises(RuntimeError, match="poll failed"):
+            monitor.run_once()
+    else:
+        assert monitor.run_once()["blocked"] == 0
+    adapter.disconnect.assert_called_once()
+    assert monitor._poll_adapter is None
+
+
+def test_poll_disconnect_failure_does_not_hide_result(monkeypatch):
+    from unittest.mock import Mock
+
+    adapter = Mock()
+    adapter.disconnect.side_effect = OSError("already closed")
+    monitor = IntradayWatchMonitor()
+
+    def poll(now):
+        monitor._poll_adapter = adapter
+        return {"triggered": 0, "blocked": 0}
+
+    monkeypatch.setattr(monitor, "_run_once", poll)
+    assert monitor.run_once()["blocked"] == 0
+    assert monitor._poll_adapter is None

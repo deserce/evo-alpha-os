@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { parseStockDetailDate } from '@/lib/mrgcReportSelection';
+import { stockDetailReturn } from '@/lib/stockDetailReturn';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft } from 'lucide-react';
@@ -15,7 +16,7 @@ export default function StockDetailView({ symbol }: { symbol: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const source = searchParams.get('returnTo');
-  const returnTo = source === '/a/strategy' ? '/a/strategy' : '/a/watchlist';
+  const returnTo = stockDetailReturn(source);
   const { globalDate, setGlobalDate, setSelectedStock } = useGlobalStore();
   useEffect(() => {
     setSelectedStock(symbol);
@@ -34,6 +35,14 @@ export default function StockDetailView({ symbol }: { symbol: string }) {
   }, [setGlobalDate]);
 
   const datesQuery = useQuery({ queryKey: ['quantDates'], queryFn: () => quantApi.getDates(160) });
+  const appliedLatestResearch = useRef(false);
+  const latestTradeDate = datesQuery.data?.latest;
+  useEffect(() => {
+    if (appliedLatestResearch.current || !returnTo.startsWith('/a/research')
+      || searchParams.get('trade_date') || !latestTradeDate) return;
+    appliedLatestResearch.current = true;
+    setGlobalDate(latestTradeDate);
+  }, [returnTo, searchParams, latestTradeDate, setGlobalDate]);
   const dates = rows<string>(datesQuery.data?.dates);
   const selectedDate = globalDate || datesQuery.data?.latest || '';
   const dateOptions = selectedDate && !dates.includes(selectedDate) ? [selectedDate, ...dates] : dates;
@@ -57,7 +66,7 @@ export default function StockDetailView({ symbol }: { symbol: string }) {
           返回
         </button>
         <div className="min-w-0">
-          <h1 className="truncate text-[14px] font-black text-white">
+          <h1 className="evo-page-title truncate">
             个股详情 <span className="font-mono text-text-tertiary">{symbol}</span>
           </h1>
         </div>
@@ -78,7 +87,7 @@ export default function StockDetailView({ symbol }: { symbol: string }) {
 
       {/* 主内容区 - 纯个股详情面板 */}
       <main className="min-h-0 flex-1 overflow-hidden p-2">
-        <StockDetailPanel symbol={symbol} selectedDate={selectedDate} onSelectSymbol={selectSymbol} dailyHintsPanel={dailyHintsPanel} sidebarScopeKey="__all_watchlist__" unifiedHints={unifiedHints && unifiedHints.date === selectedDate && unifiedHints.poolName === 'Watchlist全部' ? unifiedHints : undefined} />
+        <StockDetailPanel symbol={symbol} selectedDate={selectedDate} forceResearchAsOf={returnTo.startsWith('/a/research') && Boolean(searchParams.get('trade_date'))} onSelectSymbol={selectSymbol} dailyHintsPanel={dailyHintsPanel} sidebarScopeKey="__all_watchlist__" unifiedHints={unifiedHints && unifiedHints.date === selectedDate && unifiedHints.poolName === 'Watchlist全部' ? unifiedHints : undefined} />
       </main>
     </div>
   );

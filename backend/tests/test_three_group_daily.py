@@ -259,3 +259,158 @@ def test_stale_frozen_retry_is_skipped_not_replaced(prepared,monkeypatch):
     assert sender.call_count==1
     with closing(daily._connect(prepared)) as conn:
         assert conn.execute('SELECT status FROM notification_deliveries').fetchone()[0]=='SKIPPED'
+
+
+def formal_c(db, monkeypatch):
+    from quant_engine.watch import structure_monitor as module
+    original = module.evaluate_structure_turning
+    result = dict(summary={'status': 'ok'}, state={'status': 'OBSERVING'}, markers=[
+        {'trade_date': TARGET, 'marker_type': 'BUY_CONFIRM', 'reason': 'fact'}])
+    monkeypatch.setattr(module, 'evaluate_structure_turning',
+                        lambda rows, config=None: result.copy() if rows else original(rows, config))
+    return StructureMonitor(db).run(TARGET, historical=True)
+
+
+def test_ensure_c_reuses_trusted_formal_snapshot_without_replay_or_pool_loss(db, monkeypatch):
+    formal = formal_c(db, monkeypatch)
+    evaluate = Mock(side_effect=AssertionError('trusted C must not replay'))
+    monkeypatch.setattr(daily, 'evaluate_structure_turning', evaluate)
+    groups = [dict(pool_id='watchlist', name='自选股', symbols=['600001'])]
+    daily._ensure_c(db, TARGET, groups)
+    data = StructureMonitor(db).read_status(TARGET)
+    evaluate.assert_not_called()
+    assert data['rows'] == formal['rows']
+    assert data['events'] == formal['events']
+    assert data['freshness']['status'] == 'CURRENT'
+
+
+def test_ensure_c_repair_merges_all_pool_ids_and_keeps_monitor_digest(db, monkeypatch):
+    formal_c(db, monkeypatch)
+    with closing(daily._connect(db)) as conn, conn:
+        conn.execute('UPDATE stock_daily_prices SET high=12 WHERE trade_date=?', ('2026-09-11',))
+    evaluate = Mock(return_value=dict(summary={'status': 'ok'}, state={'status': 'OBSERVING'}, markers=[
+        {'trade_date': TARGET, 'marker_type': 'BUY_CONFIRM', 'reason': 'repaired'}]))
+    monkeypatch.setattr(daily, 'evaluate_structure_turning', evaluate)
+    groups = [dict(pool_id='watchlist', name='自选股', symbols=['600001'])]
+    daily._ensure_c(db, TARGET, groups)
+    daily._ensure_c(db, TARGET, groups)
+    data = StructureMonitor(db).read_status(TARGET)
+    assert evaluate.call_count == 1
+    assert set(data['rows'][0]['pool_ids']) == {'watchlist', 'pool_0d1aea597dc4', 'smart_mrgc_20d'}
+    assert set(data['events'][0]['pool_ids']) == set(data['rows'][0]['pool_ids'])
+    assert data['rows'][0]['state']['_input_digest']
+    assert data['freshness']['status'] == 'CURRENT'
+
+
+@pytest.mark.parametrize('change', ['rule', 'input', 'member'])
+def test_prepare_does_not_trust_ready_archive_without_current_inputs(prepared, monkeypatch, change):
+    with closing(daily._connect(prepared)) as conn:
+        run = dict(conn.execute('SELECT * FROM three_group_daily_runs').fetchone())
+    prior_report = json.loads(run['report_json'])
+    monkeypatch.setattr(daily, 'read_archive', lambda *args: dict(
+        valid=True, archive_id=run['report_id'], report=prior_report))
+    if change == 'member':
+        with closing(daily._connect(prepared)) as conn, conn:
+            conn.execute("INSERT INTO quant_preselect_results VALUES ('mrgc_v1',?,'600002')", (TARGET,))
+    elif change == 'rule':
+        monkeypatch.setattr(daily, 'VERSION', 'new-rule')
+    else:
+        monkeypatch.setattr(daily, 'source_signature', lambda *args: 'b'*64)
+    ensure = Mock()
+    monkeypatch.setattr(daily, '_ensure_c', ensure)
+    result = daily.prepare(prepared, TARGET)
+    assert result['status'] == 'READY', result
+    assert result['reason'] != 'reused'
+    ensure.assert_called_once()
+    if change == 'member':
+        assert '600002' in next(g['symbols'] for g in ensure.call_args.args[2] if g['id'] == 'mrgc')
+
+
+def test_ensure_c_supplement_has_complete_run_ledger_and_no_delivery(db, monkeypatch):
+    monkeypatch.setattr(daily, 'evaluate_structure_turning', Mock(return_value=dict(
+        summary={'status': 'ok'}, state={'status': 'OBSERVING'}, markers=[])))
+    with closing(daily._connect(db)) as conn:
+        daily._schema(conn)
+    daily._ensure_c(db, TARGET, [dict(pool_id='watchlist', name='自选股', symbols=['600001'])])
+    data = StructureMonitor(db).read_status(TARGET)
+    assert data['run'] and data['run']['status'] == 'COMPLETED'
+    assert data['counts']['total'] == 1
+    assert data['freshness']['status'] == 'CURRENT'
+    with closing(daily._connect(db)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM notification_deliveries').fetchone()[0] == 0
+
+
+def test_real_historical_c_then_local_prepare_reuses_and_repairs_inputs(db, monkeypatch):
+    from tests.test_structure_turning import bars
+    prices = bars([10 + i*.01 for i in range(100)])
+    target = prices[-1]['trade_date']
+    monkeypatch.setattr(daily, '_now', lambda: NOW)
+    monkeypatch.setattr(daily, 'send_notification', Mock(side_effect=AssertionError('no mail')))
+    with closing(daily._connect(db)) as conn, conn:
+        conn.execute('DELETE FROM stock_daily_prices')
+        conn.execute('DELETE FROM trading_calendar')
+        conn.execute('DELETE FROM strategy_run_log')
+        conn.execute('DELETE FROM quant_preselect_results')
+        for row in prices:
+            conn.execute('INSERT INTO stock_daily_prices VALUES (?,?,?,?,?,?,?)',
+                ('600001',row['trade_date'],row['open'],row['high'],row['low'],row['close'],row['volume']))
+            conn.execute('INSERT INTO trading_calendar VALUES (?,1)', (row['trade_date'],))
+            conn.execute("INSERT INTO strategy_run_log VALUES ('mrgc_v1',?,'success')", (row['trade_date'],))
+        conn.execute("INSERT INTO quant_preselect_results VALUES ('mrgc_v1',?,'600001')", (target,))
+        conn.execute("INSERT INTO data_quality_report VALUES (?,'stock_daily','SH','PASS',?)", (target,target))
+    formal = StructureMonitor(db).run(target, historical=True)
+    assert formal['run']['status'] == 'COMPLETED'
+    first = daily.prepare(db, target)
+    assert first['status'] == 'READY', first
+    assert StructureMonitor(db).read_status(target)['rows'] == formal['rows']
+    second = daily.prepare(db, target)
+    assert second['status'] == 'READY' and second['reason'] == 'reused', second
+    with closing(daily._connect(db)) as conn, conn:
+        conn.execute('UPDATE stock_daily_prices SET volume=volume+1 WHERE trade_date=?', (prices[0]['trade_date'],))
+    repaired = daily.prepare(db, target)
+    assert repaired['status'] == 'READY' and repaired['reason'] != 'reused', repaired
+    assert StructureMonitor(db).read_status(target)['freshness']['status'] == 'CURRENT'
+    assert daily.prepare(db, target)['reason'] == 'reused'
+    with closing(daily._connect(db)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM notification_deliveries').fetchone()[0] == 0
+        assert conn.execute('SELECT attempt_count FROM three_group_daily_runs').fetchone()[0] == 1
+    daily.send_notification.assert_not_called()
+
+
+def test_prepare_same_inputs_still_respects_attempt_limit(prepared, monkeypatch):
+    with closing(daily._connect(prepared)) as conn, conn:
+        conn.execute("UPDATE three_group_daily_runs SET status='BLOCKED',attempt_count=3")
+    ensure = Mock()
+    monkeypatch.setattr(daily, '_ensure_c', ensure)
+    result = daily.prepare(prepared, TARGET)
+    assert result['reason'] == 'prepare_attempt_limit'
+    ensure.assert_not_called()
+
+
+def test_c_quality_recovery_clears_blocked_run_counts(db, monkeypatch):
+    formal_c(db, monkeypatch)
+    monkeypatch.setattr(daily, 'evaluate_structure_turning', Mock(return_value=dict(
+        summary={'status': 'ok'}, state={'status': 'OBSERVING'}, markers=[])))
+    groups = [dict(pool_id='watchlist', name='自选股', symbols=['600001'])]
+    with closing(daily._connect(db)) as conn, conn:
+        conn.execute("UPDATE data_quality_report SET status='FAIL'")
+    daily._ensure_c(db, TARGET, groups)
+    assert StructureMonitor(db).read_status(TARGET)['run']['status'] == 'BLOCKED'
+    with closing(daily._connect(db)) as conn, conn:
+        conn.execute("UPDATE data_quality_report SET status='PASS'")
+    daily._ensure_c(db, TARGET, groups)
+    data = StructureMonitor(db).read_status(TARGET)
+    assert data['run']['status'] == 'COMPLETED'
+    assert not data['run']['stats'].get('BLOCKED')
+    assert data['freshness']['status'] == 'CURRENT'
+
+
+def test_failed_prepare_does_not_reset_attempts_for_its_own_output_timestamps(db, monkeypatch):
+    ensure = Mock(wraps=daily._ensure_c)
+    monkeypatch.setattr(daily, '_ensure_c', ensure)
+    for attempt in range(5):
+        monkeypatch.setattr(daily, '_now', lambda n=attempt: NOW+timedelta(seconds=n))
+        result = daily.prepare(db, TARGET)
+        assert result['status'] == 'BLOCKED'
+    assert result['reason'] == 'prepare_attempt_limit'
+    assert ensure.call_count == 3

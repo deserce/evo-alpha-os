@@ -10,6 +10,162 @@ from quant_engine.watch.engine import WatchEngine
 from quant_engine.watch.scanner import WatchHistoricalScanner
 
 
+@pytest.fixture(autouse=True)
+def notification_today(monkeypatch):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    monkeypatch.setattr(
+        WatchNotificationDispatcher, "_today", staticmethod(lambda: "2026-07-20"),
+        raising=False,
+    )
+
+
+@pytest.mark.parametrize("event_type", ["TRIGGERED", "INVALIDATED", "DATA_BLOCKED"])
+def test_stale_intraday_is_never_backfilled_even_with_explicit_date(
+    tmp_path, monkeypatch, event_type,
+):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    db_path = tmp_path / "stale.db"
+    seed_intraday_event(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE watch_events SET event_type=?", (event_type,))
+    sent = []
+    dispatcher = WatchNotificationDispatcher(
+        db_path, sender=lambda *args, **kwargs: sent.append(args) or EmailDeliveryResult(True),
+    )
+    monkeypatch.setattr(dispatcher, "_today", lambda: "2026-07-21")
+    dispatcher.dispatch_immediate("2026-07-20")
+    dispatcher.dispatch_immediate()
+    assert sent == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notification_deliveries").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("payload,dedupe_key", [
+    ({"historical": True}, "state:repair"),
+    ({"source": "historical_repair"}, "state:repair"),
+    ({"mode": "historical"}, "state:repair"),
+    ({}, "repair:2026-07-20:600001"),
+])
+def test_historical_repair_has_no_immediate_or_digest_event(tmp_path, payload, dedupe_key):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    db_path = tmp_path / "repair.db"
+    seed_intraday_event(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE watch_events SET event_type='INVALIDATED', title='REPAIR_SENTINEL', "
+            "payload=?, dedupe_key=?", (json.dumps(payload), dedupe_key),
+        )
+    sent = []
+    dispatcher = WatchNotificationDispatcher(
+        db_path, sender=lambda *args, **kwargs: sent.append(args) or EmailDeliveryResult(True),
+    )
+    dispatcher.dispatch_immediate("2026-07-20")
+    assert sent == []
+    with closing(dispatcher._connect()) as conn:
+        assert "REPAIR_SENTINEL" not in dispatcher._digest_body(conn, "2026-07-20")
+
+
+@pytest.mark.parametrize("status", ["PENDING", "FAILED"])
+@pytest.mark.parametrize("historical", [False, True])
+def test_pending_or_failed_stale_and_repair_deliveries_leave_queue(
+    tmp_path, monkeypatch, status, historical,
+):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    db_path = tmp_path / "retry.db"
+    seed_intraday_event(db_path)
+    sent = []
+    dispatcher = WatchNotificationDispatcher(
+        db_path, sender=lambda *args, **kwargs: sent.append(args) or EmailDeliveryResult(True),
+    )
+    with closing(dispatcher._connect()) as conn:
+        delivery = dispatcher._ensure_delivery(
+            conn, dedupe_key="email:event:intraday-trigger", event_id="intraday-trigger",
+            delivery_type="event",
+        )
+        conn.execute("UPDATE notification_deliveries SET status=?, attempt_count=1", (status,))
+        if historical:
+            conn.execute("UPDATE watch_events SET payload=?",
+                         (json.dumps({"source": "intraday_5min", "historical": True}),))
+        conn.commit()
+    if not historical:
+        monkeypatch.setattr(dispatcher, "_today", lambda: "2026-07-21")
+    assert dispatcher.retry_failed() == {"sent": 0, "failed": 0, "skipped": 1}
+    assert sent == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT status, attempt_count FROM notification_deliveries WHERE delivery_id=?",
+            (delivery["delivery_id"],),
+        ).fetchone() == ("SKIPPED", 1)
+
+
+def test_old_intraday_does_not_reappear_in_digest_but_daily_events_remain(tmp_path):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    db_path = tmp_path / "digest.db"
+    seed_events(db_path)
+    seed_intraday_event(db_path)
+    dispatcher = WatchNotificationDispatcher(db_path, sender=lambda *args, **kwargs: None)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE watch_events SET trade_date='2026-07-13' "
+                     "WHERE event_id='intraday-trigger'")
+    with closing(dispatcher._connect()) as conn:
+        body = dispatcher._digest_body(conn, "2026-07-13")
+    assert "海思科 002653" not in body
+    assert "低吸确认触发" in body
+
+
+def test_historical_snapshots_cannot_generate_or_retry_digest(tmp_path):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    db_path = tmp_path / "snapshot-digest.db"
+    seed_events(db_path)
+    sent = []
+    dispatcher = WatchNotificationDispatcher(
+        db_path, sender=lambda *args, **kwargs: sent.append(args) or EmailDeliveryResult(True),
+    )
+    with closing(dispatcher._connect()) as conn:
+        dispatcher._ensure_delivery(
+            conn, dedupe_key="email:digest:2026-07-13", event_id=None, delivery_type="digest",
+        )
+        conn.execute("UPDATE notification_deliveries SET status='FAILED', attempt_count=1")
+        conn.execute("UPDATE watch_daily_snapshot SET factors=?",
+                     (json.dumps({"watch_rebuild": {"mode": "historical"}}),))
+        conn.commit()
+    assert dispatcher.dispatch_digest("2026-07-13", force=True)["sent"] == 0
+    assert dispatcher.retry_failed()["skipped"] == 1
+    assert sent == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM notification_deliveries").fetchall() == [
+            ("SKIPPED",),
+        ]
+
+
+def test_event_is_rechecked_after_delivery_creation(tmp_path, monkeypatch):
+    from quant_engine.watch.dispatcher import WatchNotificationDispatcher
+
+    db_path = tmp_path / "race.db"
+    seed_intraday_event(db_path)
+    sent = []
+    dispatcher = WatchNotificationDispatcher(
+        db_path, sender=lambda *args, **kwargs: sent.append(args) or EmailDeliveryResult(True),
+    )
+    original = dispatcher._ensure_delivery
+
+    def mark_historical(conn, **kwargs):
+        delivery = original(conn, **kwargs)
+        conn.execute("UPDATE watch_events SET payload='{\"historical\":true}'")
+        conn.commit()
+        return delivery
+
+    monkeypatch.setattr(dispatcher, "_ensure_delivery", mark_historical)
+    assert dispatcher.dispatch_immediate()["skipped"] == 1
+    assert sent == []
+
+
 def seed_events(db_path):
     with sqlite3.connect(db_path) as conn:
         WatchEngine(db_path).ensure_schema(conn)

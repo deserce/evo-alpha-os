@@ -9,7 +9,8 @@ from __future__ import annotations
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from contextlib import closing
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from quant_engine.common import setup_logger
+from quant_engine.calculators.timing_signal_calculator import resolve_sparse_output_dates
 
 
 DB_PATH = BACKEND_DIR / "data" / "local_quant.db"
@@ -126,11 +128,12 @@ class RiskPlanCalculator:
             FROM stock_daily_prices
             WHERE symbol IN ({symbol_values})
               AND trade_date >= ?
-              AND trade_date <= ?
+              AND trade_date < ?
             ORDER BY symbol, trade_date
             """,
             conn,
-            params=[*symbols, start_date, end_date],
+            params=[*symbols, start_date,
+                    (date.fromisoformat(end_date) + timedelta(days=1)).isoformat()],
         )
         if not kline.empty:
             kline["trade_date"] = pd.to_datetime(kline["trade_date"], format="mixed").dt.strftime("%Y-%m-%d")
@@ -241,116 +244,127 @@ class RiskPlanCalculator:
             "plan_status": plan_status,
         }
 
-    def run_daily(self, days: int = 3) -> dict:
-        return self.run(mode="daily", days=days)
+    def run_daily(
+        self, days: int = 3, target_dates: list[str] | None = None, missing_only: bool = False
+    ) -> dict:
+        """Revalue simulations on exact dates without touching other days or Portfolio."""
+        return self.run(mode="daily", days=days, target_dates=target_dates, missing_only=missing_only)
 
     def run_init(self, days: int = 3) -> dict:
         return self.run(mode="init", days=days)
 
-    def run(self, mode: str = "daily", days: int = 3) -> dict:
+    def _compute_plans(self, conn: sqlite3.Connection, day: str) -> pd.DataFrame:
+        end = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        existing_created_at = dict(conn.execute(
+            "SELECT signal_id, created_at FROM trade_plans WHERE trade_date>=? AND trade_date<?",
+            (day, end),
+        ))
+        signals = pd.read_sql_query(
+            """
+            SELECT s.*, l.market_state, l.industry_state, l.structure_score
+            FROM timing_signals_daily s
+            LEFT JOIN stock_lifecycle_state l
+              ON l.trade_date >= ? AND l.trade_date < ? AND s.symbol = l.symbol
+            WHERE COALESCE(s.is_invalidated, 0) = 0 AND s.trade_date < ?
+            """,
+            conn, params=(day, end, end),
+        )
+        if signals.empty:
+            return pd.DataFrame()
+        for column in (
+            "entry_price", "stop_loss_price", "stop_loss_pct", "risk_amount_pct",
+            "suggested_position_pct", "structure_score",
+        ):
+            signals[column] = pd.to_numeric(signals[column], errors="coerce")
+        signals["trade_date"] = pd.to_datetime(
+            signals["trade_date"], format="mixed",
+        ).dt.strftime("%Y-%m-%d")
+        kline = self._load_kline(conn, signals, day)
+        target_symbols = set(kline.loc[kline["trade_date"] == day, "symbol"])
+        if not set(signals["symbol"]).issubset(target_symbols):
+            raise ValueError(f"active signal prices missing exact target date: {day}")
+        kline_by_symbol = {
+            symbol: group.sort_values("trade_date") for symbol, group in kline.groupby("symbol")
+        }
+        dynamic_rows = signals.apply(
+            lambda row: self._dynamic_fields(row, kline_by_symbol), axis=1, result_type="expand",
+        )
+        max_position = signals["structure_score"].fillna(0).apply(
+            lambda score: 15.0 if score >= 85 else 10.0
+        )
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # A signal can have independent valuations on several dates, including legacy rows.
+        plan_ids = signals["signal_id"].map(lambda value: f"plan_{value}_{day}")
+        return pd.DataFrame({
+            "plan_id": plan_ids,
+            "signal_id": signals["signal_id"],
+            "trade_date": day,
+            "signal_trade_date": signals["trade_date"],
+            "symbol": signals["symbol"],
+            "signal_type": signals["signal_type"],
+            "entry_price": signals["entry_price"],
+            "initial_stop_price": signals["stop_loss_price"],
+            "stop_loss_pct": signals["stop_loss_pct"],
+            "risk_amount_pct": signals["risk_amount_pct"],
+            "suggested_position_pct": signals["suggested_position_pct"],
+            "max_position_pct": max_position,
+            "time_stop_10d_action": "10日未达到+5%则减仓50%",
+            "time_stop_20d_action": "20日未走出趋势则清仓",
+            "market_risk_action": signals["market_state"].map(
+                lambda state: "市场M0触发总仓减半" if state == "M0" else "正常"
+            ),
+            "industry_risk_action": signals["industry_state"].map(
+                lambda state: "行业I0/I1触发减仓50%" if state in {"I0", "I1"} else "正常"
+            ),
+            **{column: dynamic_rows[column] for column in dynamic_rows.columns},
+            "created_at": signals["signal_id"].map(
+                lambda value: existing_created_at.get(value) or now
+            ),
+            "updated_at": now,
+        })
+
+    def _save(self, conn: sqlite3.Connection, plans: pd.DataFrame, day: str) -> None:
+        end = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        with conn:
+            conn.execute("DELETE FROM trade_plans WHERE trade_date>=? AND trade_date<?", (day, end))
+            if not plans.empty:
+                columns = ",".join(plans.columns)
+                placeholders = ",".join("?" for _ in plans.columns)
+                for start in range(0, len(plans), 1000):
+                    batch = plans.iloc[start:start + 1000].astype(object)
+                    conn.executemany(
+                        f"INSERT INTO trade_plans ({columns}) VALUES ({placeholders})",
+                        batch.where(pd.notna(batch), None).itertuples(index=False, name=None),
+                    )
+
+    def run(
+        self, mode: str = "daily", days: int = 3,
+        target_dates: list[str] | None = None, missing_only: bool = False,
+    ) -> dict:
         start = time.time()
+        computed_dates = []
+        skipped_dates = []
+        records = 0
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                dates, skipped_dates = resolve_sparse_output_dates(
+                    conn, target_dates=target_dates,
+                    fallback=lambda: [day] if (day := self._latest_price_date(conn)) else [],
+                    task_name="risk_plans", missing_only=missing_only,
+                )
                 self._create_table(conn)
-                if not self._table_exists(conn, "timing_signals_daily"):
-                    return {"success": True, "records": 0, "elapsed": time.time() - start}
-                latest_date = self._latest_price_date(conn)
-                if not latest_date:
-                    return {"success": True, "records": 0, "elapsed": time.time() - start}
-                existing_created_at = {
-                    str(row[0]): row[1]
-                    for row in conn.execute(
-                        "SELECT plan_id, created_at FROM trade_plans WHERE plan_id IS NOT NULL"
-                    ).fetchall()
-                }
-                signals = pd.read_sql_query(
-                    """
-                    SELECT s.*, l.market_state, l.industry_state, l.structure_score
-                    FROM timing_signals_daily s
-                    LEFT JOIN stock_lifecycle_state l
-                      ON l.trade_date = ? AND s.symbol = l.symbol
-                    WHERE COALESCE(s.is_invalidated, 0) = 0
-                    """,
-                    conn,
-                    params=(latest_date,),
-                )
-                if signals.empty:
-                    with conn:
-                        conn.execute("DELETE FROM trade_plans")
-                    return {"success": True, "records": 0, "elapsed": time.time() - start}
-
-                for column in (
-                    "entry_price",
-                    "stop_loss_price",
-                    "stop_loss_pct",
-                    "risk_amount_pct",
-                    "suggested_position_pct",
-                    "structure_score",
-                ):
-                    signals[column] = pd.to_numeric(signals[column], errors="coerce")
-                signals["trade_date"] = pd.to_datetime(
-                    signals["trade_date"],
-                    format="mixed",
-                ).dt.strftime("%Y-%m-%d")
-
-                kline = self._load_kline(conn, signals, latest_date)
-                kline_by_symbol = {
-                    symbol: group.sort_values("trade_date")
-                    for symbol, group in kline.groupby("symbol")
-                } if not kline.empty else {}
-                dynamic_rows = signals.apply(
-                    lambda row: self._dynamic_fields(row, kline_by_symbol),
-                    axis=1,
-                    result_type="expand",
-                )
-
-                max_position = signals["structure_score"].fillna(0).apply(lambda score: 15.0 if score >= 85 else 10.0)
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                plan_ids = signals["signal_id"].map(lambda x: f"plan_{x}")
-                plans = pd.DataFrame(
-                    {
-                        "plan_id": plan_ids,
-                        "signal_id": signals["signal_id"],
-                        "trade_date": latest_date,
-                        "signal_trade_date": signals["trade_date"],
-                        "symbol": signals["symbol"],
-                        "signal_type": signals["signal_type"],
-                        "entry_price": signals["entry_price"],
-                        "initial_stop_price": signals["stop_loss_price"],
-                        "stop_loss_pct": signals["stop_loss_pct"],
-                        "risk_amount_pct": signals["risk_amount_pct"],
-                        "suggested_position_pct": signals["suggested_position_pct"],
-                        "max_position_pct": max_position,
-                        "time_stop_10d_action": "10日未达到+5%则减仓50%",
-                        "time_stop_20d_action": "20日未走出趋势则清仓",
-                        "market_risk_action": signals["market_state"].map(
-                            lambda s: "市场M0触发总仓减半" if s == "M0" else "正常"
-                        ),
-                        "industry_risk_action": signals["industry_state"].map(
-                            lambda s: "行业I0/I1触发减仓50%" if s in {"I0", "I1"} else "正常"
-                        ),
-                        "current_stop_price": dynamic_rows["current_stop_price"],
-                        "days_since_signal": dynamic_rows["days_since_signal"],
-                        "max_high_since_entry": dynamic_rows["max_high_since_entry"],
-                        "latest_close": dynamic_rows["latest_close"],
-                        "r_multiple": dynamic_rows["r_multiple"],
-                        "risk_status": dynamic_rows["risk_status"],
-                        "recommended_action": dynamic_rows["recommended_action"],
-                        "add_allowed": dynamic_rows["add_allowed"],
-                        "reduce_pct": dynamic_rows["reduce_pct"],
-                        "exit_reason": dynamic_rows["exit_reason"],
-                        "plan_status": dynamic_rows["plan_status"],
-                        "created_at": plan_ids.map(lambda value: existing_created_at.get(value) or now),
-                        "updated_at": now,
-                    }
-                )
-                with conn:
-                    conn.execute("DELETE FROM trade_plans")
-                plans.to_sql("trade_plans", conn, if_exists="append", index=False, method="multi", chunksize=1000)
-            return {"success": True, "records": len(plans), "elapsed": time.time() - start}
+                for day in dates:
+                    plans = self._compute_plans(conn, day)
+                    self._save(conn, plans, day)
+                    computed_dates.append(day)
+                    records += len(plans)
+            return {"success": True, "records": records, "elapsed": time.time() - start,
+                    "computed_dates": computed_dates, "skipped_dates": skipped_dates}
         except Exception as e:
             logger.error(f"❌ 风控交易计划失败: {e}")
-            return {"success": False, "error": str(e), "records": 0, "elapsed": time.time() - start}
+            return {"success": False, "error": str(e), "records": records,
+                    "elapsed": time.time() - start, "computed_dates": computed_dates,
+                    "skipped_dates": skipped_dates}
 
 
 if __name__ == "__main__":
@@ -359,7 +373,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EvoAlpha 风控交易计划计算器")
     parser.add_argument("--mode", choices=("daily", "init"), default="daily")
     parser.add_argument("--days", type=int, default=3)
+    parser.add_argument("--target-dates", nargs="+")
+    parser.add_argument("--missing-only", action="store_true")
     args = parser.parse_args()
 
-    result = RiskPlanCalculator().run(mode=args.mode, days=args.days)
+    result = RiskPlanCalculator().run(
+        mode=args.mode, days=args.days, target_dates=args.target_dates, missing_only=args.missing_only
+    )
     raise SystemExit(0 if result.get("success") else 1)

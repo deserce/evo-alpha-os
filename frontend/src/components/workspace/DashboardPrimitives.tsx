@@ -91,7 +91,7 @@ export function PageHeader({
           </span>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-lg sm:text-xl font-bold text-white tracking-normal leading-tight">{title}</h1>
+              <h1 className="evo-page-title truncate">{title}</h1>
               {eyebrow && <span className="rounded border border-border-primary bg-bg-secondary/70 px-2 py-1 text-[10px] font-mono text-text-tertiary">{eyebrow}</span>}
             </div>
             {children && <div className="text-[11px] text-text-secondary mt-1">{children}</div>}

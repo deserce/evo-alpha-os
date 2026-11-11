@@ -1,19 +1,17 @@
 'use client';
 
-import { Fragment, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowDownUp, CandlestickChart, ExternalLink, Flame, Layers, Network, Search } from 'lucide-react';
+import { ArrowDownUp, ChevronDown, ChevronUp, CandlestickChart, ExternalLink, Layers, Search, X } from 'lucide-react';
 import { quantApi } from '@/lib/api';
 import { useGlobalStore } from '@/lib/store';
 import SectorChart from '@/components/sector/SectorChart';
 import StockChart from '@/components/stock/StockChart';
 import {
   CockpitPanel,
-  ProgressLine,
   Row,
   StageBadge,
-  StatCard,
   WorkbenchPage,
   clamp,
   int,
@@ -187,7 +185,7 @@ function SectorRpsHeatmap({
   }
 
   return (
-    <div className="max-h-[510px] overflow-auto custom-scrollbar">
+    <div className="sector-heatmap-scroll max-h-[510px] overflow-auto overscroll-contain custom-scrollbar">
       <div className="min-w-[920px]">
         <div
           className="grid gap-1"
@@ -206,7 +204,7 @@ function SectorRpsHeatmap({
                 key={date}
                 type="button"
                 onClick={() => onSort(date)}
-                className={`sticky top-0 z-20 h-7 rounded border px-1 py-1 text-center font-mono text-[9px] font-bold shadow-[0_2px_0_rgba(0,0,0,0.55)] transition-colors ${
+                className={`sticky top-0 z-20 h-7 whitespace-nowrap rounded border px-0.5 py-1 text-center font-mono text-[9px] font-bold shadow-[0_2px_0_rgba(0,0,0,0.55)] transition-colors ${
                   activeSort
                     ? 'border-brand-blue/70 text-brand-blue-light'
                     : 'border-border-secondary text-text-tertiary hover:border-brand-blue/45 hover:text-white'
@@ -216,7 +214,7 @@ function SectorRpsHeatmap({
               >
                 {dateLabel(date)}
                 {activeSort && (
-                  <span className="ml-0.5 text-[8px]">{sortDirection === 'desc' ? '↓' : '↑'}</span>
+                  <span className="text-[8px]">{sortDirection === 'desc' ? '↓' : '↑'}</span>
                 )}
               </button>
             );
@@ -292,6 +290,7 @@ function IndustryStockWorkbench({
   onSort: (key: string) => void;
   onOpenStock: (symbol: string) => void;
 }) {
+  const [mobilePane, setMobilePane] = useState<'chart' | 'stocks'>('chart');
   const [chartMode, setChartMode] = useState<'sector' | 'stock'>('sector');
   const [selectedSymbol, setSelectedSymbol] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
@@ -313,6 +312,7 @@ function IndustryStockWorkbench({
     if (!symbol || symbol === '-') return;
     setSelectedSymbol(symbol);
     setChartMode('stock');
+    setMobilePane('chart');
     requestAnimationFrame(() => {
       listRef.current
         ?.querySelector<HTMLElement>(`[data-symbol="${symbol}"]`)
@@ -348,8 +348,17 @@ function IndustryStockWorkbench({
   const selectedPct = toNumber(selectedStock?.pct_chg, Number.NaN);
 
   return (
-    <div className="grid gap-2 xl:grid-cols-[minmax(0,1fr)_430px]">
-      <section className="flex h-[620px] min-w-0 flex-col overflow-hidden rounded-lg border border-border-secondary bg-bg-primary/35">
+    <div data-sector-workbench className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-2 lg:grid-cols-[minmax(0,1fr)_minmax(320px,35%)] lg:grid-rows-[minmax(0,1fr)]">
+      <div role="group" aria-label="行业详情视图" className="flex gap-2 lg:hidden">
+        {([['chart', '走势图'], ['stocks', '成分股']] as const).map(([pane, label]) => (
+          <button key={pane} type="button" aria-pressed={mobilePane === pane}
+            className="rounded border border-border-primary px-3 py-1 text-xs aria-pressed:border-brand-blue aria-pressed:text-brand-blue-light"
+            onClick={() => setMobilePane(pane)}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <section className={`${mobilePane === 'chart' ? 'flex' : 'hidden lg:flex'} min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border-secondary bg-bg-primary/35`}>
         <div className="flex min-h-9 items-center justify-between gap-2 border-b border-border-secondary bg-bg-secondary/45 px-2">
           <div className="flex min-w-0 items-center gap-1">
             <button
@@ -407,7 +416,7 @@ function IndustryStockWorkbench({
         </div>
       </section>
 
-      <aside className="flex h-[620px] min-w-0 flex-col overflow-hidden rounded-lg border border-border-secondary bg-bg-primary/35">
+      <aside className={`${mobilePane === 'stocks' ? 'flex' : 'hidden lg:flex'} min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border-secondary bg-bg-primary/35`}>
         <div className="flex min-h-9 items-center justify-between gap-2 border-b border-border-secondary bg-bg-secondary/45 px-2.5">
           <div className="flex min-w-0 items-center gap-2">
             <span className="text-xs font-black text-text-primary">成分股</span>
@@ -504,6 +513,13 @@ export default function IndustriesPage() {
   const router = useRouter();
   const { globalDate, setGlobalDate, selectedSector: globalSector, setSelectedSector } = useGlobalStore();
   const [localSector, setLocalSector] = useState(globalSector);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const detailDialog = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = detailDialog.current;
+    if (detailOpen && dialog && !dialog.open) dialog.showModal();
+  }, [detailOpen]);
   const [rpsPeriod, setRpsPeriod] = useState(20);
   const [heatmapSortDate, setHeatmapSortDate] = useState('');
   const [heatmapSortDirection, setHeatmapSortDirection] = useState<SortDirection>('desc');
@@ -522,7 +538,7 @@ export default function IndustriesPage() {
   const industryQuery = useQuery({
     queryKey: ['industriesStrength', selectedDate, sectorRpsKey],
     queryFn: () => quantApi.getIndustryStrength(selectedDate, 120, sectorRpsKey),
-    enabled: Boolean(selectedDate),
+    enabled: Boolean(detailOpen && selectedDate),
     staleTime: 60_000,
   });
   const heatmapQuery = useQuery({
@@ -548,6 +564,19 @@ export default function IndustriesPage() {
     [heatmapSectors, activeHeatmapSortDate, heatmapSortDirection],
   );
   const currentName = localSector || text(sortedHeatmapSectors[0]?.sector_name || industries[0]?.sector_name, '');
+  const currentIndex = sortedHeatmapSectors.findIndex((row) => row.sector_name === currentName);
+
+  const selectSector = (name: string) => {
+    setLocalSector(name);
+    setSelectedSector(name);
+    setDetailOpen(true);
+  };
+
+  const moveSector = (offset: -1 | 1) => {
+    if (currentIndex < 0) return;
+    const name = sortedHeatmapSectors[currentIndex + offset]?.sector_name;
+    if (typeof name === 'string' && name) selectSector(name);
+  };
   const current = (
     industries.find((row) => row.sector_name === currentName)
     || sortedHeatmapSectors.find((row) => row.sector_name === currentName)
@@ -566,7 +595,7 @@ export default function IndustriesPage() {
       sortDir: 'desc',
       limit: 500,
     }),
-    enabled: Boolean(selectedDate && currentName),
+    enabled: Boolean(detailOpen && selectedDate && currentName),
     staleTime: 60_000,
   });
 
@@ -580,9 +609,11 @@ export default function IndustriesPage() {
 
   const refresh = () => {
     datesQuery.refetch();
-    industryQuery.refetch();
     heatmapQuery.refetch();
-    stocksQuery.refetch();
+    if (detailOpen) {
+      industryQuery.refetch();
+      stocksQuery.refetch();
+    }
   };
 
   const sortStocks = (key: string) => {
@@ -598,7 +629,7 @@ export default function IndustriesPage() {
     <WorkbenchPage
       index="03"
       title="Industries  行业战役"
-      subtitle="先找主战场，再看行业内 S3/S4/S5 梯队与龙头扩散。"
+      subtitle="点击热图中的行业或 RPS 数值，查看行业作战详情。"
       date={selectedDate}
       dates={dates}
       onDateChange={setGlobalDate}
@@ -606,11 +637,12 @@ export default function IndustriesPage() {
     >
       <CockpitPanel
         title="行业 RPS 热图"
+        className="sector-heatmap-panel"
         icon={Layers}
         extra={
           <div className="flex items-center gap-2">
             <span className="rounded border border-border-secondary bg-bg-primary px-2 py-1 font-mono text-[10px] text-text-tertiary">
-              Top100×20 · 15行
+              Top100 × 20日
             </span>
             <RpsSelect value={rpsPeriod} onChange={setRpsPeriod} />
           </div>
@@ -631,67 +663,102 @@ export default function IndustriesPage() {
             setHeatmapSortDate(date);
             setHeatmapSortDirection('desc');
           }}
-          onSelect={(name) => {
-            setLocalSector(name);
-            setSelectedSector(name);
-          }}
+          onSelect={selectSector}
         />
       </CockpitPanel>
 
-      <div className="mt-3 grid gap-3">
-        <CockpitPanel title="行业作战详情" icon={Flame}>
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-2xl font-black text-white">{text(current.sector_name, '行业待选')}</h2>
-                <StageBadge value={current.industry_state} />
+      <dialog
+        ref={detailDialog}
+        aria-labelledby="sector-detail-title"
+        onClose={() => setDetailOpen(false)}
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+          if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey
+            || event.shiftKey || event.nativeEvent.isComposing) return;
+          if (event.target instanceof Element && event.target.closest(
+            '[data-sector-workbench], input, textarea, select, [contenteditable]',
+          )) return;
+
+          event.preventDefault();
+          if (!event.repeat) moveSector(event.key === 'ArrowUp' ? -1 : 1);
+        }}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) detailDialog.current?.close();
+        }}
+        className="fixed inset-0 m-auto max-h-[calc(100dvh-24px)] w-[calc(100%-24px)] max-w-[1480px] overflow-hidden rounded-xl border border-border-primary bg-bg-primary p-0 text-text-primary shadow-2xl backdrop:bg-black/65"
+      >
+        {detailOpen && (
+          <div className="flex h-[calc(100dvh-26px)] flex-col">
+            <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border-primary px-4 py-2">
+              <h2 id="sector-detail-title" aria-live="polite" className="min-w-0 truncate text-sm font-bold">
+                {currentName} · 行业作战详情
+              </h2>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {currentIndex >= 0 && (
+                  <span className="hidden font-mono text-xs text-text-secondary sm:inline">
+                    {currentIndex + 1}/{sortedHeatmapSectors.length}
+                  </span>
+                )}
+                <button type="button" aria-label="上一个板块" title="上一个板块"
+                  disabled={currentIndex <= 0} onClick={() => moveSector(-1)}
+                  className="rounded border border-border-primary p-1.5 hover:bg-bg-tertiary disabled:opacity-40">
+                  <ChevronUp size={17} />
+                </button>
+                <button type="button" aria-label="下一个板块" title="下一个板块"
+                  disabled={currentIndex < 0 || currentIndex >= sortedHeatmapSectors.length - 1}
+                  onClick={() => moveSector(1)}
+                  className="rounded border border-border-primary p-1.5 hover:bg-bg-tertiary disabled:opacity-40">
+                  <ChevronDown size={17} />
+                </button>
+                <button type="button" aria-label="关闭行业详情" autoFocus
+                  className="rounded border border-border-primary p-1.5 hover:bg-bg-tertiary"
+                  onClick={() => detailDialog.current?.close()}>
+                  <X size={17} />
+                </button>
               </div>
-              <div className="mt-1 text-[11px] text-text-secondary">
-                领涨 {text(current.leader_symbol)} · 成交 {money(current.amount)} · RPS{rpsPeriod} {num(current[sectorRpsKey])}
+            </header>
+            <div className="grid shrink-0 grid-cols-2 gap-x-3 gap-y-1 border-b border-border-primary px-3 py-2 text-[11px] text-text-secondary sm:grid-cols-4 lg:grid-cols-5">
+              <div className="col-span-2 flex items-center gap-2">
+                <StageBadge value={current.industry_state} />
+                <span>领涨 {text(current.leader_name || current.leader_symbol)}</span>
+              </div>
+              {[
+                ['行业强度', num(current.industry_strength_score, 0)],
+                [`RPS${rpsPeriod}`, num(current[sectorRpsKey], 0)],
+                ['20日收益', pct(current.return_20d)],
+                ['RPS90占比', ratioPct(current.rps90_stock_ratio)],
+                ['S4/S5', `${s4s5} / ${int(totalStocks)}`],
+                ['成交', money(current.amount)],
+                ['成交放大', num(current.amount_ratio_20)],
+                ['新高占比', ratioPct(current.new_high_stock_ratio)],
+                ['龙头强度', num(current.leader_strength_score, 0)],
+              ].map(([label, value]) => (
+                <div key={label} className="flex items-baseline gap-1.5">
+                  <span>{label}</span>
+                  <strong className="font-mono text-text-primary">{value}</strong>
+                </div>
+              ))}
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
+              <IndustryStockWorkbench
+                key={currentName}
+                sectorName={currentName}
+                tradeDate={selectedDate}
+                stocks={sortedStocks}
+                total={totalStocks}
+                rpsPeriod={rpsPeriod}
+                sortKey={activeStockSortBy}
+                sortDirection={stockSortDirection}
+                onSort={sortStocks}
+                onOpenStock={(symbol) => router.push(`/a/stock/${symbol}`)}
+              />
+              <div className="shrink-0 rounded border border-border-secondary px-2 py-1 text-[10px] leading-snug text-text-secondary">
+                产业链节奏：主线确认 → 龙头启动 → 中军扩散 → 补涨轮动 → 风险退潮
               </div>
             </div>
           </div>
-          <div className="mt-3 grid gap-2 sm:grid-cols-5">
-            <StatCard label="行业强度" value={num(current.industry_strength_score, 0)} tone="good" />
-            <StatCard label={`${rpsPeriod}日RPS`} value={num(current[sectorRpsKey], 0)} tone="blue" />
-            <StatCard label="20日收益" value={pct(current.return_20d)} tone={toNumber(current.return_20d) >= 0 ? 'good' : 'bad'} />
-            <StatCard label="RPS90占比" value={ratioPct(current.rps90_stock_ratio)} sub={`${int(current.rps90_stock_count)} 只`} tone="blue" />
-            <StatCard label="S4/S5" value={s4s5} sub={`成分 ${int(totalStocks)} 只`} tone="warn" />
-          </div>
-          <div className="mt-3 space-y-2">
-            <ProgressLine label="成交放大" value={clamp(toNumber(current.amount_ratio_20, 1) * 45)} tone="blue" right={num(current.amount_ratio_20)} />
-            <ProgressLine label="新高占比" value={clamp(toNumber(current.new_high_stock_ratio) * 100)} tone="good" right={ratioPct(current.new_high_stock_ratio)} />
-            <ProgressLine label="龙头强度" value={clamp(toNumber(current.leader_strength_score))} tone="warn" right={num(current.leader_strength_score, 0)} />
-          </div>
-          <div className="mt-3">
-            <IndustryStockWorkbench
-              key={currentName}
-              sectorName={currentName}
-              tradeDate={selectedDate}
-              stocks={sortedStocks}
-              total={totalStocks}
-              rpsPeriod={rpsPeriod}
-              sortKey={activeStockSortBy}
-              sortDirection={stockSortDirection}
-              onSort={sortStocks}
-              onOpenStock={(symbol) => router.push(`/a/stock/${symbol}`)}
-            />
-          </div>
-        </CockpitPanel>
-      </div>
-
-      <div className="mt-3">
-        <CockpitPanel title="产业链节奏" icon={Network}>
-          <div className="grid gap-2 md:grid-cols-5">
-            {['主线确认', '龙头启动', '中军扩散', '补涨轮动', '风险退潮'].map((label, index) => (
-              <div key={label} className="rounded-lg border border-brand-blue/35 bg-brand-blue/10 px-3 py-3 text-center">
-                <div className="font-mono text-[10px] text-brand-blue-light">0{index + 1}</div>
-                <div className="mt-1 text-[12px] font-black text-white">{label}</div>
-              </div>
-            ))}
-          </div>
-        </CockpitPanel>
-      </div>
+        )}
+      </dialog>
     </WorkbenchPage>
   );
 }

@@ -314,6 +314,7 @@ def main():
             # 实例化以获取策略名称
             strategy = StrategyClass()
             print(f"   - {key}: {strategy.strategy_name}")
+        print("   - formulas: 六条日线选股公式")
         return 0
 
     # 验证必需参数
@@ -322,7 +323,16 @@ def main():
 
     # 运行策略
     runner = StrategyRunner()
-    if args.dates:
+    if args.strategy == "formulas":
+        from quant_engine.runner.formula_results import run_formula_screens
+
+        engine = get_engine()
+        ensure_strategy_run_log_table(engine)
+        results = run_formula_screens(
+            engine, args.dates or [args.date or runner._get_latest_trade_date()],
+            missing_only=args.missing_only,
+        )
+    elif args.dates:
         results = runner.run_many(
             strategy_name=args.strategy,
             trade_dates=args.dates,

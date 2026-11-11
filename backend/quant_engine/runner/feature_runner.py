@@ -110,7 +110,7 @@ class FeatureRunner:
                         target_dates=target_dates,
                         missing_only=missing_only,
                     )
-                elif name in {"strength", "structure", "lifecycle"}:
+                elif name in {"strength", "structure", "lifecycle", "timing", "risk"}:
                     result = calculator.run_daily(
                         target_dates=target_dates,
                         missing_only=missing_only,
@@ -128,6 +128,9 @@ class FeatureRunner:
                         'records': result.get('records', 0),
                         'error': result.get('error'),
                     }
+                    for field in ('computed_dates', 'skipped_dates'):
+                        if field in result:
+                            results[name][field] = result[field]
                 else:
                     results[name] = {'success': True, 'elapsed': elapsed, 'records': 0}
 

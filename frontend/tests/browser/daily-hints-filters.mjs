@@ -126,6 +126,28 @@ try {
   await new Promise(resolve=>setTimeout(resolve,500));
   assert.equal(await evaluate(`document.querySelector('[data-selected-symbol]').dataset.selectedSymbol`),selectedCode,'Selected stock stays current');
   assert.deepEqual(await evaluate(`[...${hints}.querySelectorAll('[data-hint-selected="true"]')].map(a=>a.dataset.hintSymbol)`),[selectedCode],'Exactly one hint card highlighted for global selected stock');
+  const arrowKey = async (key) => {
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key, code: key });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key });
+  };
+  for (const category of ['buy', 'sell']) {
+    const [first, second] = baseline.cards.filter(card => card.direction === category);
+    assert.ok(second, `Keyboard regression requires two ${category} cards`);
+    await filter(category);
+    const firstButton = `${hints}.querySelector('[data-hint-symbol="${first.symbol}"] [data-hint-select]')`;
+    await evaluate(`${firstButton}.focus(); ${firstButton}.click();`);
+    await wait(`document.querySelector('[data-selected-symbol]').dataset.selectedSymbol === '${first.symbol}'`);
+    await arrowKey('ArrowUp');
+    assert.equal(await evaluate(`document.querySelector('[data-selected-symbol]').dataset.selectedSymbol`), first.symbol, 'First card does not wrap');
+    await arrowKey('ArrowDown');
+    await wait(`document.querySelector('[data-selected-symbol]').dataset.selectedSymbol === '${second.symbol}'`);
+    assert.equal(await evaluate(`document.activeElement.closest('[data-hint-symbol]').dataset.hintSymbol`), second.symbol, 'Focus follows chart selection');
+    await arrowKey('ArrowUp');
+    await wait(`document.querySelector('[data-selected-symbol]').dataset.selectedSymbol === '${first.symbol}'`);
+  }
+  await filter('all');
+  await evaluate(`${hints}.querySelector('[data-hint-symbol="${selectedCode}"] [data-hint-select]').click()`);
+  await wait(`document.querySelector('[data-selected-symbol]').dataset.selectedSymbol === '${selectedCode}'`);
   const headers=await evaluate(`(()=>{return [...${hints}.querySelectorAll('[data-hint-header]')].map(h=>{const r=h.getBoundingClientRect();return {width:r.width,scrollWidth:h.scrollWidth,clientWidth:h.clientWidth,buttons:[...h.querySelectorAll('button')].map(b=>{const q=b.getBoundingClientRect();return {label:b.getAttribute('title')||b.textContent.trim(),center:q.y+q.height/2,left:q.left,right:q.right};}),left:r.left,right:r.right};});})()`);
   for(const header of headers){
     assert.equal(header.buttons.length,3,'Header includes name, chart and AI buttons');

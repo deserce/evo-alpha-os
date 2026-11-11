@@ -79,6 +79,42 @@ def test_daily_monitor_dedupes_all_groups_and_idempotent_current_events(tmp_path
         assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'portfolio%'").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize('historical', [False, True])
+def test_input_change_without_timestamps_invalidates_saved_result(tmp_path, historical):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    worker.run(target)
+    changed_day = prices[0]['trade_date'] if historical else target
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('UPDATE stock_daily_prices SET volume=volume+1 WHERE trade_date=?',
+                     (changed_day,))
+    assert worker.read_status(target)['freshness'] == {
+        'status': 'STALE', 'reason': 'price_data_changed'}
+
+
+def test_same_second_price_repair_invalidates_saved_result(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('ALTER TABLE stock_daily_prices ADD COLUMN updated_at TEXT')
+    saved = worker.run(target)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('UPDATE stock_daily_prices SET volume=volume+1,updated_at=? '
+                     'WHERE trade_date=?', (saved['run']['updated_at'], target))
+    assert worker.read_status(target)['freshness']['status'] == 'STALE'
+
+
+def test_unchanged_inputs_without_timestamps_are_verifiable_and_future_rows_ignored(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    saved = worker.run(target)
+    assert saved['freshness']['status'] == 'CURRENT'
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('UPDATE stock_daily_prices SET volume=volume+1 WHERE trade_date>?',
+                     (target,))
+    assert worker.read_status(target)['freshness']['status'] == 'CURRENT'
+
+
 def test_first_enable_does_not_backfill_historical_buy_events(tmp_path):
     worker, _, prices = monitor(tmp_path)
     data = worker.run(_holding_day(prices))
@@ -163,6 +199,79 @@ def test_read_monitor_is_read_only_exact_date_and_pool_filter(tmp_path):
     assert path.stat().st_mtime_ns == before
 
 
+def test_quality_recovery_marks_old_snapshot_stale_without_writing(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('DELETE FROM data_quality_report WHERE trade_date=?', (target,))
+    worker.run(target)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('INSERT INTO data_quality_report VALUES (?,?,?,?,?)',
+                     (target, 'stock_daily', 'SH', 'PASS', target))
+    before = path.stat().st_mtime_ns
+
+    data = worker.read_status(target)
+
+    assert data['freshness'] == {'status': 'STALE', 'reason': 'quality_changed'}
+    assert data['run']['status'] == 'BLOCKED'
+    assert data['rows'][0]['reason'] == 'stock_daily_quality_missing:SH'
+    assert data['events'] == []
+    assert path.stat().st_mtime_ns == before
+    restored = worker.run(target)
+    assert restored['freshness'] == {'status': 'CURRENT', 'reason': None}
+    assert restored['rows'][0]['data_status'] == 'OK'
+
+
+def test_current_quality_failure_invalidates_saved_buy_without_rerunning(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    worker.run(target)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("UPDATE data_quality_report SET status='FAIL' WHERE trade_date=?", (target,))
+    before = path.stat().st_mtime_ns
+    data = worker.read_status(target)
+    assert data['freshness'] == {'status': 'STALE', 'reason': 'quality_changed'}
+    assert data['run']['status'] == 'COMPLETED'
+    assert path.stat().st_mtime_ns == before
+
+
+def test_unchanged_quality_failure_stays_blocked_and_current(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("UPDATE data_quality_report SET status='FAIL' WHERE trade_date=?", (target,))
+    worker.run(target)
+    data = worker.read_status(target)
+    assert data['freshness'] == {'status': 'CURRENT', 'reason': None}
+    assert data['rows'][0]['data_status'] == 'BLOCKED'
+    assert data['events'] == []
+
+
+def test_timestamp_only_refresh_does_not_invalidate_unchanged_inputs(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    worker.run(target)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('ALTER TABLE stock_daily_prices ADD COLUMN updated_at TEXT')
+        conn.execute('UPDATE stock_daily_prices SET updated_at=? WHERE trade_date=?',
+                     ('2099-01-01T00:00:00+08:00', target))
+    data = worker.read_status(target)
+    assert data['freshness'] == {'status': 'CURRENT', 'reason': None}
+
+
+def test_recovered_target_bar_marks_prior_missing_bar_snapshot_stale(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        saved = conn.execute('SELECT * FROM stock_daily_prices WHERE trade_date=?', (target,)).fetchone()
+        conn.execute('DELETE FROM stock_daily_prices WHERE trade_date=?', (target,))
+    worker.run(target)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('INSERT INTO stock_daily_prices VALUES (?,?,?,?,?,?,?)', saved)
+    data = worker.read_status(target)
+    assert data['freshness'] == {'status': 'STALE', 'reason': 'price_data_changed'}
+
+
 def test_blocked_recalculation_withdraws_stale_current_event_then_recovers(tmp_path):
     worker, path, prices = monitor(tmp_path)
     target = _buy_day(prices)
@@ -224,7 +333,7 @@ def test_pipeline_child_reuses_parent_lock_only_with_matching_stage(tmp_path):
         assert worker.run(target, workflow_child=True)['counts']['total'] == 1
 
 
-def test_workflow_c_is_best_effort_before_combined_digest_and_not_morning(tmp_path, monkeypatch):
+def test_workflow_c_is_best_effort_before_digest_and_in_morning(tmp_path, monkeypatch):
     import scripts.run_daily_data_workflow as workflow
     path, prices = make_db(tmp_path)
     monkeypatch.setattr(workflow, 'DB_PATH', path)
@@ -239,7 +348,9 @@ def test_workflow_c_is_best_effort_before_combined_digest_and_not_morning(tmp_pa
     assert names.index('watch_email_immediate') < names.index('structure_monitor')
     assert names.index('structure_monitor') < names.index('watch_email_digest')
     args.morning = True
-    assert all(t.name != 'structure_monitor' for t in workflow.make_tasks(args))
+    morning = next(t for t in workflow.make_tasks(args) if t.name == 'structure_monitor')
+    assert not morning.critical and morning.timeout_seconds == 120
+    assert morning.command[morning.command.index('--trade-date') + 1] == prices[-1]['trade_date']
 
 
 def test_monitor_new_version_never_reads_old_run_or_events(tmp_path, monkeypatch):
@@ -325,3 +436,190 @@ def test_bad_current_ohlcv_blocks_without_previous_price_reuse(tmp_path):
     assert row['data_status'] == 'BLOCKED'
     assert row['reason'].startswith('invalid_ohlcv:')
     assert row['current_price'] is None
+
+
+def historical_db(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    days = [row['trade_date'] for row in prices if row['trade_date'] <= target][-20:]
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.executescript('''
+            CREATE TABLE strategy_run_log(strategy_name TEXT,trade_date TEXT,status TEXT);
+            CREATE TABLE quant_preselect_results(strategy_name TEXT,trade_date TEXT,symbol TEXT);
+            INSERT INTO stock_pools VALUES ('smart_mrgc_20d','MRGC',0);
+            INSERT INTO stock_pool_members VALUES ('smart_mrgc_20d','600999');
+            CREATE TABLE watch_events(id TEXT);
+            INSERT INTO watch_events VALUES ('untouched');
+            CREATE TABLE portfolio_positions(id TEXT);
+            INSERT INTO portfolio_positions VALUES ('untouched');
+            CREATE TABLE notification_deliveries(id TEXT);
+            INSERT INTO notification_deliveries VALUES ('untouched');
+        ''')
+        conn.executemany("INSERT INTO strategy_run_log VALUES ('mrgc_v1',?,'success')",
+                         [(day,) for day in days])
+        conn.execute("INSERT INTO quant_preselect_results VALUES ('mrgc_v1',?,'600641')", (target,))
+        conn.execute("INSERT INTO quant_preselect_results VALUES ('mrgc_v1','2099-01-01','600998')")
+    return worker, path, prices
+
+
+def test_historical_scope_is_read_only_exact_date_and_current_pool_unchanged(tmp_path, monkeypatch):
+    from quant_engine.watch import smart_mrgc_pool
+    worker, path, prices = historical_db(tmp_path)
+    target = _buy_day(prices)
+    monkeypatch.setattr(smart_mrgc_pool, 'refresh', lambda *a: pytest.fail('historical refresh'))
+    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        scope = worker.resolve_scope(conn, target, historical=True)
+        assert scope['status'] == 'READY'
+        assert set(scope['members']) == {'600641'}
+        assert scope['membership_source'] == 'backfill_time_members'
+    first = worker.run(target, historical=True)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("DELETE FROM stock_pool_members WHERE pool_id='a'")
+        conn.execute("INSERT INTO stock_pool_members VALUES ('a','600997')")
+        conn.execute('UPDATE stock_daily_prices SET volume=999 WHERE trade_date>?', (target,))
+        before = conn.iterdump()
+        protected = [line for line in before if any(table in line for table in
+            ('stock_pool', 'watch_events', 'portfolio_positions', 'notification_deliveries'))]
+    second = worker.run(target, historical=True)
+    assert second['counts'] == first['counts']
+    assert second['rows'][0]['pool_ids'] == ['a', 'b', 'smart_mrgc_20d']
+    assert second['rows'][0]['state']['_input_digest'] == first['rows'][0]['state']['_input_digest']
+    assert second['run']['stats']['historical'] is True
+    assert second['run']['stats']['membership_source'] == 'historical_snapshot'
+    assert second['freshness']['status'] == 'CURRENT'
+    with closing(sqlite3.connect(path)) as conn:
+        assert protected == [line for line in conn.iterdump() if any(table in line for table in
+            ('stock_pool', 'watch_events', 'portfolio_positions', 'notification_deliveries'))]
+        assert conn.execute('SELECT COUNT(*) FROM structure_monitor_runs').fetchone()[0] == 1
+        assert conn.execute('SELECT COUNT(*) FROM structure_monitor_events').fetchone()[0] == 1
+
+
+def test_historical_scope_reuses_manual_snapshot_even_when_current_pool_is_over_capacity(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    worker.run(target)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('DELETE FROM stock_pool_members')
+        conn.executemany("INSERT INTO stock_pool_members VALUES ('a',?)",
+                         [(f'{600000+i}',) for i in range(301)])
+    data = worker.run(target, historical=True)
+    assert [row['symbol'] for row in data['rows']] == ['600641']
+    assert data['rows'][0]['pool_ids'] == ['a', 'b']
+
+
+def test_historical_membership_failure_has_blocked_run_ledger(tmp_path):
+    worker, path, prices = historical_db(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('DELETE FROM strategy_run_log WHERE trade_date=?', (target,))
+    result = worker.run(target, historical=True)
+    assert result['run']['status'] == 'BLOCKED'
+    assert result['run']['stats']['membership_reason'] == 'mrgc_dates_missing'
+    assert result['run']['stats']['historical'] is True
+    assert result['rows'] == []
+
+
+@pytest.mark.parametrize('status,exit_code', [('BLOCKED', 1), ('COMPLETED', 0)])
+def test_cli_historical_flag_and_blocked_exit_status(tmp_path, monkeypatch, capsys, status, exit_code):
+    import scripts.run_structure_monitor as cli
+    from unittest.mock import Mock
+    result = dict(trade_date='2026-09-30', version='test', config_hash='test', scope='test',
+                  counts={'total': 0}, run={'status': status})
+    run = Mock(return_value=result)
+    monkeypatch.setattr(cli.StructureMonitor, 'run', run)
+    monkeypatch.setattr('sys.argv', ['run_structure_monitor.py', '--trade-date', '2026-09-30',
+                                   '--db', str(tmp_path / 'cli.db'), '--historical', '--workflow-child'])
+    assert cli.main() == exit_code
+    run.assert_called_once_with('2026-09-30', workflow_child=True, historical=True)
+    assert json.loads(capsys.readouterr().out)['run']['status'] == status
+
+
+def test_historical_child_inherits_only_matching_parent_lock(tmp_path, monkeypatch):
+    import os
+    worker, _, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with worker.lock_path.open('w+') as handle:
+        handle.write(json.dumps(dict(pid=os.getppid(), stage='structure_monitor',
+                                     target_trade_date=target)))
+        handle.flush()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert worker.run(target, historical=True, workflow_child=True)['run']['status'] == 'COMPLETED'
+        with pytest.raises(RuntimeError, match='busy'):
+            worker.run(_next_day(prices, target), historical=True, workflow_child=True)
+
+
+def test_historical_manual_daily_snapshot_is_used_without_mutation(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    groups = [dict(pool_id='a', name='冻结池', symbols=['600642'])]
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('CREATE TABLE three_group_daily_runs(trade_date TEXT,groups_json TEXT)')
+        conn.execute('INSERT INTO three_group_daily_runs VALUES (?,?)', (target, json.dumps(groups)))
+    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        scope = worker.resolve_scope(conn, target, historical=True)
+    assert scope['members']['600641']['pool_ids'] == ['b']
+    assert scope['members']['600642']['pool_ids'] == ['a']
+    assert scope['membership_sources'] == {'a': 'historical_snapshot', 'b': 'backfill_time_members'}
+
+
+def test_historical_scope_limit_and_invalid_member_fail_without_partial_run(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('DELETE FROM stock_pool_members')
+        conn.executemany("INSERT INTO stock_pool_members VALUES ('a',?)",
+                         [(f'{600000+i}',) for i in range(301)])
+    with pytest.raises(ValueError, match='300'):
+        worker.run(target, historical=True)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        assert conn.execute('SELECT COUNT(*) FROM structure_monitor_runs').fetchone()[0] == 0
+        conn.execute('DELETE FROM stock_pool_members')
+        conn.execute("INSERT INTO stock_pool_members VALUES ('a','bad')")
+    with pytest.raises(ValueError, match='invalid'):
+        worker.run(target, historical=True)
+
+
+def test_historical_run_does_not_prune_other_dates_and_digest_remains_read_only(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        worker.ensure_schema(conn)
+        conn.execute('INSERT INTO structure_monitor_runs VALUES (?,?,?,?,?,?,?,?,?)',
+            ('2023-01-01', 'old', 'old', 'COMPLETED', 'old', '{}', '{}', 0, 'old'))
+    worker.run(target, historical=True)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        assert conn.execute("SELECT 1 FROM structure_monitor_runs WHERE version='old'").fetchone()
+        conn.execute('UPDATE stock_daily_prices SET volume=volume+1 WHERE trade_date=?',
+                     (prices[0]['trade_date'],))
+    before = path.stat().st_mtime_ns
+    assert worker.read_status(target)['freshness']['status'] == 'STALE'
+    assert before == path.stat().st_mtime_ns
+
+
+def test_historical_membership_recovery_keeps_original_manual_scope(tmp_path):
+    worker, path, prices = historical_db(tmp_path)
+    target = _buy_day(prices)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('DELETE FROM strategy_run_log WHERE trade_date=?', (target,))
+    assert worker.run(target, historical=True)['run']['status'] == 'BLOCKED'
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("UPDATE stock_pool_members SET symbol='600997' WHERE pool_id IN ('a','b')")
+        conn.execute("INSERT INTO strategy_run_log VALUES ('mrgc_v1',?,'success')", (target,))
+    data = worker.run(target, historical=True)
+    assert data['run']['status'] == 'COMPLETED'
+    assert [row['symbol'] for row in data['rows']] == ['600641']
+    assert data['rows'][0]['pool_ids'] == ['a', 'b', 'smart_mrgc_20d']
+
+
+def test_partial_daily_c_run_does_not_claim_full_historical_membership(tmp_path):
+    worker, path, prices = monitor(tmp_path)
+    target = _buy_day(prices)
+    worker.run(target, historical=True)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("UPDATE structure_monitor_runs SET scope='three_group_daily_supplement'")
+        conn.execute("INSERT INTO stock_pool_members VALUES ('a','600642')")
+        conn.row_factory = sqlite3.Row
+        scope = worker.resolve_scope(conn, target, historical=True)
+    assert set(scope['members']) == {'600641', '600642'}

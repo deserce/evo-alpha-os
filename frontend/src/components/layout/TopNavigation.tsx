@@ -29,7 +29,7 @@ import { useGlobalStore } from '@/lib/store';
 import { quantApi } from '@/lib/api';
 
 const NAV_TABS = [
-  { id: 'dashboard', label: 'Dashboard', sub: '总览', path: '/a/quant', activePath: '/a/quant', icon: Radar },
+  { id: 'dashboard', label: 'Dashboard', sub: '总览', path: '/a/dashboard', activePath: '/a/dashboard', icon: Radar },
   { id: 'market', label: 'Market', sub: '市场温度', path: '/a/market', activePath: '/a/market', icon: Activity },
   { id: 'sector', label: 'Industries', sub: '行业战役', path: '/a/sector', activePath: '/a/sector', icon: Layers },
   { id: 'strategy', label: 'Strategy', sub: '策略选股', path: '/a/strategy', activePath: '/a/strategy', icon: Target },
@@ -82,7 +82,7 @@ export default function TopNavigation() {
       <header className="evo-topbar sticky top-0 z-40 w-full">
         <div className="flex h-12 items-center justify-between gap-3 px-3 sm:px-4">
           <div className="flex min-w-0 items-center gap-3">
-            <Link href="/a/quant" className="flex shrink-0 items-center gap-2">
+            <Link href="/a/dashboard" className="flex shrink-0 items-center gap-2">
               <div className="evo-mobile-logo">
                 <span>A</span>
               </div>
@@ -160,7 +160,7 @@ export default function TopNavigation() {
                     <Link href="/a/data" onClick={() => setShowSettingsMenu(false)} className="flex items-center gap-2 px-3 py-2 text-xs text-text-secondary hover:bg-bg-tertiary hover:text-text-primary">
                       <Database size={13} /> 数据管理
                     </Link>
-                    <Link href="/a/quant#ai-brief" onClick={() => setShowSettingsMenu(false)} className="flex items-center gap-2 px-3 py-2 text-xs text-text-secondary hover:bg-bg-tertiary hover:text-text-primary">
+                    <Link href="/a/dashboard#ai-brief" onClick={() => setShowSettingsMenu(false)} className="flex items-center gap-2 px-3 py-2 text-xs text-text-secondary hover:bg-bg-tertiary hover:text-text-primary">
                       <Bot size={13} /> AI 实验室
                     </Link>
                   </div>

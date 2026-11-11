@@ -13,6 +13,286 @@ from scripts.standalone.collect_stock_kline_mootdx_qfq import (
 )
 
 
+@pytest.fixture
+def resume_db():
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    conn = sqlite3.connect(":memory:")
+    collector.init_target_table(conn, "prices")
+    collector.init_raw_target_table(conn, "raw_prices")
+    for symbol in ("000001", "600000", "920001", "000003", "000004"):
+        bse = symbol.startswith("92")
+        conn.execute(
+            "INSERT INTO prices(symbol,trade_date,open,high,low,close,volume,amount,"
+            "turnover_rate,source,adjustment_mode,quality_flag,market) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, "2026-10-30", 10, 11, 9, 10, 100, 1000,
+             None if bse else 1, "tdx_standard_bj" if bse else collector.SOURCE_NAME,
+             "none" if bse else "qfq", "ok", "BSE" if bse else "SH" if symbol.startswith("6") else "SZ"),
+        )
+    for symbol in ("000001", "920001", "000002", "000003", "000004"):
+        conn.execute(
+            "INSERT INTO raw_prices(symbol,trade_date,close,source,adjustment_mode,quality_flag) "
+            "VALUES (?, '2026-10-30 00:00:00.000000', ?, ?, 'none', 'ok_unadjusted')",
+            (symbol, 0 if symbol == "000004" else 10, collector.RAW_SOURCE_NAME),
+        )
+    conn.execute("UPDATE prices SET high=8 WHERE symbol='000003'")
+    conn.commit()
+    yield conn
+    conn.close()
+
+
+def test_resume_selects_missing_or_invalid_dual_rows_without_history_scan(resume_db):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    queries = []
+    resume_db.set_trace_callback(queries.append)
+    symbols = ["000001", "600000", "920001", "000002", "000003", "000004"]
+    pending, complete = collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", symbols, date(2026, 10, 30)
+    )
+    assert pending == ["600000", "000002", "000003", "000004"]
+    assert complete == ["000001", "920001"]
+    assert not any("MAX(" in sql.upper() or "GROUP BY" in sql.upper() for sql in queries)
+    assert resume_db.total_changes == 11
+
+
+def test_resume_does_not_treat_another_date_as_target_completion(resume_db):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    assert collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", ["000001"], date(2026, 10, 29)
+    ) == (["000001"], [])
+
+
+def test_resume_validates_table_names_before_sql(resume_db):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    with pytest.raises(ValueError, match="invalid table"):
+        collector.select_resume_symbols(
+            resume_db, "prices; DROP TABLE prices", "raw_prices", ["000001"], date(2026, 10, 30)
+        )
+
+
+@pytest.mark.parametrize("column,value", [
+    ("close", None), ("source", "unknown"), ("adjustment_mode", "none"),
+    ("quality_flag", "FAIL"), ("turnover_rate", None),
+])
+def test_resume_never_skips_invalid_market_data(resume_db, column, value):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    resume_db.execute(f"UPDATE prices SET {column}=? WHERE symbol='000001'", (value,))
+    assert collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", ["000001"], date(2026, 10, 30)
+    ) == (["000001"], [])
+
+
+def test_resume_rejects_duplicate_same_day_rows(resume_db):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    resume_db.execute("INSERT INTO prices SELECT symbol, '2026-10-30 00:00:00', "
+                      "open,close,high,low,volume,amount,pct_chg,turnover_rate,source,"
+                      "quality_flag,run_id,updated_at,adjustment_mode,market "
+                      "FROM prices WHERE symbol='000001'")
+    assert collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", ["000001"], date(2026, 10, 30)
+    ) == (["000001"], [])
+
+
+@pytest.mark.parametrize("symbol", ["000001", "920001"])
+def test_resume_does_not_skip_inconsistent_raw_and_latest_close(resume_db, symbol):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    resume_db.execute("UPDATE raw_prices SET close=1309.22 WHERE symbol=?", (symbol,))
+    assert collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", [symbol], date(2026, 10, 30)
+    ) == ([symbol], [])
+
+
+@pytest.mark.parametrize("column,value", [("source", "unknown"), ("turnover_rate", 0),
+                                         ("quality_flag", "FAIL")])
+def test_resume_replaces_classified_bad_rows_in_the_database(resume_db, column, value):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    daily = pd.read_sql_query("SELECT * FROM prices WHERE symbol='000001'", resume_db)
+    raw = pd.read_sql_query("SELECT * FROM raw_prices WHERE symbol='000001'", resume_db)
+    for data in (daily, raw):
+        data["trade_date"] = pd.to_datetime(data["trade_date"]).dt.date
+    resume_db.execute(f"UPDATE prices SET {column}=? WHERE symbol='000001'", (value,))
+    resume_db.commit()
+    result = FetchResult("000001", "success", "SZ", data=daily, raw_data=raw,
+                         start_date=date(2026, 10, 30), end_date=date(2026, 10, 30),
+                         write_policy="resume_target")
+    assert collector.save_dual_batch(resume_db, "prices", "raw_prices", [result]) == (1, 1)
+    assert collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", ["000001"], date(2026, 10, 30)
+    ) == ([], ["000001"])
+    assert resume_db.execute("SELECT count(*) FROM raw_prices WHERE symbol='000001'").fetchone()[0] == 1
+
+
+def test_resume_post_write_invalid_pair_rolls_back_both_tables(resume_db):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    daily = pd.read_sql_query("SELECT * FROM prices WHERE symbol='000001'", resume_db)
+    raw = pd.read_sql_query("SELECT * FROM raw_prices WHERE symbol='000001'", resume_db)
+    for data in (daily, raw):
+        data["trade_date"] = pd.to_datetime(data["trade_date"]).dt.date
+    raw["close"] = 1309.22
+    before = list(resume_db.iterdump())
+    result = FetchResult("000001", "success", "SZ", data=daily, raw_data=raw,
+                         start_date=date(2026, 10, 30), end_date=date(2026, 10, 30),
+                         write_policy="resume_target")
+    with pytest.raises(ValueError, match="resume.*validation"):
+        collector.save_dual_batch(resume_db, "prices", "raw_prices", [result])
+    assert list(resume_db.iterdump()) == before
+
+
+def test_resume_cleans_duplicate_target_rows_but_preserves_history_and_other_symbols(resume_db):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    daily = pd.read_sql_query("SELECT * FROM prices WHERE symbol='000001'", resume_db)
+    raw = pd.read_sql_query("SELECT * FROM raw_prices WHERE symbol='000001'", resume_db)
+    for data in (daily, raw):
+        data["trade_date"] = pd.to_datetime(data["trade_date"]).dt.date
+    resume_db.execute("INSERT INTO prices SELECT symbol,'2026-10-29',open,close,high,low,"
+                      "volume,amount,pct_chg,turnover_rate,source,quality_flag,run_id,updated_at,"
+                      "adjustment_mode,market FROM prices WHERE symbol='000001'")
+    resume_db.execute("INSERT INTO prices SELECT symbol,'2026-10-30 00:00:00.000000',"
+                      "open,close,high,low,volume,amount,pct_chg,turnover_rate,source,quality_flag,"
+                      "run_id,updated_at,adjustment_mode,market FROM prices WHERE symbol='000001' "
+                      "AND trade_date='2026-10-30'")
+    resume_db.execute("UPDATE raw_prices SET close=0 WHERE symbol='000001'")
+    resume_db.commit()
+    queries = {table: f"SELECT * FROM {table} WHERE symbol<>'000001' "
+                     "OR trade_date<'2026-10-30' ORDER BY symbol,trade_date"
+               for table in ("prices", "raw_prices")}
+    before = {table: resume_db.execute(query).fetchall() for table, query in queries.items()}
+    result = FetchResult("000001", "success", "SZ", data=daily, raw_data=raw,
+                         start_date=date(2026, 10, 30), end_date=date(2026, 10, 30),
+                         write_policy="resume_target")
+    collector.save_dual_batch(resume_db, "prices", "raw_prices", [result])
+    assert collector.select_resume_symbols(
+        resume_db, "prices", "raw_prices", ["000001"], date(2026, 10, 30)
+    ) == ([], ["000001"])
+    assert {table: resume_db.execute(query).fetchall()
+            for table, query in queries.items()} == before
+
+
+@pytest.mark.parametrize("target,full_refresh,valid", [
+    ("2026-10-30", False, True), ("2026-10-29", False, False),
+    ("2026-10-31", False, False), ("2026-10-30", True, False),
+])
+def test_resume_date_guard_preserves_historical_adjustment_boundary(target, full_refresh, valid):
+    from datetime import datetime
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    day = date.fromisoformat(target)
+    if valid:
+        collector.validate_resume_request(day, day, full_refresh, datetime(2026, 10, 31, 10))
+    else:
+        with pytest.raises(ValueError, match="latest completed"):
+            collector.validate_resume_request(day, day, full_refresh, datetime(2026, 10, 31, 10))
+
+
+def test_resume_all_complete_cli_never_opens_a_market_connection(resume_db, monkeypatch):
+    import sys
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    monkeypatch.setattr(collector, "ensure_data_core_schema", lambda *args: None)
+    monkeypatch.setattr(collector, "get_db_connection", lambda: resume_db)
+    monkeypatch.setattr(collector, "load_symbols", lambda *args: ["000001", "920001"])
+    monkeypatch.setattr(collector, "validate_resume_request", lambda *args: None)
+    monkeypatch.setattr(collector, "log_data_source_run", lambda *args, **kwargs: None)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("complete dates need neither discovery nor a history scan")
+
+    monkeypatch.setattr(collector, "AdapterPool", forbidden)
+    monkeypatch.setattr(collector, "load_last_dates", forbidden)
+    monkeypatch.setattr(sys, "argv", ["collector", "--start", "2026-10-30", "--end",
+                                     "2026-10-30", "--force-window", "--resume-target-day",
+                                     "--table", "prices", "--raw-table", "raw_prices"])
+    assert collector.main() == 0
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("no raw data", "WARNING"), ("source unavailable", "FAIL"),
+    ("malformed payload", "FAIL"),
+])
+def test_source_summary_separates_no_raw_data_from_source_outage(monkeypatch, reason, expected):
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    logs = []
+    monkeypatch.setattr(collector, "log_data_source_run", lambda *args, **kwargs: logs.append(kwargs))
+    collector.log_source_summary(
+        None, run_id="fixture", trade_date="2026-10-30", duration=1,
+        results=[FetchResult("000001", "skip", "SZ", reason="up-to-date"),
+                 FetchResult("000004", "fail", "SZ", reason=reason)],
+    )
+    row = next(row for row in logs if row["market"] == "SZ")
+    assert row["status"] == expected
+    assert row["fail_count"] == 1
+
+
+@pytest.mark.parametrize("recovery_available,permanent_outage", [
+    (True, False), (False, False), (True, True),
+])
+def test_batch_recovers_once_without_refetching_successes(
+    monkeypatch, recovery_available, permanent_outage
+):
+    from types import SimpleNamespace
+    from scripts.standalone import collect_stock_kline_mootdx_qfq as collector
+
+    pools = []
+    calls = []
+    writes = []
+
+    class Pool:
+        STARTUP_BUDGET_SECONDS = 30.0
+
+        def __init__(self, **kwargs):
+            self.generation = len(pools)
+            self.available = 1 if self.generation == 0 or recovery_available else 0
+            self.closed = False
+            pools.append(self)
+
+        def close(self):
+            self.closed = True
+
+    def fetch(symbol, *args, **kwargs):
+        pool = args[5]
+        assert not pool.closed
+        calls.append((symbol, pool.generation))
+        status = "fail" if symbol == "000002" and (pool.generation == 0 or permanent_outage) else "success"
+        return FetchResult(symbol, status, "SZ", reason="source unavailable" if status == "fail" else "")
+
+    def save(conn, table, raw_table, results):
+        writes.extend(r.symbol for r in results)
+        return len(results), len(results)
+
+    monkeypatch.setattr(collector, "AdapterPool", Pool)
+    monkeypatch.setattr(collector, "fetch_one_symbol", fetch)
+    monkeypatch.setattr(collector, "save_dual_batch", save)
+    args = SimpleNamespace(workers=1, pool_size=1, timeout=1, connect_retries=1,
+                           connect_retry_delay=0, submit_window=1, batch_size=2,
+                           diagnostic_only=False, source_outage_threshold=1,
+                           lookback_days=1, full_refresh=False, force_window=True,
+                           max_bars=40, table="prices", raw_table="raw_prices")
+    result = collector.collect_with_recovery(
+        args, None, ["000001", "000002", "000003"], {}, Pool(),
+        date(2026, 10, 30), date(2026, 10, 30),
+    )
+    assert len(pools) == 2
+    assert all(pool.closed for pool in pools)
+    assert calls.count(("000001", 0)) == 1
+    assert ("000001", 1) not in calls
+    assert result.recoveries == 1
+    recovered = recovery_available and not permanent_outage
+    assert result.outage is (not recovered)
+    assert writes == (["000001", "000002", "000003"] if recovered else ["000001"])
+    assert [r.status for r in result.results] == (["success"] * 3 if recovered else ["success", "fail"])
+
+
 @pytest.mark.parametrize("results, expected", [
     ([FetchResult("600000", "fail", "SH"),
       FetchResult("000001", "fail", "SZ"),

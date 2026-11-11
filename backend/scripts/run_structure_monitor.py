@@ -28,16 +28,18 @@ def main() -> int:
     parser.add_argument('--trade-date', required=True)
     parser.add_argument('--db', type=Path, default=BACKEND_DIR / 'data' / 'local_quant.db')
     parser.add_argument('--workflow-child', action='store_true')
+    parser.add_argument('--historical', action='store_true')
     args = parser.parse_args()
     try:
-        result = StructureMonitor(args.db).run(args.trade_date, workflow_child=args.workflow_child)
+        result = StructureMonitor(args.db).run(args.trade_date, workflow_child=args.workflow_child,
+                                              historical=args.historical)
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
         logging.getLogger(__name__).error('C monitor failed: %s', exc)
         return 1
     print(json.dumps({key: result[key] for key in
                       ('trade_date', 'version', 'config_hash', 'scope', 'counts', 'run')},
                      ensure_ascii=False))
-    return 0
+    return 0 if result['run'] and result['run']['status'] == 'COMPLETED' else 1
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ from app.api.v1.watch import router as watch_router
 from app.api.v1.portfolio import router as portfolio_router
 from app.api.v1.structure_candidate import router as structure_candidate_router
 from app.api.v1.chart_signals import router as chart_signals_router
+from app.api.v1.research import router as research_router
 
 # 创建统一的v1路由器
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -37,3 +38,4 @@ api_v1_router.include_router(structure_candidate_router)
 __all__ = ["api_v1_router"]
 
 api_v1_router.include_router(chart_signals_router)
+api_v1_router.include_router(research_router)

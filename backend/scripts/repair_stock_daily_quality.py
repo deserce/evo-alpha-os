@@ -107,7 +107,22 @@ def abnormal_symbols(conn: sqlite3.Connection, trade_date: str) -> set[str]:
         """,
         (trade_date,),
     ).fetchall()
-    return {str(row[0]).zfill(6) for row in rows}
+    symbols = {str(row[0]).zfill(6) for row in rows}
+    clones = conn.execute('''
+        WITH day_rows AS (
+            SELECT symbol,market,ROUND(open,4) o,ROUND(high,4) h,ROUND(low,4) l,
+                   ROUND(close,4) c,ROUND(volume,4) v,ROUND(amount,4) a
+            FROM stock_daily_prices WHERE trade_date>=? AND trade_date<DATE(?,'+1 day')
+              AND volume>=1000 AND amount>0
+        ), cloned AS (
+            SELECT market,o,h,l,c,v,a FROM day_rows GROUP BY market,o,h,l,c,v,a
+            HAVING COUNT(DISTINCT symbol)>=3 OR (c>=100 AND COUNT(DISTINCT symbol)>=2)
+        ) SELECT d.symbol FROM day_rows d JOIN cloned c
+          ON d.market=c.market AND d.o=c.o AND d.h=c.h AND d.l=c.l
+          AND d.c=c.c AND d.v=c.v AND d.a=c.a
+        ''', (trade_date, trade_date)).fetchall()
+    symbols.update(str(row[0]).zfill(6) for row in clones)
+    return symbols
 
 
 def write_symbols_file(symbols: list[str]) -> Path:
@@ -136,6 +151,7 @@ def run_targeted_redownload(symbols: list[str], args: argparse.Namespace) -> int
         str(symbols_file),
         "--end",
         args.date,
+        "--force-window",
         "--workers",
         str(args.workers),
         "--pool-size",

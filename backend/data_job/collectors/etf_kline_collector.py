@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, date
 from data_job.common import setup_network_emergency_kit, setup_backend_path, setup_logger
 
 # 基类导入
-from data_job.core.base_collector import BaseCollector
+from data_job.core.base_collector import BaseCollector, NetworkError
 from data_job.core.mootdx_adapter import MootdxAdapter
 from data_core.market_calendar import is_a_share_session
 
@@ -55,6 +55,14 @@ class ETFKlineCollector(BaseCollector):
         self.table_name = "etf_daily_prices"
         self.http_failure_count = 0
         self.http_circuit_threshold = 3
+
+    def _health_check(self):
+        """仅检查数据库，行情源可用性由正式 fetch 验证，避免百度 HTTP 拦截 TDX。"""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as e:
+            raise NetworkError(f"数据库连接失败: {e}") from e
 
     def _init_table(self):
         """初始化 ETF K线表"""

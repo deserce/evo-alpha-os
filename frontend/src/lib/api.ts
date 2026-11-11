@@ -319,7 +319,7 @@ export const strategyApi = {
 
 export const quantApi = {
   getDates: (limit: number = 120) => api.get('/v1/quant/dates', { params: { limit } }),
-  getDashboard: (tradeDate?: string) => api.get('/v1/quant/dashboard', { params: { trade_date: tradeDate } }),
+  getDashboard: (tradeDate?: string, exactDate = false) => api.get('/v1/quant/dashboard', { params: { trade_date: tradeDate, exact_date: exactDate || undefined } }),
   getMonitor: () => api.get('/v1/quant/monitor'),
   getDataManagement: (params?: { includeQualityDetail?: boolean; includeDuplicates?: boolean }) =>
     api.get('/v1/quant/data-management', {
@@ -341,18 +341,20 @@ export const quantApi = {
         limit: params.limit ?? 200,
       },
     }),
-  getSignals: (params: { tradeDate?: string; signalType?: string; limit?: number }) =>
+  getSignals: (params: { tradeDate?: string; signalType?: string; limit?: number; exactDate?: boolean }) =>
     api.get('/v1/quant/signals', {
       params: {
         trade_date: params.tradeDate,
+        exact_date: params.exactDate,
         signal_type: params.signalType,
         limit: params.limit ?? 200,
       },
     }),
-  getTradePlans: (params: { tradeDate?: string; status?: string; limit?: number }) =>
+  getTradePlans: (params: { tradeDate?: string; status?: string; limit?: number; exactDate?: boolean }) =>
     api.get('/v1/quant/trade-plans', {
       params: {
         trade_date: params.tradeDate,
+        exact_date: params.exactDate,
         status: params.status,
         limit: params.limit ?? 200,
       },
@@ -362,9 +364,10 @@ export const quantApi = {
     limit: number = 100,
     sortBy?: string,
     sortDir: 'asc' | 'desc' = 'desc',
+    exactDate = false,
   ) =>
     api.get('/v1/quant/industry-strength', {
-      params: { trade_date: tradeDate, limit, sort_by: sortBy, sort_dir: sortDir },
+      params: { trade_date: tradeDate, limit, sort_by: sortBy, sort_dir: sortDir, exact_date: exactDate || undefined },
     }),
   getSectorRpsHeatmap: (params: {
     tradeDate?: string;
@@ -414,17 +417,18 @@ export const quantApi = {
         limit: params.limit ?? 200,
       },
     }),
-  getAlphaOpportunities: (params: { tradeDate?: string; rpsPeriod?: number; state?: string; limit?: number }) =>
+  getAlphaOpportunities: (params: { tradeDate?: string; rpsPeriod?: number; state?: string; limit?: number; exactDate?: boolean }) =>
     api.get('/v1/quant/alpha-opportunities', {
       params: {
         trade_date: params.tradeDate,
+        exact_date: params.exactDate,
         rps_period: params.rpsPeriod ?? 20,
         state: params.state,
         limit: params.limit ?? 200,
       },
     }),
-  getResearchSnapshot: (tradeDate?: string, limit: number = 200) =>
-    api.get('/v1/quant/research/snapshot', { params: { trade_date: tradeDate, limit } }),
+  getResearchSnapshot: (tradeDate?: string, limit: number = 200, exactDate = false) =>
+    api.get('/v1/quant/research/snapshot', { params: { trade_date: tradeDate, limit, exact_date: exactDate || undefined } }),
   getReviewSummary: (tradeDate?: string) =>
     api.get('/v1/quant/review/summary', { params: { trade_date: tradeDate } }),
   getBacktestSummary: (params: { startDate?: string; endDate?: string; signalType?: string }) =>
@@ -435,16 +439,19 @@ export const quantApi = {
         signal_type: params.signalType,
       },
     }),
-  getAiBrief: (tradeDate?: string) => api.get('/v1/quant/ai/brief', { params: { trade_date: tradeDate } }),
+  getAiBrief: (tradeDate?: string, exactDate = false) => api.get('/v1/quant/ai/brief', { params: { trade_date: tradeDate, exact_date: exactDate || undefined } }),
   getSyncStatus: () => api.get('/v1/quant/sync/status'),
-  getStrategyResults: (params: { tradeDate?: string; strategyName?: string; limit?: number }) =>
+  getStrategyResults: (params: { tradeDate?: string; strategyName?: string; limit?: number; offset?: number }) =>
     api.get('/v1/quant/strategy/results', {
       params: {
         trade_date: params.tradeDate,
         strategy_name: params.strategyName,
         limit: params.limit ?? 500,
+        offset: params.offset,
       },
     }),
+  getFormulaStrategyRuns: (tradeDate: string) =>
+    api.get('/v1/quant/strategy/formula-runs', { params: { trade_date: tradeDate } }),
   getStrategyMeta: () => api.get('/v1/quant/strategy/meta'),
 };
 
@@ -730,7 +737,33 @@ export interface PortfolioExitEvent {
   updated_at: string;
 }
 
+export type PortfolioDashboardRisk = {
+  trade_date: string;
+  snapshot_ready: boolean;
+  position_count: number;
+  counts: { executable: number; watch: number; blocked: number };
+  rows: Array<{
+    id: number;
+    account_id: number;
+    account_name: string;
+    symbol: string;
+    name: string;
+    event_status: PortfolioExitEventStatus;
+    triggered_at: string;
+    bar_time: string | null;
+    quantity: number;
+    available_quantity: number;
+    recommended_quantity: number;
+    category: 'executable' | 'watch' | 'blocked';
+    reason: string;
+  }>;
+};
+
 export const portfolioApi = {
+  getDashboardRisk: (tradeDate: string) =>
+    apiInstance.get<PortfolioDashboardRisk, PortfolioDashboardRisk>('/v1/portfolio/risk-summary', {
+      params: { trade_date: tradeDate },
+    }),
   getAccounts: () =>
     apiInstance.get<PortfolioAccount[], PortfolioAccount[]>('/v1/portfolio/accounts'),
   createAccount: (payload: PortfolioAccountCreate) =>
