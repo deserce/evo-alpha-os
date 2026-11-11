@@ -1,0 +1,1408 @@
+{
+  "summary": {
+    "universe": 135,
+    "first_price_day": "2026-09-24",
+    "window_start": "2026-09-28",
+    "window_end": "2026-10-30",
+    "rows": 2833,
+    "recent_rows": 2698,
+    "raw_missing": 0,
+    "ratio_change_stocks": 21,
+    "stable_ratio_stocks": 114,
+    "exact_cross_symbol_ohlcv_clones": 0,
+    "invalid_ohlcv": 0,
+    "adjusted_close_jumps_over_31pct": 0,
+    "pct_change_difference_over_0_1pp": 0,
+    "missing_recent_stock_days": 2,
+    "hit_rows_checked": 786,
+    "hit_errors": 0,
+    "trade_rows_checked": 989,
+    "trade_errors": 0,
+    "sample_count": 17,
+    "nontradable_signal_rows": 3,
+    "open_limit_delay_rows": 1
+  },
+  "cost_formula": "(exit_open/entry_open - 0.002)/1.002 - 1",
+  "cost_interpretation": "双边各0.2%均按未加买入费用的入场本金估算；总0.4%；分母含买入费用。不是按卖出成交额收取0.2%的精确佣税模型。",
+  "validation_method": "Independent read-only SQL; t+1 entry open and t+6 exit open for fixed five-session holdings; no imports from analyze.py. Current qfq prices; not original historical price vintage. Open-down-limit exception independently checked against prior close with tick rounding; 002768 exit deferred 2026-10-15 to 2026-10-16. Zero-volume original signal rows kept as nontradable_signal.",
+  "samples": [
+    {
+      "signal_date": "2026-09-28",
+      "symbol": "688498",
+      "name": "源杰科技",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": -0.34248186503623423,
+      "entry_date": "2026-09-29",
+      "exit_date": "2026-10-13",
+      "entry_price": 1593.67,
+      "exit_price": 1053.15,
+      "gross_return": -0.33916682876630666,
+      "net_return": -0.34248186503623423,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-13",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-20",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "C_BUY",
+          "reason": "MACD柱底背离成立，价格止跌与RSI/KDJ动能改善共振；当天早期确认、非右侧底部确认",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-22",
+          "kind": "C_EXIT",
+          "reason": "收盘跌破结构失效线",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "C_BUY",
+          "reason": "MACD柱底背离成立，价格止跌与RSI/KDJ动能改善共振；当天早期确认、非右侧底部确认",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-29",
+          "kind": "C_EXIT",
+          "reason": "收盘跌破结构失效线",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-09-29",
+      "symbol": "688498",
+      "name": "源杰科技",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": -0.28696821173369114,
+      "entry_date": "2026-09-30",
+      "exit_date": "2026-10-14",
+      "entry_price": 1644.2,
+      "exit_price": 1178.0,
+      "gross_return": -0.2835421481571585,
+      "net_return": -0.28696821173369114,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-13",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-20",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "C_BUY",
+          "reason": "MACD柱底背离成立，价格止跌与RSI/KDJ动能改善共振；当天早期确认、非右侧底部确认",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-22",
+          "kind": "C_EXIT",
+          "reason": "收盘跌破结构失效线",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "C_BUY",
+          "reason": "MACD柱底背离成立，价格止跌与RSI/KDJ动能改善共振；当天早期确认、非右侧底部确认",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-29",
+          "kind": "C_EXIT",
+          "reason": "收盘跌破结构失效线",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-09-30",
+      "symbol": "002768",
+      "name": "国恩股份",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": -0.20990893356471485,
+      "entry_date": "2026-10-08",
+      "exit_date": "2026-10-16",
+      "entry_price": 69.84,
+      "exit_price": 55.43,
+      "gross_return": -0.20632875143184426,
+      "net_return": -0.20990893356471485,
+      "exit_delay": 1,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-09-30",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-08",
+          "kind": "C_EXIT",
+          "reason": "连续两日失守MA10且MACD动能走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-09",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-09",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-20",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "C_RISK",
+          "reason": "新确认回踩结构替代旧观察，重新等待确认",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-08",
+      "symbol": "002860",
+      "name": "星帅尔",
+      "expected_status": "nontradable_signal",
+      "reported_status": "nontradable_signal",
+      "reported_net_return": null,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-15",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-15",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-15",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "C_EXIT",
+          "reason": "连续两日失守MA10且MACD动能走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-09",
+      "symbol": "601579",
+      "name": "会稽山",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": -0.3091852010265185,
+      "entry_date": "2026-10-12",
+      "exit_date": "2026-10-19",
+      "entry_price": 40.32,
+      "exit_price": 27.99,
+      "gross_return": -0.3058035714285715,
+      "net_return": -0.3091852010265185,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-08",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-08",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-12",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "C_EXIT",
+          "reason": "连续两日失守MA10且MACD动能走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-20",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "C_BUY",
+          "reason": "MACD柱底背离成立，价格止跌与RSI/KDJ动能改善共振；当天早期确认、非右侧底部确认",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-29",
+          "kind": "C_EXIT",
+          "reason": "收盘跌破结构失效线",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-30",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "C_BUY",
+          "reason": "MACD柱底背离成立，价格止跌与RSI/KDJ动能改善共振；当天早期确认、非右侧底部确认",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-12",
+      "symbol": "002860",
+      "name": "星帅尔",
+      "expected_status": "nontradable_signal",
+      "reported_status": "nontradable_signal",
+      "reported_net_return": null,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-15",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-15",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-15",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "C_EXIT",
+          "reason": "连续两日失守MA10且MACD动能走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-13",
+      "symbol": "002860",
+      "name": "星帅尔",
+      "expected_status": "nontradable_signal",
+      "reported_status": "nontradable_signal",
+      "reported_net_return": null,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-15",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-15",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-15",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "C_EXIT",
+          "reason": "连续两日失守MA10且MACD动能走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-14",
+      "symbol": "301529",
+      "name": "福赛科技",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": 0.20300709999278976,
+      "entry_date": "2026-10-15",
+      "exit_date": "2026-10-22",
+      "entry_price": 116.82,
+      "exit_price": 141.05,
+      "gross_return": 0.2074131141927753,
+      "net_return": 0.20300709999278976,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-08",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-08",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-14",
+          "kind": "C_RISK",
+          "reason": "收盘跌破结构支撑",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-16",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-21",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-21",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-26",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-30",
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-15",
+      "symbol": "301529",
+      "name": "福赛科技",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": 0.17806551421147265,
+      "entry_date": "2026-10-16",
+      "exit_date": "2026-10-23",
+      "entry_price": 119.01,
+      "exit_price": 140.72,
+      "gross_return": 0.18242164523989568,
+      "net_return": 0.17806551421147265,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-08",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-08",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-14",
+          "kind": "C_RISK",
+          "reason": "收盘跌破结构支撑",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-16",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-21",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-21",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-26",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-30",
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-15",
+      "symbol": "688137",
+      "name": "近岸蛋白",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": -0.34712866419970245,
+      "entry_date": "2026-10-16",
+      "exit_date": "2026-10-23",
+      "entry_price": 149.99,
+      "exit_price": 98.42,
+      "gross_return": -0.3438229215281019,
+      "net_return": -0.34712866419970245,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-08",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-08",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-12",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-12",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-14",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-14",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-16",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-19",
+          "kind": "C_EXIT",
+          "reason": "连续两日失守MA10且MACD动能走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-23",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-23",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-27",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-27",
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-16",
+      "symbol": "301529",
+      "name": "福赛科技",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": 0.3365925503708913,
+      "entry_date": "2026-10-19",
+      "exit_date": "2026-10-26",
+      "entry_price": 115.98,
+      "exit_price": 155.56,
+      "gross_return": 0.3412657354716331,
+      "net_return": 0.3365925503708913,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-08",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-08",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-14",
+          "kind": "C_RISK",
+          "reason": "收盘跌破结构支撑",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-16",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-21",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-21",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-26",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-30",
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-16",
+      "symbol": "603236",
+      "name": "移远通信",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": 0.2298550732664466,
+      "entry_date": "2026-10-19",
+      "exit_date": "2026-10-26",
+      "entry_price": 64.87,
+      "exit_price": 80.07,
+      "gross_return": 0.2343147834129795,
+      "net_return": 0.2298550732664466,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-19",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-19",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-21",
+          "kind": "C_RISK",
+          "reason": "价格创新高但MACD正柱低于参考高点，顶背离仅预警、未确认退出",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-22",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-22",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-27",
+          "kind": "C_EXIT",
+          "reason": "顶背离预警后收盘跌破前日低点及MA5，MACD动能继续走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-28",
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-19",
+      "symbol": "603198",
+      "name": "迎驾贡酒",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": 0.03559375459477687,
+      "entry_date": "2026-10-20",
+      "exit_date": "2026-10-27",
+      "entry_price": 40.59,
+      "exit_price": 42.2,
+      "gross_return": 0.03966494210396654,
+      "net_return": 0.03559375459477687,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_BUY",
+          "reason": "[2 买]",
+          "pivot_date": "2026-09-29",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[2 卖]",
+          "pivot_date": "2026-08-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-27",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-27",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-22",
+      "symbol": "301529",
+      "name": "福赛科技",
+      "expected_status": "closed",
+      "reported_status": "closed",
+      "reported_net_return": 0.18238905928904003,
+      "entry_date": "2026-10-23",
+      "exit_date": "2026-10-30",
+      "entry_price": 140.72,
+      "exit_price": 167.0,
+      "gross_return": 0.18675383740761808,
+      "net_return": 0.18238905928904003,
+      "exit_delay": 0,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-08",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-08",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-14",
+          "kind": "C_RISK",
+          "reason": "收盘跌破结构支撑",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-16",
+          "kind": "CHAN_BUY",
+          "reason": "[类 2 买]",
+          "pivot_date": "2026-10-16",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-21",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-21",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-26",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-30",
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-30",
+      "symbol": "603198",
+      "name": "迎驾贡酒",
+      "expected_status": "immature",
+      "reported_status": "immature",
+      "reported_net_return": null,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_BUY",
+          "reason": "[2 买]",
+          "pivot_date": "2026-09-29",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[2 卖]",
+          "pivot_date": "2026-08-13",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-27",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-27",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-30",
+      "symbol": "688686",
+      "name": "奥普特",
+      "expected_status": "immature",
+      "reported_status": "immature",
+      "reported_net_return": null,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-26",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-30",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-30",
+          "evidence": "current_recomputed"
+        }
+      ]
+    },
+    {
+      "signal_date": "2026-10-30",
+      "symbol": "688710",
+      "name": "益诺思",
+      "expected_status": "immature",
+      "reported_status": "immature",
+      "reported_net_return": null,
+      "pass": true,
+      "signals": [
+        {
+          "date": "2026-09-30",
+          "kind": "C_RISK",
+          "reason": "价格创新高但MACD正柱低于参考高点，顶背离仅预警、未确认退出",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-09",
+          "kind": "CHAN_SELL",
+          "reason": "[1 卖]",
+          "pivot_date": "2026-10-09",
+          "evidence": "current_recomputed"
+        },
+        {
+          "date": "2026-10-12",
+          "kind": "C_RISK",
+          "reason": "收盘失守MA10且MACD动能走弱，等待结构验证",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-13",
+          "kind": "C_EXIT",
+          "reason": "顶背离预警后收盘跌破前日低点及MA5，MACD动能继续走弱",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-20",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-20",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-26",
+          "kind": "CHAN_BUY",
+          "reason": "[1 买]",
+          "pivot_date": "2026-10-26",
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-28",
+          "kind": "C_BUY",
+          "reason": "回踩结构成立，收复MA5并突破前日高点，MACD动能改善",
+          "pivot_date": null,
+          "evidence": "archived_before_next_open"
+        },
+        {
+          "date": "2026-10-29",
+          "kind": "CHAN_SELL",
+          "reason": "[2 卖]",
+          "pivot_date": "2026-10-29",
+          "evidence": "archived_before_next_open"
+        }
+      ]
+    }
+  ],
+  "hit_errors": [],
+  "trade_errors": [],
+  "ratio_changes": [
+    {
+      "symbol": "000739",
+      "name": "普洛药业",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0050360493664103,
+      "changes": [
+        {
+          "date": "2026-10-08",
+          "before": 1.0050360493664101,
+          "after": 1.0,
+          "relative_change": -0.005010814656434381
+        }
+      ]
+    },
+    {
+      "symbol": "002303",
+      "name": "美盈森",
+      "min_ratio": 1.0,
+      "max_ratio": 1.012048192323835,
+      "changes": [
+        {
+          "date": "2026-10-16",
+          "before": 1.012048192323835,
+          "after": 1.0,
+          "relative_change": -0.011904761468097935
+        }
+      ]
+    },
+    {
+      "symbol": "002422",
+      "name": "科伦药业",
+      "min_ratio": 1.0,
+      "max_ratio": 1.002925198473407,
+      "changes": [
+        {
+          "date": "2026-10-21",
+          "before": 1.002925198473407,
+          "after": 1.0,
+          "relative_change": -0.002916666644590893
+        }
+      ]
+    },
+    {
+      "symbol": "002472",
+      "name": "双环传动",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0033802818249153,
+      "changes": [
+        {
+          "date": "2026-10-14",
+          "before": 1.0033802818249151,
+          "after": 1.0,
+          "relative_change": -0.003368894013710544
+        }
+      ]
+    },
+    {
+      "symbol": "002807",
+      "name": "江阴银行",
+      "min_ratio": 1.0,
+      "max_ratio": 1.025,
+      "changes": [
+        {
+          "date": "2026-10-16",
+          "before": 1.025,
+          "after": 1.0,
+          "relative_change": -0.024390243902438935
+        }
+      ]
+    },
+    {
+      "symbol": "600026",
+      "name": "中远海能",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0146750521573193,
+      "changes": [
+        {
+          "date": "2026-10-22",
+          "before": 1.0146750521573191,
+          "after": 1.0,
+          "relative_change": -0.014462809671055066
+        }
+      ]
+    },
+    {
+      "symbol": "600039",
+      "name": "四川路桥",
+      "min_ratio": 1.0,
+      "max_ratio": 1.004007123935468,
+      "changes": [
+        {
+          "date": "2026-10-16",
+          "before": 1.004007123935468,
+          "after": 1.0,
+          "relative_change": -0.003991130978992508
+        }
+      ]
+    },
+    {
+      "symbol": "600941",
+      "name": "中国移动",
+      "min_ratio": 1.0,
+      "max_ratio": 1.026462836469757,
+      "changes": [
+        {
+          "date": "2026-09-30",
+          "before": 1.026462836469757,
+          "after": 1.0,
+          "relative_change": -0.025780608444401998
+        }
+      ]
+    },
+    {
+      "symbol": "601101",
+      "name": "昊华能源",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0093299408317586,
+      "changes": [
+        {
+          "date": "2026-10-16",
+          "before": 1.0093299408317584,
+          "after": 1.0,
+          "relative_change": -0.009243697679343521
+        }
+      ]
+    },
+    {
+      "symbol": "601225",
+      "name": "陕西煤业",
+      "min_ratio": 0.9999999999999998,
+      "max_ratio": 1.0020990155735219,
+      "changes": [
+        {
+          "date": "2026-10-22",
+          "before": 1.0020990155735219,
+          "after": 0.9999999999999998,
+          "relative_change": -0.0020946189357553546
+        }
+      ]
+    },
+    {
+      "symbol": "601766",
+      "name": "中国中车",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0170807457181537,
+      "changes": [
+        {
+          "date": "2026-10-15",
+          "before": 1.0170807457181537,
+          "after": 1.0,
+          "relative_change": -0.016793893493768808
+        }
+      ]
+    },
+    {
+      "symbol": "601872",
+      "name": "招商轮船",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0080545226265938,
+      "changes": [
+        {
+          "date": "2026-10-23",
+          "before": 1.0080545226265936,
+          "after": 1.0,
+          "relative_change": -0.007990165656522885
+        }
+      ]
+    },
+    {
+      "symbol": "601919",
+      "name": "中远海控",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0271807850563792,
+      "changes": [
+        {
+          "date": "2026-10-23",
+          "before": 1.0271807850563792,
+          "after": 1.0,
+          "relative_change": -0.02646153963529152
+        }
+      ]
+    },
+    {
+      "symbol": "601985",
+      "name": "中国核电",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0021231422822354,
+      "changes": [
+        {
+          "date": "2026-10-23",
+          "before": 1.0021231422822354,
+          "after": 1.0,
+          "relative_change": -0.0021186440993670175
+        }
+      ]
+    },
+    {
+      "symbol": "603233",
+      "name": "大参林",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0225274719916713,
+      "changes": [
+        {
+          "date": "2026-10-19",
+          "before": 1.0225274719916713,
+          "after": 1.0,
+          "relative_change": -0.02203116552731088
+        }
+      ]
+    },
+    {
+      "symbol": "603337",
+      "name": "杰克科技",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0086455331412105,
+      "changes": [
+        {
+          "date": "2026-10-09",
+          "before": 1.0086455331412105,
+          "after": 1.0000000000000002,
+          "relative_change": -0.008571428571428452
+        }
+      ]
+    },
+    {
+      "symbol": "603939",
+      "name": "益丰药房",
+      "min_ratio": 1.0,
+      "max_ratio": 1.013210039630119,
+      "changes": [
+        {
+          "date": "2026-09-30",
+          "before": 1.013210039630119,
+          "after": 1.0,
+          "relative_change": -0.013037809647979182
+        }
+      ]
+    },
+    {
+      "symbol": "603995",
+      "name": "甬金股份",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0119379228014327,
+      "changes": [
+        {
+          "date": "2026-10-14",
+          "before": 1.0119379228014325,
+          "after": 1.0,
+          "relative_change": -0.011797090051120618
+        }
+      ]
+    },
+    {
+      "symbol": "688029",
+      "name": "南微医学",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0060525360125894,
+      "changes": [
+        {
+          "date": "2026-10-23",
+          "before": 1.0060525360125894,
+          "after": 1.0,
+          "relative_change": -0.006016123210203395
+        }
+      ]
+    },
+    {
+      "symbol": "688046",
+      "name": "药康生物",
+      "min_ratio": 1.0,
+      "max_ratio": 1.0044704262451964,
+      "changes": [
+        {
+          "date": "2026-10-22",
+          "before": 1.0044704262451964,
+          "after": 1.0,
+          "relative_change": -0.004450530476947212
+        }
+      ]
+    },
+    {
+      "symbol": "688072",
+      "name": "拓荆科技",
+      "min_ratio": 1.0,
+      "max_ratio": 1.000568274070466,
+      "changes": [
+        {
+          "date": "2026-10-12",
+          "before": 1.000568274070466,
+          "after": 1.0,
+          "relative_change": -0.0005679513184584373
+        }
+      ]
+    }
+  ],
+  "missing_stock_days": [
+    {
+      "symbol": "002860",
+      "name": "星帅尔",
+      "date": "2026-09-30"
+    },
+    {
+      "symbol": "002860",
+      "name": "星帅尔",
+      "date": "2026-10-09"
+    }
+  ],
+  "clones": [],
+  "invalid_ohlcv": [],
+  "large_jumps": [],
+  "pct_differences": [],
+  "limitations": [
+    "Raw table has close only; qfq/raw ratio changes are compatible with corporate actions but not independently verified announcements.",
+    "Clone check is exact same-day OHLCV among 135 names, not all market and not a proof against subtle corruption.",
+    "Current price records may contain subsequent corrections or qfq rebasing.",
+    "No closing performance attributed to unfinished cases."
+  ],
+  "input_hashes": {
+    "hit_outcomes.csv": "2f2bf8ccba1a52b326e9987666220d8afa98bdf6d2014ddfaf93ca4d24ea9bdc",
+    "trades.csv": "c776f1c6f119ddc9272ee0c2d9d0d8ab599e00423806f545899a4cfad376d056"
+  },
+  "resources": {
+    "elapsed_seconds": 0.088,
+    "peak_rss_bytes": 64585728,
+    "network_requests": 0,
+    "db_writes": 0
+  }
+}
