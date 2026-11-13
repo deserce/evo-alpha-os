@@ -153,6 +153,8 @@ textarea {
 
 .cockpit-card,
 .evo-panel,
+.evo-page-header,
+.dashboard-header,
 .evo-inner-panel,
 .evo-stat {
   border: 1px solid rgba(64, 120, 190, 0.28);
@@ -165,6 +167,8 @@ textarea {
 }
 
 .cockpit-card,
+.evo-page-header,
+.dashboard-header,
 .evo-panel {
   border-radius: 8px;
 }
@@ -1373,8 +1377,13 @@ textarea {
   grid-column: span 3;
 }
 
+.evo-page-header,
 .dashboard-header {
-  min-height: 56px;
+  padding: 6px 10px;
+}
+
+.dashboard-header {
+  min-height: 46px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2207,7 +2216,10 @@ textarea {
   font-size: 12px;
   font-weight: 500;
 }
+.chart-toolbar button[aria-pressed="true"]:not(:disabled),
+.chart-mode-switch > button[aria-pressed="true"],
 .stock-sidebar-tabs > button[aria-selected="true"],
+.stock-sidebar-tabs > button[aria-pressed="true"],
 .stock-sidebar-panel button[aria-pressed="true"] {
   color: var(--brand-blue-light);
   background: color-mix(in srgb, var(--brand-blue) 14%, transparent);

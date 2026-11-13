@@ -722,3 +722,29 @@ Lesson learned: 2026-11-10 Dashboard 一屏验收只测量最后一排底边，�
 Lesson learned: 2026-11-10 统一页面标题时只核对字号，漏查策略与研究重复使用 04、自选股缺少 06。 Rule: 主导航标题的编号按导航顺序验收，策略 04、研究 05、自选股 06，检查标题文案与样式一起生效。
 
 Lesson learned: 2026-11-11 EvoAlpha 后端 `bootout` 后立即 `bootstrap` 返回错误 5，恢复磁盘 plist 也没有立即恢复运行。 Rule: 变更 LaunchAgent 之前备份原配置，重载时等待旧服务退出，对错误 5 只做一次有界重试，并通过监听地址和业务 HTTP 响应核实上线或回滚结果。
+
+Lesson learned: 2026-11-13 将现有 Watchlist 规划为逐户私有会改变管理员统一发布参考池的用途。 Rule: 现有 Watchlist 由管理员维护，所有启用用户可只读查看；另外提供「我的自选」，按用户隔离，管理员也只管理自己的个人自选。
+
+Lesson learned: 2026-11-13 用户指出新页面缺少顶部标签，问题是导航入口未出现在主导航。 Rule: 新增主功能页面时，按用户指定的位置接入现有顶部和移动导航，检查当前页高亮，并在本地预览核验入口可见。
+
+Lesson learned: 2026-11-13 本地登录只用 127.0.0.1 的 HTTP 请求验收，漏掉浏览器通过 localhost 提交时被来源校验拒绝。 Rule: 本地登录验收须覆盖 localhost 和 127.0.0.1 的真实来源及会话回传；3001 测试会话不设固定过期，仍支持退出撤销。
+
+Lesson learned: 2026-11-13 Watchlist 切换使用独立通栏会压缩行情工作区。 Rule: Watchlist 列表切换复用现有工具栏，保持原有工作区起点和可用高度。
+
+Lesson learned: 2026-11-13 个人 Watchlist 独立渲染只显示代码，且缺少日期选择。 Rule: 个人与共享 Watchlist 共用股票表格和全局交易日；按该交易日请求名称、价格、涨跌和 RPS，避免按股重复请求。
+
+Lesson learned: 个人 Watchlist 只复用股票表格仍会让分组管理出现两套界面。 Rule: 个人和共享分组复用同一个管理侧栏，通过各自的 API 执行操作。
+
+Lesson learned: 把 Shared / Mine 放到标题位置时一并移除了 Watchlist 标题。 Rule: 列表切换与 Watchlist 标题同排显示，移除摘要时保留主标题。
+
+Lesson learned: 恢复 Watchlist 标题时漏掉工作区编号 06。 Rule: 调整工作区标题时对照相邻页面保留编号及其样式。
+
+Lesson learned: Mine 复用了个股组件，但独立容器缺少 Shared 的内边距。 Rule: Watchlist 的两种视图共用侧栏宽度和行情区容器样式。
+
+Lesson learned: K 线工具栏的选中态独立拼接颜色时与个股资料出现偏差。 Rule: 板块弹窗、Strategy 和 Watchlist 的 K 线控件通过同一状态选择器复用个股资料高亮。
+
+Lesson learned: 策略侧栏传入 summaryOnly 会使当日提示组件直接返回空。 Rule: 可见提示页签必须渲染完整面板，摘要模式仅用于提供后台上下文。
+
+Lesson learned: 2026-11-13 普通账户能打开行业页，但热图、成分股和走势接口漏配只读权限，页面把 403 显示成无数据。 Rule: 共享页面验收必须覆盖普通账户及页面依赖的全部只读接口，分别验证未登录、正常读取与禁止写入。
+
+Lesson learned: 3001 测试前端使用临时命令启动后随执行会话退出，基金筛选项目的通配监听继续响应同一端口。 Rule: 测试部署必须先核对监听归属，使用独立服务管理进程，并在启动命令退出后复查实际页面标题和新版静态资源。

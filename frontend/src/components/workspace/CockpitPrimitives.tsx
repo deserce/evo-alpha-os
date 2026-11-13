@@ -1,10 +1,10 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import type { CSSProperties, ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { clsx } from 'clsx';
-import { RefreshCw } from 'lucide-react';
-import { AppShell, DateSelect, asList } from './DashboardPrimitives';
+import { AppShell, asList } from './DashboardPrimitives';
 
 export type Row = Record<string, unknown>;
 export type Tone = 'good' | 'warn' | 'bad' | 'blue' | 'neutral';
@@ -96,7 +96,6 @@ export function WorkbenchPage({
   date,
   dates,
   onDateChange,
-  onRefresh,
   children,
 }: {
   index: string;
@@ -105,35 +104,20 @@ export function WorkbenchPage({
   date?: string;
   dates?: string[];
   onDateChange?: (value: string) => void;
-  onRefresh?: () => void;
   children: ReactNode;
 }) {
   return (
     <AppShell>
       <div className="evo-command-space">
-        <div className="mb-2 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-          <div className="min-w-0">
-            <h1 className="evo-page-title">
-              <span className="evo-page-index">{index}</span> {title}
-            </h1>
-            {subtitle && <div className="mt-0.5 text-[11px] text-text-secondary">{subtitle}</div>}
-          </div>
-          <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-            {dates && onDateChange && (
-              <DateSelect value={date} dates={dates} onChange={onDateChange} />
-            )}
-            {onRefresh && (
-              <button
-                type="button"
-                onClick={onRefresh}
-                className="h-9 w-9 rounded-lg border border-border-primary bg-bg-secondary text-text-primary transition-colors hover:border-brand-blue/60 hover:text-brand-blue-light"
-                title="刷新"
-              >
-                <RefreshCw size={14} className="mx-auto" />
-              </button>
-            )}
-          </div>
-        </div>
+        <header className="evo-page-header mb-1.5 flex min-h-[46px] flex-wrap items-center gap-x-3 gap-y-1">
+          <h1 className="evo-page-title whitespace-nowrap">
+            <span className="evo-page-index">{index}</span> {title}
+          </h1>
+          {subtitle && <div className="ml-auto text-right text-[11px] text-text-secondary">{subtitle}</div>}
+          {dates && onDateChange && (
+            <TopbarTradeDate value={date} dates={dates} onChange={onDateChange} />
+          )}
+        </header>
         {children}
       </div>
     </AppShell>

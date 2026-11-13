@@ -1,5 +1,6 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import { useEffect, useRef, useState } from 'react';
 import { parseStockDetailDate } from '@/lib/mrgcReportSelection';
 import { stockDetailReturn } from '@/lib/stockDetailReturn';
@@ -12,58 +13,60 @@ import { AllWatchlistDailyHints, StockDetailPanel } from '@/components/stock/Sto
 import type { DailyHintsContext } from './DailyHintsPanel';
 import { rows } from '@/components/workspace/CockpitPrimitives';
 
-export default function StockDetailView({ symbol }: { symbol: string }) {
+export default function StockDetailView({ symbol, onClose, onSelectStock }: { symbol: string; onClose?: () => void; onSelectStock?: (symbol: string) => void }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const source = searchParams.get('returnTo');
   const returnTo = stockDetailReturn(source);
   const { globalDate, setGlobalDate, setSelectedStock } = useGlobalStore();
   useEffect(() => {
+    if (onClose) return;
     setSelectedStock(symbol);
     try {
       window.localStorage.setItem('evoalpha.stock.symbol', symbol);
     } catch {
       // Global state still preserves navigation when browser storage is unavailable.
     }
-  }, [symbol, setSelectedStock]);
+  }, [symbol, setSelectedStock, onClose]);
   const appliedLink = useRef(false);
   useEffect(() => {
-    if (appliedLink.current) return;
+    if (onClose || appliedLink.current) return;
     appliedLink.current = true;
     const linkedDate = parseStockDetailDate(window.location.search);
     if (linkedDate) setGlobalDate(linkedDate);
-  }, [setGlobalDate]);
+  }, [setGlobalDate, onClose]);
 
   const datesQuery = useQuery({ queryKey: ['quantDates'], queryFn: () => quantApi.getDates(160) });
   const appliedLatestResearch = useRef(false);
   const latestTradeDate = datesQuery.data?.latest;
   useEffect(() => {
-    if (appliedLatestResearch.current || !returnTo.startsWith('/a/research')
+    if (onClose || appliedLatestResearch.current || !returnTo.startsWith('/a/research')
       || searchParams.get('trade_date') || !latestTradeDate) return;
     appliedLatestResearch.current = true;
     setGlobalDate(latestTradeDate);
-  }, [returnTo, searchParams, latestTradeDate, setGlobalDate]);
+  }, [returnTo, searchParams, latestTradeDate, setGlobalDate, onClose]);
   const dates = rows<string>(datesQuery.data?.dates);
-  const selectedDate = globalDate || datesQuery.data?.latest || '';
+  const linkedDate = onClose ? parseStockDetailDate(searchParams.toString()) : '';
+  const selectedDate = linkedDate || (onClose && returnTo.startsWith('/a/research') ? latestTradeDate : globalDate) || latestTradeDate || '';
   const dateOptions = selectedDate && !dates.includes(selectedDate) ? [selectedDate, ...dates] : dates;
 
   const [unifiedHints, setUnifiedHints] = useState<DailyHintsContext>();
-  const selectSymbol = (nextSymbol: string) => router.replace(`/a/stock/${nextSymbol}?returnTo=${encodeURIComponent(returnTo)}`);
+  const selectSymbol = onSelectStock ?? ((nextSymbol: string) => router.replace(`/a/stock/${nextSymbol}?returnTo=${encodeURIComponent(returnTo)}`));
   const dailyHintsPanel = <AllWatchlistDailyHints date={selectedDate}
     onSelectSymbol={selectSymbol} onContext={setUnifiedHints} />;
 
   return (
     <div className="flex h-[calc(100dvh-var(--evo-nav-height,64px))] min-h-0 flex-col">
       {/* 顶部工具栏 */}
-      <div className="flex shrink-0 items-center gap-2 border-b border-border-primary bg-bg-secondary/40 px-3 py-2">
+      <div className="evo-page-header mx-3 mb-1.5 mt-2.5 flex shrink-0 flex-wrap items-center gap-2">
         <button
           type="button"
-          onClick={() => router.push(returnTo)}
+          onClick={onClose ?? (() => router.push(returnTo))}
           className="flex h-8 items-center gap-1 rounded-md border border-border-primary bg-bg-primary px-2 text-[11px] font-bold text-text-secondary transition-colors hover:border-brand-blue/60 hover:text-brand-blue-light"
           title="返回"
         >
           <ArrowLeft size={14} />
-          返回
+          {onClose ? '关闭' : '返回'}
         </button>
         <div className="min-w-0">
           <h1 className="evo-page-title truncate">
@@ -71,16 +74,8 @@ export default function StockDetailView({ symbol }: { symbol: string }) {
           </h1>
         </div>
         <div className="ml-auto flex items-center gap-2">
-          {dates.length > 0 && (
-            <select
-              value={selectedDate}
-              onChange={(event) => setGlobalDate(event.target.value)}
-              className="h-8 rounded-md border border-border-primary bg-bg-primary px-2 text-[11px] font-mono text-text-primary outline-none"
-            >
-              {dateOptions.map((date) => (
-                <option key={date} value={date}>{date}</option>
-              ))}
-            </select>
+          {!onClose && dates.length > 0 && (
+            <TopbarTradeDate value={selectedDate} dates={dateOptions} onChange={setGlobalDate} />
           )}
         </div>
       </div>

@@ -1538,7 +1538,7 @@ selectedAccount && (
     return (
       <WorkbenchPage
         index="07"
-        title="Portfolio  真实持仓"
+        title="真实持仓"
         subtitle={`当前口径：${today}（Asia/Shanghai）`}
       >
         <div className="evo-panel p-8 text-center text-sm text-text-secondary">
@@ -1551,10 +1551,9 @@ selectedAccount && (
   return (
     <WorkbenchPage
       index="07"
-      title="Portfolio  真实持仓"
+      title="真实持仓"
       subtitle={`多账户真实成交记账与持仓管理｜当前口径：${today}（Asia/Shanghai）`}
       date={today}
-      onRefresh={refresh}
     >
       {accountsQuery.isError && (
         <div className="mb-3 rounded-lg border border-danger/40 bg-danger/10 p-3 text-xs text-danger">
@@ -1564,7 +1563,7 @@ selectedAccount && (
 
       {accounts.length === 0 && (
         <div className="mb-3 rounded-lg border border-brand-blue/40 bg-brand-blue/10 p-4">
-          <div className="text-sm font-black text-white">还没有 Portfolio 账户</div>
+          <div className="text-sm font-black text-white">还没有持仓账户</div>
           <div className="mt-1 text-xs text-text-secondary">
             先创建现金或模拟账户，再记录真实成交。系统不会连接券商，也不会自动下单。
           </div>
@@ -1726,6 +1725,14 @@ selectedAccount && (
                   {summary.missingPriceCount} 只持仓缺少行情，未计入市值、可估值资产小计和未实现盈亏。
                 </div>
               )}
+              <div className="mt-3 grid min-w-0 gap-2 border-t border-border-primary pt-3">
+                {selectedAccount?.derived_data_pending && <div className="rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-warning">
+                  成交已记账，历史权益正在等待补齐。以下仅展示已核验快照。
+                </div>}
+                {performanceSnapshotsQuery.isLoading ? <div className="evo-panel p-8 text-text-secondary">正在读取权益…</div>
+                  : performanceSnapshotsQuery.isError ? <div className="evo-panel p-8 text-danger">权益读取失败，请刷新重试。</div>
+                  : <EquityChart snapshots={performanceSnapshots} baselineDate={selectedAccount?.baseline_date} />}
+              </div>
             </>
           ) : (
             <div className="py-8 text-center text-xs text-text-secondary">
@@ -2013,19 +2020,6 @@ selectedAccount && (
 
 
       </div>
-
-      <div className="mt-2 grid min-w-0 gap-2">
-
-
-        {selectedAccount?.derived_data_pending && <div className="rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-warning">
-          成交已记账，历史权益正在等待补齐。以下仅展示已核验快照。
-        </div>}
-        {performanceSnapshotsQuery.isLoading ? <div className="evo-panel p-8 text-text-secondary">正在读取权益…</div>
-          : performanceSnapshotsQuery.isError ? <div className="evo-panel p-8 text-danger">权益读取失败，请刷新重试。</div>
-          : <EquityChart snapshots={performanceSnapshots} baselineDate={selectedAccount?.baseline_date} />}
-
-      </div>
-
 
       <PortfolioDisclosure title="卖点计划与监控状态" icon={ShieldAlert}>
             <div id="portfolio-exit-plans">
@@ -2545,7 +2539,7 @@ selectedAccount && (
 
       <div className="mt-3 flex items-center gap-2 rounded-lg border border-border-primary bg-bg-primary/70 p-3 text-[11px] text-text-secondary">
         <CircleDollarSign size={14} className="text-brand-blue-light" />
-        所有金额均由整数分、价格由整数微元换算展示；刷新只重新读取数据，不产生交易或持仓写入。
+        所有金额均由整数分、价格由整数微元换算展示。
       </div>
       <BookingDrawer open={bookingOpen} onClose={() => setBookingOpen(false)}
         initialTab={bookingTab} accountId={activeAccountId} onBooked={refresh}

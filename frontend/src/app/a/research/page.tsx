@@ -1,5 +1,6 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import { Suspense, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
@@ -9,7 +10,9 @@ import { formatResearchTime, researchPageNumber, researchSyncMessage } from '@/l
 import { quantApi } from '@/lib/api';
 import { useGlobalStore } from '@/lib/store';
 import { ResearchReportList } from '@/components/research/ResearchReportList';
-import { CockpitPanel, CompactTable, WorkbenchPage, type Row, rows } from '@/components/workspace/CockpitPrimitives';
+import { CockpitPanel, CompactTable, type Row, rows } from '@/components/workspace/CockpitPrimitives';
+
+import { AppShell } from '@/components/workspace/DashboardPrimitives';
 
 const fieldClass = 'w-full rounded-lg border border-border-primary bg-bg-primary px-2 py-1.5 text-xs text-text-primary';
 const buttonClass = 'rounded-lg border border-border-primary px-3 py-1.5 text-xs text-text-primary hover:border-brand-blue/60 disabled:opacity-40';
@@ -26,10 +29,7 @@ function ResearchPool() {
   return <CockpitPanel title="产业研究池 · 标的快照" icon={FlaskConical}>
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
       <p className="text-xs text-text-secondary">按原始主题与标的关系展示已有研究快照。研报库与研究池分别维护。</p>
-      <select aria-label="研究池日期" value={selectedDate} onChange={(event) => setGlobalDate(event.target.value)} className={fieldClass + ' max-w-44'}>
-        {selectedDate && !dateList.includes(selectedDate) && <option value={selectedDate}>{selectedDate}</option>}
-        {dateList.map((date) => <option key={date}>{date}</option>)}
-      </select>
+      <TopbarTradeDate value={selectedDate} dates={dateList} onChange={setGlobalDate} />
     </div>
     {snapshot.isLoading || dates.isLoading ? <p role="status" className="p-4 text-text-secondary">正在读取研究池…</p>
       : snapshot.isError || dates.isError ? <p role="alert" className="p-4 text-danger">研究池读取失败。<button className="ml-2 underline" onClick={() => { void dates.refetch(); void snapshot.refetch(); }}>重试</button></p>
@@ -82,10 +82,6 @@ function ReportLibrary() {
     </form>
     <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-y border-border-primary py-1 text-xs text-text-secondary">
       <span>{query.data ? `共 ${query.data.total.toLocaleString()} 篇 · 按发布日期排序` : '研报索引'}</span>
-      <button type="button" className={buttonClass} disabled={query.isFetching || facets.isFetching}
-        onClick={() => { void query.refetch(); void facets.refetch(); }}>
-        {query.isFetching || facets.isFetching ? '正在刷新…' : '刷新列表'}
-      </button>
     </div>
     <div className="min-h-0 flex-1 overflow-auto overscroll-contain">
       <details className="border-b border-border-primary px-2 py-1.5 text-xs text-text-secondary">
@@ -94,9 +90,8 @@ function ReportLibrary() {
         </summary>
         <p className="mt-2">更新计划：{facets.data?.sync?.schedule || '状态暂不可用'}</p>
       <p className="mt-2">最近成功：{facets.data?.sync?.last_success_at ? `${formatResearchTime(facets.data.sync.last_success_at)}（北京时间）` : facets.data?.sync ? '暂无成功记录' : '未确认'} · 覆盖截至：{facets.data?.sync?.coverage_through || '未确认'}</p>
-      <p role={facets.isError || ['failed', 'partial'].includes(facets.data?.sync?.status || '') ? 'alert' : 'status'} className={facets.isError || ['failed', 'partial'].includes(facets.data?.sync?.status || '') ? 'mt-2 text-warning' : 'mt-2'}>{facets.isError ? '更新状态读取失败，已显示的时间可能来自缓存；请刷新列表重试。' : researchSyncMessage(facets.data?.sync)}</p>
+      <p role={facets.isError || ['failed', 'partial'].includes(facets.data?.sync?.status || '') ? 'alert' : 'status'} className={facets.isError || ['failed', 'partial'].includes(facets.data?.sync?.status || '') ? 'mt-2 text-warning' : 'mt-2'}>{facets.isError ? '更新状态读取失败，已显示的时间可能来自缓存。' : researchSyncMessage(facets.data?.sync)}</p>
       {facets.data?.sync?.last_attempt_at && <p className="mt-2">最近尝试：{formatResearchTime(facets.data.sync.last_attempt_at)}（北京时间）</p>}
-      <p className="mt-2">刷新列表只重新读取已入库研报和更新状态，不触发采集。</p>
       </details>
       <ResearchReportList key={`reports:${search.toString()}`} returnTo={`/a/research${search.toString() ? `?${search}` : ''}`} asOfDate={filters.date_to} notImported={query.data?.status === 'not_imported'} items={query.data?.items || []} loading={query.isLoading} error={query.isError} onRetry={() => void query.refetch()} />
     </div>
@@ -109,11 +104,31 @@ function ReportLibrary() {
 
 export default function ResearchPage() {
   const [tab, setTab] = useState<'reports' | 'pool'>('reports');
-  return <WorkbenchPage index="05" title="Research  研究中心" subtitle="检索研报、查看公司覆盖与产业研究标的。">
-    <div className="mb-2 flex shrink-0 gap-2" role="tablist" aria-label="研究中心">
-      <button role="tab" aria-selected={tab === 'reports'} className={buttonClass + (tab === 'reports' ? ' bg-brand-blue/15' : '')} onClick={() => setTab('reports')}>研报库</button>
-      <button role="tab" aria-selected={tab === 'pool'} className={buttonClass + (tab === 'pool' ? ' bg-brand-blue/15' : '')} onClick={() => setTab('pool')}>产业研究池</button>
-    </div>
-    {tab === 'reports' ? <Suspense fallback={<p role="status">正在读取研报…</p>}><ReportLibrary /></Suspense> : <ResearchPool />}
-  </WorkbenchPage>;
+  return (
+    <AppShell>
+      <section className="flex flex-col lg:h-[calc(100dvh-var(--evo-nav-height,64px))]">
+        <header className="evo-page-header mt-2.5 flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="evo-page-title"><span className="evo-page-index">05</span> 研究中心</h1>
+          <div role="group" aria-label="研究中心视图" className="stock-sidebar-tabs inline-flex items-center gap-1">
+            {([{ id: 'reports', label: '研报库' }, { id: 'pool', label: '产业研究池' }] as const).map((view) => (
+              <button
+                key={view.id}
+                type="button"
+                aria-pressed={view.id === tab}
+                onClick={() => setTab(view.id)}
+                className={`px-3 ${view.id === tab
+                  ? 'text-brand-blue-light'
+                  : 'text-text-secondary hover:bg-bg-secondary hover:text-text-primary'}`}
+              >
+                {view.label}
+              </button>
+            ))}
+          </div>
+        </header>
+        <div className="evo-command-space min-h-0 flex-1">
+          {tab === 'reports' ? <Suspense fallback={<p role="status">正在读取研报…</p>}><ReportLibrary /></Suspense> : <ResearchPool />}
+        </div>
+      </section>
+    </AppShell>
+  );
 }

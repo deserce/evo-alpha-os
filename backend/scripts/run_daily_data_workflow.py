@@ -2378,6 +2378,10 @@ def make_repair_tasks(args: argparse.Namespace) -> list[Task]:
             if not historical and watch_dirty and not args.skip_notifications:
                 add('watch_email_digest',(sys.executable,'-m','quant_engine.watch.dispatcher',
                     '--mode','digest','--trade-date',day,'--require-trusted'),timeout=60)
+            accounts_db = os.getenv('EVOALPHA_USERS_DB') or str(DB_PATH.with_name('strategy_watch.db'))
+            if not historical:
+                add('personal_watch', (sys.executable, '-m', 'quant_engine.watch.personal',
+                    '--market', str(DB_PATH), '--accounts', accounts_db, '--date', day), timeout=60)
         if not args.skip_market_side and 'etf' in pending:
             add('etf_daily_prices',(sys.executable,'-m','data_job.collectors.etf_kline_collector',
                 '--start',day,'--end',day,'--max-bars','20'),independent=True,timeout=240)
@@ -3019,6 +3023,15 @@ def make_tasks(args: argparse.Namespace) -> list[Task]:
                 ),
             ]
         )
+
+        accounts_db = os.getenv("EVOALPHA_USERS_DB") or str(DB_PATH.with_name("strategy_watch.db"))
+        if target_trade_date:
+            tasks.append(Task(
+                name="personal_watch",
+                command=(python, "-m", "quant_engine.watch.personal", "--market", str(DB_PATH),
+                         "--accounts", accounts_db, "--date", target_trade_date),
+                critical=False, timeout_seconds=60,
+            ))
 
     if run_p0:
         tasks.append(

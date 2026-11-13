@@ -11,8 +11,10 @@ export const metadata: Metadata = {
 
 export default function RootLayout({
   children,
+  stockModal,
 }: Readonly<{
   children: React.ReactNode;
+  stockModal?: React.ReactNode;
 }>) {
   return (
     <html lang="zh-CN" className="dark">
@@ -21,6 +23,7 @@ export default function RootLayout({
           <ErrorBoundary>
             <MainLayout>
               {children}
+              {stockModal}
             </MainLayout>
           </ErrorBoundary>
         </Providers>

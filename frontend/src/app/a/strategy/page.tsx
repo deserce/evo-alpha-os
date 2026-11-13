@@ -1,5 +1,6 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import {
   useCallback,
   useEffect,
@@ -12,8 +13,6 @@ import {
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   GripVertical,
-  PanelRightClose,
-  PanelRightOpen,
   RefreshCw,
   Sparkles,
   Target,
@@ -21,7 +20,7 @@ import {
 } from 'lucide-react';
 
 import type { DailyHintsContext } from '@/components/stock/DailyHintsPanel';
-import { StockDetailPanel as SharedStockDetailPanel, AllWatchlistDailyHints } from '@/components/stock/StockWorkspace';
+import { StockDetailPanel as SharedStockDetailPanel, SharedDailyHints } from '@/components/stock/StockWorkspace';
 import {
   type Row,
   StageBadge,
@@ -321,8 +320,14 @@ function StockDetailPanel({
   symbol,
   tradeDate,
   onSelectSymbol,
+  scopeId,
+  scopeName,
+  members,
 }: {
   symbol: string;
+  scopeId: string;
+  scopeName: string;
+  members: { symbol: string; name?: string }[];
   tradeDate: string;
   onSelectSymbol: (symbol: string) => void;
 }) {
@@ -330,11 +335,11 @@ function StockDetailPanel({
   const setSelectedStock = useGlobalStore(state => state.setSelectedStock);
   useEffect(() => { if (symbol) setSelectedStock(symbol); }, [symbol, setSelectedStock]);
   const selectSymbol = (next: string) => { setSelectedStock(next); onSelectSymbol(next); };
-  const dailyHintsPanel = <AllWatchlistDailyHints date={tradeDate} onSelectSymbol={selectSymbol} onContext={setUnifiedHints} />;
+  const dailyHintsPanel = <SharedDailyHints date={tradeDate} poolId={scopeId} poolName={scopeName} members={members} onSelectSymbol={selectSymbol} onContext={setUnifiedHints} />;
   if (!symbol) return <div className="p-4 text-xs text-text-secondary">请选择一只股票</div>;
   return <SharedStockDetailPanel symbol={symbol} selectedDate={tradeDate} showDetailLink
-    onSelectSymbol={selectSymbol} dailyHintsPanel={dailyHintsPanel} sidebarScopeKey="__all_watchlist__"
-    unifiedHints={unifiedHints?.date === tradeDate ? unifiedHints : undefined} />;
+    onSelectSymbol={selectSymbol} dailyHintsPanel={dailyHintsPanel} sidebarScopeKey={scopeId}
+    unifiedHints={unifiedHints?.date === tradeDate && unifiedHints.poolName === scopeName ? unifiedHints : undefined} />;
 }
 
 export default function StrategyPage() {
@@ -684,12 +689,14 @@ export default function StrategyPage() {
   }, []);
 
   const selectSource = useCallback((source: SourceId) => {
+    if (source === activeSource) return;
+
     assistantSelectionRef.current = null;
     setActiveSource(source);
     setSortState(null);
     setSelectedSymbol('');
-    setDetailOpen(false);
-  }, []);
+    setDetailOpen(true);
+  }, [activeSource]);
 
   const selectRowAt = useCallback(
     (index: number) => {
@@ -738,16 +745,6 @@ export default function StrategyPage() {
     document.addEventListener('keydown', handleListNavigation);
     return () => document.removeEventListener('keydown', handleListNavigation);
   }, [handleListNavigation]);
-
-  const handleRefresh = useCallback(() => {
-    void formulaRunsQuery.refetch();
-    if (formulaSource) void formulaQuery.refetch();
-    if (activeSource === 'mrgc') void mrgcQuery.refetch();
-    if (activeSource === 'alpha') void alphaQuery.refetch();
-    if (activeSource === 'pocket') void pocketQuery.refetch();
-    if (activeSource === 'breakout') void breakoutQuery.refetch();
-    if (activeSource === 'exhaustion') void exhaustionQuery.refetch();
-  }, [activeSource, alphaQuery, breakoutQuery, exhaustionQuery, mrgcQuery, pocketQuery, formulaRunsQuery, formulaSource, formulaQuery]);
 
   useEffect(() => {
     if (!detailOpen) {
@@ -873,44 +870,17 @@ export default function StrategyPage() {
   return (
     <AppShell>
       <div className="evo-command-space flex min-h-0 flex-col lg:h-[calc(100dvh-var(--evo-nav-height,64px)-12px)] lg:!min-h-0">
-        <section className="evo-panel mb-1.5 shrink-0 px-2.5 py-1.5">
+        <section className="evo-page-header mb-1.5 shrink-0">
           <div className="flex min-w-0 items-center gap-2">
             <div className="hidden shrink-0 items-baseline gap-2 xl:flex">
               <h1 className="evo-page-title truncate">
-                <span className="evo-page-index">04</span> Strategy
+                <span className="evo-page-index">04</span> 策略选股
               </h1>
-              <span className="text-[11px] text-text-tertiary">策略选股</span>
             </div>
             <div className="min-w-0 flex-1">
               <SourceTabs options={SOURCE_OPTIONS} activeSource={activeSource} counts={sourceCounts} onSelect={selectSource} />
             </div>
-            <select
-              value={effectiveDate || ''}
-              onChange={(event) => setGlobalDate(event.target.value)}
-              className="h-8 min-w-[112px] shrink-0 rounded-md border border-border-primary bg-[#0b1220] px-2.5 font-mono text-xs text-text-primary outline-none focus:border-brand-blue/70"
-            >
-              {dateOptions.map((date) => (
-                <option key={date} value={date} className="bg-bg-secondary">
-                  {date}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={() => setDetailOpen((value) => !value)}
-              className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border-primary/70 bg-bg-primary/55 px-2.5 text-xs text-text-secondary transition hover:border-brand-blue/50 hover:text-brand-blue-light"
-            >
-              {detailOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
-              <span className="hidden sm:inline">{detailOpen ? '收起详情' : '展开详情'}</span>
-            </button>
-            <button
-              type="button"
-              onClick={handleRefresh}
-              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border-primary/70 bg-bg-primary/55 text-text-secondary transition hover:border-brand-blue/50 hover:text-brand-blue-light"
-              aria-label="刷新策略页面数据"
-            >
-              <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
-            </button>
+            <TopbarTradeDate value={effectiveDate} dates={dateOptions} onChange={setGlobalDate} />
           </div>
         </section>
 
@@ -1065,6 +1035,9 @@ export default function StrategyPage() {
               <StockDetailPanel
                 symbol={selectedSymbol || rowSymbol(selectedRow ?? {})}
                 tradeDate={effectiveDate}
+                scopeId={`strategy:${activeSource}`}
+                scopeName={activeOption.label}
+                members={currentRows.map((row) => ({symbol: rowSymbol(row)})).filter((row) => row.symbol)}
                 onSelectSymbol={(symbol) => { assistantSelectionRef.current = { symbol, date: effectiveDate, source: activeSource }; setSelectedSymbol(symbol); }}
               />
             </aside>

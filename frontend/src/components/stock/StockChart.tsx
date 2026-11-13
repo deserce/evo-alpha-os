@@ -1159,17 +1159,18 @@ export default function StockChart({ symbol, endDate, limit = 260, hintContext }
           {line.label} {line.price.toFixed(2)}
         </span>)}
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-1 border-b border-[#1e2226] bg-[#0b0f14] px-1.5 py-1">
-        <div className="flex items-center gap-1">
+      <div className="chart-toolbar flex flex-col gap-1.5 border-b border-[#1e2226] bg-[#0b0f14] px-2 py-1.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
           {CHART_PERIODS.map((item) => (
             <button
               key={item.key}
               type="button"
+              aria-pressed={period === item.key}
               onClick={() => setPeriod(item.key)}
               className={clsx(
-                'h-5 rounded border px-1.5 text-[10px] font-black transition-colors',
+                'h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px] font-black transition-colors',
                 period === item.key
-                  ? 'border-brand-blue bg-brand-blue/15 text-brand-blue-light'
+                  ? 'text-brand-blue-light'
                   : 'border-border-primary bg-bg-secondary text-text-secondary hover:border-brand-blue/50 hover:text-white',
               )}
             >
@@ -1181,11 +1182,12 @@ export default function StockChart({ symbol, endDate, limit = 260, hintContext }
               <button
                 key={item.key}
                 type="button"
+                aria-pressed={priceStyle === item.key}
                 onClick={() => setPriceStyle(item.key)}
                 className={clsx(
-                  'h-5 rounded border px-1.5 text-[10px] font-black transition-colors',
+                  'h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px] font-black transition-colors',
                   priceStyle === item.key
-                    ? 'border-brand-blue bg-brand-blue/15 text-brand-blue-light'
+                    ? 'text-brand-blue-light'
                     : 'border-border-primary bg-bg-secondary text-text-secondary hover:border-brand-blue/50 hover:text-white',
                 )}
               >
@@ -1205,19 +1207,20 @@ export default function StockChart({ symbol, endDate, limit = 260, hintContext }
           )}
         </div>
 
-        <div className="flex min-w-0 flex-wrap items-center justify-end gap-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
           <button type="button" aria-pressed={showMovingAverages}
             onClick={() => setShowMovingAverages((previous) => !previous)}
             title="显示或隐藏主图均线，包含知乎版MA20；不改变缠论计算"
-            className={clsx('h-5 rounded border px-1.5 text-[10px] font-bold',
-              showMovingAverages ? 'border-brand-blue bg-brand-blue/15 text-brand-blue-light' : 'border-border-primary text-text-secondary')}>
+            className={clsx('h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px] font-bold',
+              showMovingAverages ? 'text-brand-blue-light' : 'border-border-primary text-text-secondary')}>
             均线
           </button>
+          <div className="inline-flex shrink-0 items-center gap-1">
           <button type="button" aria-pressed={showChanOverlay}
             onClick={() => setShowChanOverlay((previous) => !previous)}
             title="显示通达信缠论主图指标"
-            className={clsx('h-5 rounded border px-1.5 text-[10px] font-bold',
-              showChanOverlay ? 'border-amber-400 bg-amber-500/20 text-amber-200' : 'border-border-primary text-text-secondary')}>
+            className={clsx('h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px] font-bold',
+              showChanOverlay ? 'text-brand-blue-light' : 'border-border-primary text-text-secondary')}>
             缠论
           </button>
           <ChartSettingsDisclosure label="缠论设置">
@@ -1235,20 +1238,20 @@ export default function StockChart({ symbol, endDate, limit = 260, hintContext }
           {showChanOverlay && <button type="button" aria-pressed={showChanRevocations}
             onClick={() => setShowChanRevocations((previous) => !previous)}
             title="逐柱回放原式撤销信号，空心圆悬停查看首次可见及撤销时间"
-            className={clsx('h-5 rounded border px-1.5 text-[10px]', showChanRevocations ? 'border-slate-400 text-slate-200' : 'border-border-primary text-text-secondary')}>
+            className={clsx('h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px]', showChanRevocations ? 'border-slate-400 text-slate-200' : 'border-border-primary text-text-secondary')}>
             撤销圈 ⭕
           </button>}
           {showChanOverlay && chanVariant === 'xueqiu' && <>
             <button type="button" aria-pressed={showChanHistory}
               onClick={() => setShowChanHistory((previous) => !previous)}
               title="扩展：截至各柱回放历史中枢，非原式当前输出"
-              className={clsx('h-5 rounded border px-1.5 text-[10px]', showChanHistory ? 'border-amber-400 text-amber-200' : 'border-border-primary text-text-secondary')}>
+              className={clsx('h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px]', showChanHistory ? 'border-amber-400 text-amber-200' : 'border-border-primary text-text-secondary')}>
               历史中枢（扩展）
             </button>
             <button type="button" aria-pressed={showChanPivotLabels}
               onClick={() => setShowChanPivotLabels((previous) => !previous)}
               title="扩展：沿用知乎版的极点买卖文字和ZIG买卖条件，历史标记可能重绘"
-              className={clsx('h-5 rounded border px-1.5 text-[10px]', showChanPivotLabels ? 'border-amber-400 text-amber-200' : 'border-border-primary text-text-secondary')}>
+              className={clsx('h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px]', showChanPivotLabels ? 'border-amber-400 text-amber-200' : 'border-border-primary text-text-secondary')}>
               买卖标记（知乎扩展）
             </button>
           </>}
@@ -1266,16 +1269,17 @@ export default function StockChart({ symbol, endDate, limit = 260, hintContext }
       </details>}
 
           </ChartSettingsDisclosure>
+          </div>
           {([['A', 'A强回'], ['B', 'B修复'], ['C', 'C结构']] as const).map(([key, label]) => (
-            <button key={key} type="button" aria-pressed={strategyVisibility[key]}
+            <div key={key} className="inline-flex shrink-0 items-center gap-1">
+            <button type="button" aria-pressed={strategyVisibility[key]}
               onClick={() => setStrategyVisibility((previous) => ({ ...previous, [key]: !previous[key] }))}
               title="只控制图表显示，不关闭盘后监控；A/B失效与C卖出分别标注"
-              className={clsx('h-5 rounded border px-1.5 text-[10px] font-bold disabled:opacity-40',
-                strategyVisibility[key] ? 'border-violet-400 bg-violet-500/20 text-violet-200' : 'border-border-primary text-text-secondary')}>
+              className={clsx('h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px] font-bold disabled:opacity-40',
+                strategyVisibility[key] ? 'text-brand-blue-light' : 'border-border-primary text-text-secondary')}>
               {label}
             </button>
-          ))}
-          <ChartSettingsDisclosure label="C结构设置" align="right">
+            {key === 'C' && <ChartSettingsDisclosure label="C结构设置" align="right">
             <p className="mb-2 text-text-tertiary">信号显示（A/B/C 共用）</p>
             <div className="mb-3 flex flex-wrap gap-2">
               {([['observe', '观察'], ['buy', '买点'], ['sell', '卖点/失效']] as const).map(([key, label]) => (
@@ -1289,18 +1293,21 @@ export default function StockChart({ symbol, endDate, limit = 260, hintContext }
             </div>
             {showStructure && structurePayload ? <StructureStrategyPanel payload={structurePayload} />
               : <p className="text-text-tertiary">开启 C结构后可查看规则、触发依据和买卖过程。</p>}
-          </ChartSettingsDisclosure>
+            </ChartSettingsDisclosure>}
+            </div>
+          ))}
           {INDICATORS.map((item) => (
             <button
               key={item.key}
               type="button"
               title={item.label}
+              aria-pressed={indicators[item.key]}
               disabled={minutePeriod && ['rps', 'fund', 'north'].includes(item.key)}
               onClick={() => toggleIndicator(item.key)}
               className={clsx(
-                'h-5 rounded border px-1.5 text-[10px] font-black transition-colors disabled:opacity-40',
+                'h-6 shrink-0 whitespace-nowrap rounded-[5px] border px-2 text-[11px] font-black transition-colors disabled:opacity-40',
                 indicators[item.key]
-                  ? 'border-brand-blue bg-brand-blue/15 text-brand-blue-light'
+                  ? 'text-brand-blue-light'
                   : 'border-border-primary bg-bg-secondary text-text-tertiary hover:border-text-tertiary hover:text-text-primary',
               )}
             >

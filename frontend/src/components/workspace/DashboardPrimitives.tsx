@@ -83,7 +83,7 @@ export function PageHeader({
   children?: ReactNode;
 }) {
   return (
-    <div className="py-2 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+    <div className="evo-page-header flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
       <div className="min-w-0">
         <div className="flex items-start gap-2">
           <span className="h-7 w-7 rounded-lg border border-brand-blue/35 bg-brand-blue/15 inline-flex items-center justify-center shadow-[0_0_24px_rgba(31,111,255,0.25)]">

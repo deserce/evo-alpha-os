@@ -1,6 +1,7 @@
 """
 个股相关API路由
 """
+import os
 from fastapi import APIRouter, BackgroundTasks, Query, HTTPException
 from typing import Annotated, Optional, List
 from datetime import date, datetime, timedelta
@@ -174,6 +175,8 @@ def _queue_member_refresh(
     background_tasks: BackgroundTasks | None,
     symbols: List[str],
 ) -> bool:
+    if os.getenv("EVOALPHA_TEST_CREDENTIALS"):
+        return False
     normalized = list(
         dict.fromkeys(
             _normalize_symbol(symbol)
@@ -772,7 +775,7 @@ def _dated_smart_metadata(pool: dict, resolved: dict) -> dict:
 
 
 def _stock_pool_members(pool_id: str, trade_date: Optional[str] = None, symbol: Optional[str] = None,
-                        smart_result: Optional[dict] = None) -> List[dict]:
+                        smart_result: Optional[dict] = None, personal_symbols: list[str] | None = None) -> List[dict]:
     target_date = trade_date or _latest_stock_trade_date()
     symbol_clause = "AND m.symbol=:symbol" if symbol else ""
     rps_join = ""
@@ -806,7 +809,16 @@ def _stock_pool_members(pool_id: str, trade_date: Optional[str] = None, symbol: 
     }
     member_table = "stock_pool_members"
     member_cte = ""
-    if pool_id == "smart_mrgc_20d":
+    if personal_symbols is not None:
+        if not personal_symbols:
+            return []
+        params["personal_symbols"] = json.dumps(personal_symbols)
+        member_table = "members_scope"
+        member_cte = (
+            "members_scope(pool_id,symbol,note,sort_order,added_at,updated_at) AS ("
+            "SELECT :pool_id,value,NULL,0,NULL,NULL FROM json_each(:personal_symbols)),"
+        )
+    elif pool_id == "smart_mrgc_20d":
         resolved = smart_result or _resolve_smart_pool(target_date)
         if resolved["status"] != "READY":
             raise HTTPException(status_code=409, detail={

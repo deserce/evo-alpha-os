@@ -16,7 +16,6 @@ import {
   AppShell,
   PageHeader,
   Badge,
-  ToolbarButton,
   asList,
   int,
 } from '@/components/workspace/DashboardPrimitives';
@@ -110,7 +109,6 @@ export default function DataPage() {
   });
 
   const isLoading = dataQuery.isLoading && !dataQuery.data;
-  const isRefreshing = dataQuery.isFetching || repairMutation.isPending;
 
   if (isLoading) {
     return (
@@ -136,12 +134,6 @@ export default function DataPage() {
         title="数据管理"
         eyebrow="DATA"
         icon={Database}
-        actions={
-          <ToolbarButton onClick={() => dataQuery.refetch()} active={isRefreshing}>
-            <RefreshCw size={13} className={isRefreshing ? 'dashboard-spin' : ''} />
-            刷新
-          </ToolbarButton>
-        }
       >
         最新数据 {String(database.latest_stock_date || '-')} · {formatSize(database.size_bytes)}
       </PageHeader>

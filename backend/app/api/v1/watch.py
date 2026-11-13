@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
@@ -827,6 +828,7 @@ async def get_watch_snapshots(
     pool_id: str | None = None,
     state: str | None = None,
     data_status: str | None = None,
+    strategy: bool = False,
 ):
     with _connect() as conn:
         target_date = _latest_snapshot_date(conn, trade_date)
@@ -863,6 +865,28 @@ async def get_watch_snapshots(
             params,
         ).fetchall()
         payload = [_snapshot_row(row) for row in rows]
+        if strategy and trade_date == target_date and not (pool_id or state or data_status):
+            symbols = set()
+            for table in ("quant_preselect_results", "quant_formula_results"):
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                    symbols.update(row[0] for row in conn.execute(
+                        f"SELECT DISTINCT symbol FROM {table} WHERE trade_date=?", (target_date,)
+                    ))
+            payload = [row for row in payload if row["symbol"] in symbols]
+            accounts = os.getenv("EVOALPHA_USERS_DB") or str(WATCH_DB_PATH.with_name("strategy_watch.db"))
+            if accounts and Path(accounts).is_file():
+                version = load_active_rules(conn).version
+                with closing(sqlite3.connect(Path(accounts).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE name='personal_watch_results'").fetchone():
+                        existing = {row["symbol"] for row in payload if row["data_status"] == "OK"}
+                        supplemental = {
+                            symbol: json.loads(result) for symbol, result in db.execute(
+                                "SELECT symbol,result FROM personal_watch_results WHERE trade_date=? AND version=?",
+                                (target_date, version),
+                            ) if symbol in symbols and symbol not in existing
+                        }
+                        payload = [row for row in payload if row["symbol"] not in supplemental]
+                        payload.extend(supplemental.values())
         return ApiResponse(data={"trade_date": target_date, "rows": payload, "count": len(payload)})
 
 

@@ -58,22 +58,14 @@ export default function ReviewPage() {
   const hasWinRate = hasValue(review.win_rate);
   const winRate = hasWinRate ? toNumber(review.win_rate) * 100 : null;
 
-  const refresh = () => {
-    datesQuery.refetch();
-    reviewQuery.refetch();
-    backtestQuery.refetch();
-    briefQuery.refetch();
-  };
-
   return (
     <WorkbenchPage
       index="08"
-      title="Review  复盘进化"
+      title="复盘进化"
       subtitle="把风险、买点表现、归因和 AI 复盘闭环到下一次执行。"
       date={selectedDate}
       dates={dates}
       onDateChange={setGlobalDate}
-      onRefresh={refresh}
     >
       <div className="grid gap-3 sm:grid-cols-6">
         <StatCard label="交易次数" value={int(review.trade_count ?? sampleCount)} sub="本周期样本" />

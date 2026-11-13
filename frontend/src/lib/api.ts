@@ -265,12 +265,13 @@ export const watchApi = {
         pool_id: params?.poolId,
       },
     }),
-  getSnapshots: (params?: { tradeDate?: string; poolId?: string; state?: string }) =>
+  getSnapshots: (params?: { tradeDate?: string; poolId?: string; state?: string; strategy?: boolean }) =>
     api.get('/v1/watch/snapshots', {
       params: {
         trade_date: params?.tradeDate,
         pool_id: params?.poolId,
         state: params?.state,
+        strategy: params?.strategy,
       },
     }),
   getEvents: (params?: {

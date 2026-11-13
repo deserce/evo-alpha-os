@@ -34,11 +34,11 @@ const nextSteps = {
 };
 
 export default function DailyHintsPanel({ date, poolId, poolName, members, watchSignals, legacyActions,
-  onSelectSymbol, onContext, watchStatus = '', summaryOnly = false }: {
+  onSelectSymbol, onContext, watchStatus = '', summaryOnly = false, personal = false }: {
   date: string; poolId: string; poolName: string; members: { symbol?: unknown }[];
   watchSignals: DailyHintSignal[]; legacyActions: ReactNode;
   onSelectSymbol: (symbol: string) => void; onContext?: (context: DailyHintsContext) => void;
-  watchStatus?: string; summaryOnly?: boolean;
+  watchStatus?: string; summaryOnly?: boolean; personal?: boolean;
 }) {
   const setReportOpen = useGlobalStore((state) => state.setReportOpen);
   const setReportPanelUi = useGlobalStore((state) => state.setReportPanelUi);
@@ -50,14 +50,14 @@ export default function DailyHintsPanel({ date, poolId, poolName, members, watch
   const expanded = useGlobalStore((state) => state.stockSidebarUi.expanded);
   const setExpanded = useGlobalStore((state) => state.setSidebarExpanded);
   const expandKey = (part: string) => `hints-${part}:${poolId}:${date}`;
-  const apiPoolId = ['__single__', '__all_watchlist__'].includes(poolId) ? undefined : poolId;
+  const apiPoolId = (poolId.startsWith('strategy:') || ['__single__', '__all_watchlist__'].includes(poolId)) ? undefined : poolId;
   const monitor = useQuery({ queryKey: ['structureMonitor', date, poolId],
     queryFn: () => watchApi.getStructureMonitor({ tradeDate: date, poolId: apiPoolId }),
-    enabled: Boolean(date && poolId), staleTime: 60_000, gcTime: 600_000,
+    enabled: !personal && Boolean(date && poolId), staleTime: 60_000, gcTime: 600_000,
     retry: 1, refetchOnWindowFocus: false });
   const report = useQuery({ queryKey: summaryOnly ? ['mrgcDailyReport', date, 'hints'] : ['mrgcDailyReport', date],
     queryFn: () => loadReport(date, false, false, summaryOnly),
-    enabled: Boolean(date), staleTime: 60_000, gcTime: 600_000,
+    enabled: !personal && Boolean(date), staleTime: 60_000, gcTime: 600_000,
     retry: false, refetchOnWindowFocus: false });
   const hints = useMemo(() => {
     const membership = new Set(members.map((row) => row.symbol).filter((s): s is string => typeof s === 'string'));
@@ -131,7 +131,7 @@ export default function DailyHintsPanel({ date, poolId, poolName, members, watch
   const reportMembers = new Set(report.data?.report?.stocks.map((stock) => stock.symbol) || []);
   const uncovered = report.data?.report && !summaryOnly ? members.filter((member) => typeof member.symbol === 'string'
     && !reportMembers.has(member.symbol)).length : 0;
-  const availability = [watchStatus,
+  const availability = personal ? watchStatus : [watchStatus,
     uncovered ? `日报未覆盖当前分组 ${uncovered} 只，缠论机会尚不完整` : '',
     report.data?.job.status === 'STALE' ? '日报为旧版本，等待更新' : '',
     monitor.isError ? 'C 监控读取失败' : monitor.isLoading ? 'C 监控读取中'

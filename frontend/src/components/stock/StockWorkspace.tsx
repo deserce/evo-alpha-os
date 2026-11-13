@@ -1,10 +1,11 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import MrgcDailyReportPanel, { loadReport } from './MrgcDailyReportPanel';
 import { parseReportLink, reportLinkedStocks, reportContextPool, REPORT_LINKED_POOL_ID } from '@/lib/mrgcReportSelection';
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { clsx } from 'clsx';
 import {
@@ -12,11 +13,10 @@ import {
   ArrowDown,
   ArrowUp,
   Bell,
-  BellOff,
-  BriefcaseBusiness,
   Check,
-  ChevronLeft,
-  ChevronRight,
+  ChevronDown,
+  PanelLeftClose,
+  PanelLeftOpen,
   Clock3,
   Crosshair,
   Database,
@@ -31,6 +31,7 @@ import {
   Pencil,
   RefreshCw,
   Search,
+  Settings,
   ShieldCheck,
   Star,
   Trash2,
@@ -109,7 +110,7 @@ type WatchEvent = Row & {
   payload?: Row | null;
 };
 
-type PoolMember = Row & {
+export type PoolMember = Row & {
   symbol?: string;
   name?: string;
   industry?: string;
@@ -126,7 +127,7 @@ type PoolMember = Row & {
   turnover_rate?: number | null;
 };
 
-type SortKey = 'symbol' | 'name' | 'close' | 'pct_chg' | 'rps_5' | 'rps_10' | 'rps_20' | 'rps_50' | 'rps_120' | 'rps_250';
+export type SortKey = 'symbol' | 'name' | 'close' | 'pct_chg' | 'rps_5' | 'rps_10' | 'rps_20' | 'rps_50' | 'rps_120' | 'rps_250';
 type SortDir = 'asc' | 'desc';
 
 function compareStocks(a: PoolMember, b: PoolMember, key: SortKey, dir: SortDir) {
@@ -175,13 +176,7 @@ function isDefaultPool(pool?: StockPool) {
   return Boolean(pool?.is_default) || pool?.pool_id === DEFAULT_POOL_ID;
 }
 
-function isPoolMonitored(pool?: StockPool) {
-  if (!pool) return false;
-  if (pool.monitor_enabled === null || pool.monitor_enabled === undefined) {
-    return isDefaultPool(pool);
-  }
-  return Boolean(pool.monitor_enabled);
-}
+
 
 function watchResponse(value: unknown) {
   const root = asRow(value);
@@ -707,7 +702,7 @@ function quarterLabel(reportDate: unknown) {
 
 export function StockPoolAddMenu({
   symbol,
-  label = '加入池',
+  label = '添加到…',
   className,
 }: {
   symbol: string;
@@ -717,9 +712,103 @@ export function StockPoolAddMenu({
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const identity = useQuery({
+    queryKey: ['navigation-identity'],
+    queryFn: async () => {
+      const response = await fetch('/api/v1/users/me', {cache: 'no-store'});
+      return response.ok ? await response.json() as {id: number; role: string} : null;
+    },
+    retry: false,
+  });
+  const canShare = identity.data?.role === 'admin' ||
+    (identity.data === null && process.env.NEXT_PUBLIC_EVOALPHA_LOGIN_TEST !== '1');
+  const [creating, setCreating] = useState<'mine' | 'shared' | null>(null);
+  const [groupName, setGroupName] = useState('');
+  const personalKey = ['personal-stocks', identity.data?.id];
+  const createGroup = useMutation({
+    mutationFn: async ({ scope, name }: { scope: 'mine' | 'shared'; name: string }) => {
+      if (scope === 'shared') {
+        await stockApi.createPool({ name });
+        return;
+      }
+      const response = await fetch('/api/v1/personal-stocks/groups', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'create', value: name }),
+      });
+      if (!response.ok) throw new Error('无法新建分组，请检查分组名称。');
+    },
+    onSuccess: async (_, { scope }) => {
+      setCreating(null);
+      setGroupName('');
+      if (scope === 'mine') await queryClient.invalidateQueries({ queryKey: personalKey });
+      else await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['stockPools'] }),
+        queryClient.invalidateQueries({ queryKey: ['stockPoolsAddMenu'] }),
+        queryClient.invalidateQueries({ queryKey: ['strategy-stock-pools'] }),
+      ]);
+    },
+  });
+
+  function groupHeading(scope: 'mine' | 'shared', title: string) {
+    return (
+      <div className={scope === 'shared' ? 'border-t border-border-primary' : ''}>
+        <div className="flex items-center justify-between px-2 py-1 text-[10px] font-bold text-brand-blue-light">
+          {title}
+          <button type="button" title={'新建 ' + title + ' 分组'} aria-label={'新建 ' + title + ' 分组'}
+            aria-expanded={creating === scope} disabled={createGroup.isPending}
+            className="grid h-6 w-6 place-items-center rounded text-text-secondary hover:bg-bg-tertiary hover:text-brand-blue-light"
+            onClick={() => {
+              createGroup.reset();
+              setGroupName('');
+              setCreating(creating === scope ? null : scope);
+            }}><Settings size={13} /></button>
+        </div>
+        {creating === scope && <form className="space-y-1 px-2 pb-2" onSubmit={(event) => {
+          event.preventDefault();
+          if (groupName.trim() && !createGroup.isPending) createGroup.mutate({ scope, name: groupName.trim() });
+        }}>
+          <div className="flex items-center gap-1">
+            <input aria-label={title + ' 分组名称'} placeholder="分组名称" maxLength={40} autoFocus
+              value={groupName} onChange={(event) => setGroupName(event.target.value)}
+              className="h-7 min-w-0 flex-1 rounded border border-border-primary bg-bg-primary px-2 text-xs" />
+            <button disabled={!groupName.trim() || createGroup.isPending}
+              className="h-7 shrink-0 rounded border border-brand-blue/50 px-2 text-xs text-brand-blue-light disabled:opacity-40">
+              {createGroup.isPending ? '保存中' : '新建'}
+            </button>
+          </div>
+          {createGroup.error && <p role="alert" className="text-[10px] text-danger">{createGroup.error.message}</p>}
+        </form>}
+      </div>
+    );
+  }
+  const personal = useQuery({
+    queryKey: personalKey,
+    queryFn: async () => {
+      const response = await fetch('/api/v1/personal-stocks/groups', {cache: 'no-store'});
+      if (!response.ok) throw new Error('无法读取个人分组');
+      return await response.json() as {id: number; name: string; symbols: string[]}[];
+    },
+    enabled: open && Boolean(identity.data), gcTime: 0,
+  });
+  const savePersonal = useMutation({
+    mutationFn: async (group: {id: number; name: string}) => {
+      const response = await fetch('/api/v1/personal-stocks/groups', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action: 'add', group_id: group.id, value: symbol}),
+      });
+      if (!response.ok) throw new Error('加入失败');
+    },
+    onSuccess: (_, group) => {
+      setFeedback('已加入 个人分组 / ' + group.name);
+      setOpen(false);
+      return queryClient.invalidateQueries({queryKey: personalKey});
+    },
+    onError: () => setFeedback('加入失败'),
+  });
   const poolsQuery = useQuery({
     queryKey: ['stockPoolsAddMenu'],
     queryFn: () => stockApi.getPools(),
+    enabled: open && canShare,
     staleTime: 60_000,
   });
   const pools = rows<StockPool>(poolsQuery.data?.pools);
@@ -727,7 +816,7 @@ export function StockPoolAddMenu({
     mutationFn: ({ poolId }: { poolId: string; poolName: string }) =>
       stockApi.addPoolStock(poolId, { symbol }),
     onSuccess: (_data, variables) => {
-      setFeedback(`已加入 ${variables.poolName}`);
+      setFeedback(`已加入 共享分组 / ${variables.poolName}`);
       queryClient.invalidateQueries({ queryKey: ['stockPools'] });
       queryClient.invalidateQueries({ queryKey: ['stockPoolsAddMenu'] });
       queryClient.invalidateQueries({ queryKey: ['strategy-stock-pools'] });
@@ -759,7 +848,16 @@ export function StockPoolAddMenu({
       ) : null}
       {open ? (
         <div className="absolute right-0 top-8 z-50 max-h-60 w-48 overflow-y-auto rounded-lg border border-border-primary bg-bg-secondary p-1.5 text-left shadow-xl custom-scrollbar">
-          {pools.length ? (
+          {identity.data && groupHeading('mine', '个人分组')}
+          {personal.error && <div className="px-2 py-1 text-xs text-danger">{personal.error.message}</div>}
+          {personal.data?.map((group) => <button key={group.id} type="button"
+            disabled={savePersonal.isPending || group.symbols.includes(symbol)}
+            onClick={() => savePersonal.mutate(group)}
+            className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-brand-blue/10 disabled:opacity-50">
+            {group.name}{group.symbols.includes(symbol) ? ' · 已添加' : ''}
+          </button>)}
+          {canShare && groupHeading('shared', '共享分组')}
+          {canShare && (pools.length ? (
             pools.filter((pool) => !pool.is_smart).map((pool) => (
               <button
                 key={pool.pool_id}
@@ -779,7 +877,7 @@ export function StockPoolAddMenu({
             <div className="px-2 py-2 text-[11px] text-text-tertiary">
               {poolsQuery.isLoading ? '正在读取分组' : '暂无自选分组'}
             </div>
-          )}
+          ))}
         </div>
       ) : null}
     </div>
@@ -1458,23 +1556,6 @@ export function StockDetailPanel({
   const latest = kline[kline.length - 1] ?? {};
   const displayName = text(info.name || lifecycle.name || symbol, symbol);
   const price = latest.close ?? plans[0]?.latest_close ?? signals[0]?.entry_price;
-  const portfolioPrice = finiteNumber(price);
-  const portfolioPriceMicros =
-    portfolioPrice !== null && portfolioPrice > 0
-      ? Math.round(portfolioPrice * 1_000_000)
-      : null;
-  const portfolioParams = new URLSearchParams({
-    symbol,
-    side: 'BUY',
-  });
-  if (
-    portfolioPriceMicros !== null
-    && Number.isSafeInteger(portfolioPriceMicros)
-    && portfolioPriceMicros > 0
-  ) {
-    portfolioParams.set('price', String(portfolioPriceMicros / 1_000_000));
-  }
-  const portfolioHref = `/a/portfolio?${portfolioParams.toString()}`;
   const pctChg = latest.pct_chg;
   const isUp = toNumber(pctChg) >= 0;
 
@@ -1496,14 +1577,6 @@ export function StockDetailPanel({
           </span>
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-1">
-          <Link
-            href={portfolioHref}
-            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border-primary bg-bg-primary px-2 text-[11px] font-black text-text-secondary transition-colors hover:border-brand-blue/60 hover:text-brand-blue-light"
-            title={`将 ${displayName} 加入 Portfolio`}
-          >
-            <BriefcaseBusiness size={12} />
-            <span>加入 Portfolio</span>
-          </Link>
           {showDetailLink && (
             <Link
               href={`/a/stock/${symbol}?returnTo=${encodeURIComponent(originPath === '/a/strategy' ? '/a/strategy' : '/a/watchlist')}`}
@@ -1827,7 +1900,22 @@ function TodayActionBox({
   );
 }
 
-function PoolSidebar({
+export const watchlistSidebarClass = "ml-3 my-2 flex w-[clamp(268px,calc(20vw-12px),288px)] min-h-0 shrink-0 flex-col overflow-hidden rounded-lg border border-border-primary bg-bg-secondary/45";
+export const watchlistContentClass = "flex min-w-0 flex-1 flex-col overflow-hidden p-2";
+
+export function WatchlistSidebarToggle({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
+  const label = collapsed ? '展开分组' : '收起分组';
+  return (
+    <button type="button" onClick={onToggle} title={label} aria-label={label}
+      aria-expanded={!collapsed} className="grid h-7 w-7 shrink-0 place-items-center rounded text-text-secondary hover:bg-bg-secondary hover:text-brand-blue-light">
+      {collapsed ? <PanelLeftOpen size={14} /> : <PanelLeftClose size={14} />}
+    </button>
+  );
+}
+
+export function PoolSidebar({
+  sidebarToggle,
+  canEdit,
   pools,
   selectedPoolId,
   selectedSymbol,
@@ -1838,7 +1926,6 @@ function PoolSidebar({
   editingPoolId,
   editingPoolName,
   isBusy,
-  monitoringPoolId,
   sortKey,
   sortDir,
   onKeywordChange,
@@ -1850,12 +1937,13 @@ function PoolSidebar({
   onSavePool,
   onCancelEditPool,
   onDeletePool,
-  onToggleMonitor,
   onAddStock,
   onSelectStock,
   onRemoveStock,
   onSort,
 }: {
+  sidebarToggle?: ReactNode;
+  canEdit: boolean;
   pools: StockPool[];
   selectedPoolId: string;
   selectedSymbol: string;
@@ -1866,7 +1954,6 @@ function PoolSidebar({
   editingPoolId: string;
   editingPoolName: string;
   isBusy: boolean;
-  monitoringPoolId?: string;
   sortKey: SortKey;
   sortDir: 'asc' | 'desc';
   onKeywordChange: (value: string) => void;
@@ -1878,23 +1965,36 @@ function PoolSidebar({
   onSavePool: () => void;
   onCancelEditPool: () => void;
   onDeletePool: (poolId: string) => void;
-  onToggleMonitor: (pool: StockPool) => void;
   onAddStock: (symbol: string) => void;
   onSelectStock: (symbol: string) => void;
   onRemoveStock: (symbol: string) => void;
   onSort: (key: SortKey) => void;
 }) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsId = useId();
   const selectedPool = pools.find((pool) => pool.pool_id === selectedPoolId);
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex shrink-0 items-center gap-2 border-b border-border-secondary px-2 py-2">
-        <Star size={13} className="shrink-0 text-brand-blue-light" />
-        <select value={selectedPoolId} onChange={(event) => onSelectPool(event.target.value)}
-          aria-label="选择自选分组"
-          className="h-7 min-w-0 flex-1 rounded border border-border-primary bg-bg-primary px-1 text-[11px] font-bold text-text-primary">
-          {pools.map((pool) => <option key={pool.pool_id} value={pool.pool_id}>{text(pool.name)} · {int(pool.stock_count)} 只</option>)}
-        </select>
+        {sidebarToggle ?? <Star size={13} className="shrink-0 text-brand-blue-light" />}
+        <div className="relative min-w-0 flex-1">
+          <select value={selectedPoolId} onChange={(event) => onSelectPool(event.target.value)}
+            aria-label="选择自选分组"
+            className="h-7 w-full appearance-none rounded border border-border-primary bg-bg-primary pl-2 pr-8 text-[11px] font-bold text-text-primary">
+            {pools.map((pool) => <option key={pool.pool_id} value={pool.pool_id}>{text(pool.name)} · {int(pool.stock_count)} 只</option>)}
+          </select>
+          <ChevronDown size={12} aria-hidden="true" className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-text-secondary" />
+        </div>
+        {canEdit && (
+          <button type="button" aria-label="管理分组" title="管理分组"
+            aria-expanded={settingsOpen} aria-controls={settingsId}
+            onClick={() => setSettingsOpen((open) => !open)}
+            className={clsx('grid h-7 w-7 shrink-0 place-items-center rounded hover:bg-bg-secondary hover:text-brand-blue-light',
+              settingsOpen ? 'bg-brand-blue/15 text-brand-blue-light' : 'text-text-secondary')}>
+            <Settings size={14} />
+          </button>
+        )}
       </div>
       {selectedPool?.is_smart && (
         <div className="shrink-0 border-b border-border-secondary px-2 py-1.5 text-[10px] leading-4 text-text-secondary">
@@ -1904,8 +2004,7 @@ function PoolSidebar({
           {selectedPool.smart_state?.reason && <div className="text-warning">{({mrgc_dates_missing: '窗口内 MRGC 尚未完成', source_dates_missing: '窗口内行情缺失', source_window_incomplete: '交易日窗口不足', c_monitor_capacity_exceeded: '监控总数超过 300 只上限'} as Record<string, string>)[selectedPool.smart_state.reason] || '数据待校验'}</div>}
         </div>
       )}
-      <details className="shrink-0 border-b border-border-secondary">
-        <summary className="cursor-pointer px-2 py-1.5 text-[10px] font-bold text-text-tertiary">管理分组</summary>
+      {canEdit && <div id={settingsId} hidden={!settingsOpen} className="shrink-0 border-b border-border-secondary">
       {/* 头部：标题 + 新建池 */}
       <div className="shrink-0 border-b border-border-secondary p-2">
         <div className="mb-2 flex items-center gap-1.5">
@@ -1980,21 +2079,7 @@ function PoolSidebar({
                     </span>
                     <span className="ml-auto font-mono text-[10px] text-text-tertiary">{int(pool.stock_count)}</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => onToggleMonitor(pool)}
-                    disabled={pool.is_smart || pool.is_report || monitoringPoolId === pool.pool_id}
-                    className={clsx(
-                      'shrink-0 rounded p-0.5 transition-colors disabled:opacity-40',
-                      isPoolMonitored(pool)
-                        ? 'bg-success/10 text-success hover:bg-success/20'
-                        : 'text-text-tertiary hover:bg-bg-tertiary hover:text-warning',
-                    )}
-                    title={pool.is_report ? '日报联动只读列表' : pool.is_smart ? '自动监控 C 类信号，盘后邮件提醒' : isPoolMonitored(pool) ? '已持续跟踪，点击关闭' : '开启持续跟踪'}
-                    aria-label={`${text(pool.name)}${isPoolMonitored(pool) ? '关闭' : '开启'}持续跟踪`}
-                  >
-                    {isPoolMonitored(pool) ? <Bell size={10} /> : <BellOff size={10} />}
-                  </button>
+
                   {!isDefaultPool(pool) && !pool.is_smart && !pool.is_report && (
                     <div className="flex shrink-0 items-center">
                       <button type="button" onClick={() => onStartEditPool(pool)} className="text-text-tertiary hover:text-brand-blue-light" title="重命名">
@@ -2012,10 +2097,10 @@ function PoolSidebar({
         })}
       </div>
 
-      </details>
+      </div>}
 
       {/* 搜索框 */}
-      <div className="shrink-0 border-b border-border-secondary p-2">
+      {canEdit && <div className="shrink-0 border-b border-border-secondary p-2">
         <div className="flex items-center gap-1.5">
           <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-border-primary bg-bg-primary text-text-tertiary">
             <Search size={12} />
@@ -2049,7 +2134,7 @@ function PoolSidebar({
             ))}
           </div>
         )}
-      </div>
+      </div>}
 
       {/* 池内股票列表 - 固定代码/名称/行业，其余指标横向滚动 */}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -2059,7 +2144,7 @@ function PoolSidebar({
         </div>
         {members.length === 0 ? (
           <div className="rounded border border-dashed border-border-primary p-3 text-center text-[10px] leading-4 text-text-tertiary">
-            {selectedPool?.is_report ? '当前日报筛选没有匹配股票' : selectedPool?.is_smart ? '等待盘后自动收集 MRGC 股票' : '暂无股票，先搜索添加'}
+            {selectedPool?.is_report ? '当前日报筛选没有匹配股票' : selectedPool?.is_smart ? '等待盘后自动收集 MRGC 股票' : canEdit ? '暂无股票，先搜索添加' : '暂无参考股票'}
           </div>
         ) : (
           <StockTable
@@ -2070,7 +2155,7 @@ function PoolSidebar({
             onSort={onSort}
             onSelectStock={onSelectStock}
             onRemoveStock={onRemoveStock}
-            readOnly={(selectedPool?.is_smart || selectedPool?.is_report)}
+            readOnly={!canEdit || selectedPool?.is_smart || selectedPool?.is_report}
           />
         )}
       </div>
@@ -2078,7 +2163,7 @@ function PoolSidebar({
   );
 }
 
-function StockTable({
+export function StockTable({
   readOnly = false,
   members,
   selectedSymbol,
@@ -2257,7 +2342,10 @@ function StockTable({
   );
 }
 
-export default function StockWorkspace({ initialSymbol }: { initialSymbol?: string }) {
+export default function StockWorkspace({ initialSymbol, listSwitcher }: {
+  initialSymbol?: string;
+  listSwitcher?: ReactNode;
+}) {
   const [unifiedHints, setUnifiedHints] = useState<DailyHintsContext>();
   const queryClient = useQueryClient();
   const { globalDate, setGlobalDate, setSelectedStock, reportContext, setReportContext, reportFocus, setReportFocus, reportOpen } = useGlobalStore();
@@ -2304,6 +2392,16 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
     }
   }, [sortKey]);
 
+  const identity = useQuery({
+    queryKey: ['navigation-identity'],
+    queryFn: async () => {
+      const response = await fetch('/api/v1/users/me', { cache: 'no-store' });
+      if (!response.ok) return null;
+      return (await response.json()) as { id: number; role: string };
+    },
+    retry: false,
+  });
+  const canEdit = identity.data === null || identity.data?.role === 'admin';
   const datesQuery = useQuery({ queryKey: ['quantDates'], queryFn: () => quantApi.getDates(160) });
   const dates = rows<string>(datesQuery.data?.dates);
   const selectedDate = globalDate || datesQuery.data?.latest || '';
@@ -2360,11 +2458,6 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
     () => pools.find((pool) => pool.pool_id === selectedPoolId),
     [pools, selectedPoolId],
   );
-  const selectedMember = useMemo(
-    () => members.find((stock) => stock.symbol === selectedSymbol),
-    [members, selectedSymbol],
-  );
-
   const selectSymbol = useCallback((symbol: string, _updateRoute: boolean) => {
     const nextSymbol = normalizeSymbol(symbol);
     setSelectedSymbolState(nextSymbol);
@@ -2411,22 +2504,6 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
     });
   }, []);
 
-  const refreshAll = () => {
-    datesQuery.refetch();
-    poolsQuery.refetch();
-    if (selectedPoolId !== REPORT_LINKED_POOL_ID) {
-      poolStocksQuery.refetch();
-      watchSummaryQuery.refetch();
-      watchSnapshotsQuery.refetch();
-      watchEventsQuery.refetch();
-    } else {
-      queryClient.invalidateQueries({ queryKey: ['mrgcDailyReport', selectedDate] });
-    }
-    queryClient.invalidateQueries({ queryKey: ['structureMonitor'] });
-    queryClient.invalidateQueries({ queryKey: ['stockInfo', selectedSymbol] });
-    queryClient.invalidateQueries({ queryKey: ['stockChartRows', selectedSymbol, 'latest'] });
-    queryClient.invalidateQueries({ queryKey: ['stockChartData', selectedSymbol] });
-  };
 
   const createPoolMutation = useMutation({
     mutationFn: () => stockApi.createPool({ name: newPoolName.trim() }),
@@ -2477,19 +2554,6 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
     },
   });
 
-  const monitorPoolMutation = useMutation({
-    mutationFn: ({ poolId, enabled }: { poolId: string; enabled: boolean }) =>
-      stockApi.updatePool(poolId, { monitor_enabled: enabled }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['stockPools'] });
-      queryClient.invalidateQueries({ queryKey: ['watchSummary'] });
-      queryClient.invalidateQueries({ queryKey: ['watchSnapshots'] });
-      queryClient.invalidateQueries({ queryKey: ['watchEvents'] });
-    },
-  });
-
-
-
   useEffect(() => {
     if (!routeSymbol || routeSymbol === selectedSymbol) return;
     queueMicrotask(() => selectSymbol(routeSymbol, false));
@@ -2537,8 +2601,7 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
     || updatePoolMutation.isPending
     || deletePoolMutation.isPending
     || addStockMutation.isPending
-    || removeStockMutation.isPending
-    || monitorPoolMutation.isPending;
+    || removeStockMutation.isPending;
 
   const setSidebarUi = useGlobalStore((state) => state.setStockSidebarUi);
   useEffect(() => {
@@ -2555,55 +2618,18 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
   return (
     <div className="flex h-[calc(100dvh-var(--evo-nav-height,64px))] min-h-0 flex-col">
       {/* 顶部工具栏 */}
-      <div className="flex shrink-0 items-center gap-2 border-b border-border-primary bg-bg-secondary/40 px-3 py-2">
-        <button
-          type="button"
-          onClick={toggleSidebar}
-          className="h-8 w-8 rounded-md border border-border-primary bg-bg-primary text-text-secondary transition-colors hover:border-brand-blue/60 hover:text-brand-blue-light"
-          title={sidebarCollapsed ? '展开分组' : '收起分组'}
-        >
-          {sidebarCollapsed ? <ChevronRight size={14} className="mx-auto" /> : <ChevronLeft size={14} className="mx-auto" />}
-        </button>
-        <div className="min-w-0">
-          <h1 className="evo-page-title truncate">
-            <span className="evo-page-index">06</span> Watchlist <span className="text-text-tertiary">自选股</span>
-          </h1>
-          <div className="truncate text-[10px] text-text-secondary">
-            {text(selectedPool?.name, '未选择')}
-            {selectedSymbol ? ` · ${text(selectedMember?.name, selectedSymbol)} ${selectedSymbol}` : ' · 选择股票查看行情'}
-          </div>
-        </div>
+      <div className="evo-page-header mx-3 mb-1.5 mt-2.5 flex shrink-0 flex-wrap items-center gap-2">
+        {listSwitcher ?? <h1 className="evo-page-title">自选股</h1>}
         <div className="ml-auto flex items-center gap-2">
-          {!reportLinked && <WatchRuleScannerPanel
+          {canEdit && !reportLinked && <WatchRuleScannerPanel
             pools={realPools}
             dates={dates}
             selectedPoolId={selectedPoolId}
             onSelectSymbol={(symbol) => selectSymbol(symbol, false)}
           />}
           {dates.length > 0 && (
-            <select
-              value={selectedDate}
-              onChange={(event) => setGlobalDate(event.target.value)}
-              className="h-8 rounded-md border border-border-primary bg-bg-primary px-2 text-[11px] font-mono text-text-primary outline-none"
-            >
-              {dates.map((date) => (
-                <option key={date} value={date}>{date}</option>
-              ))}
-            </select>
+            <TopbarTradeDate value={selectedDate} dates={dates} onChange={setGlobalDate} />
           )}
-          <button
-            type="button"
-            onClick={refreshAll}
-            className="h-8 w-8 rounded-md border border-border-primary bg-bg-primary text-text-secondary transition-colors hover:border-brand-blue/60 hover:text-brand-blue-light"
-            title="刷新"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="mx-auto">
-              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
-              <path d="M21 3v5h-5" />
-              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
-              <path d="M8 16H3v5" />
-            </svg>
-          </button>
         </div>
       </div>
 
@@ -2616,11 +2642,17 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
       {/* 主体：左侧边栏 + 右侧行情 */}
       <div className="flex min-h-0 flex-1">
         {/* 左侧分组边栏 */}
-        {!sidebarCollapsed && (
+        {sidebarCollapsed ? (
+          <div className="ml-3 my-2 shrink-0 rounded-lg border border-border-primary bg-bg-secondary/45 px-2 py-2">
+            <WatchlistSidebarToggle collapsed onToggle={toggleSidebar} />
+          </div>
+        ) : (
           <aside
-            className="flex w-[clamp(280px,20vw,300px)] min-h-0 shrink-0 flex-col overflow-hidden border-r border-border-primary bg-bg-primary/60 transition-all duration-200"
+            className={watchlistSidebarClass}
           >
             <PoolSidebar
+              sidebarToggle={<WatchlistSidebarToggle collapsed={false} onToggle={toggleSidebar} />}
+              canEdit={canEdit}
               pools={pools}
               selectedPoolId={selectedPoolId}
               selectedSymbol={selectedSymbol}
@@ -2631,7 +2663,6 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
               editingPoolId={editingPoolId}
               editingPoolName={editingPoolName}
               isBusy={isBusy}
-              monitoringPoolId={monitorPoolMutation.isPending ? monitorPoolMutation.variables?.poolId : undefined}
               sortKey={sortKey}
               sortDir={sortDir}
               onKeywordChange={setKeyword}
@@ -2653,10 +2684,6 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
                 setEditingPoolName('');
               }}
               onDeletePool={(poolId) => deletePoolMutation.mutate(poolId)}
-              onToggleMonitor={(pool) => monitorPoolMutation.mutate({
-                poolId: pool.pool_id,
-                enabled: !isPoolMonitored(pool),
-              })}
               onAddStock={(symbol) => {
                 if (selectedPoolId && symbol) addStockMutation.mutate(symbol);
               }}
@@ -2668,7 +2695,7 @@ export default function StockWorkspace({ initialSymbol }: { initialSymbol?: stri
         )}
 
         {/* 右侧行情区 */}
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden p-2">
+        <main className={watchlistContentClass}>
           {reportLinkError && <div role="alert" className="mb-1 shrink-0 text-xs text-warning">{reportLinkError}</div>}
           {reportLinked && reportContext && <div className="mb-1 flex shrink-0 items-center justify-between gap-2 rounded border border-brand-blue/30 bg-brand-blue/5 px-2 py-1 text-[10px] text-brand-blue-light">
             <span>日报联动 · {reportContext.date} · {reportContext.label} · {members.length} 只</span>
@@ -2694,7 +2721,8 @@ export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymb
   onSelectSymbol: (symbol: string) => void; onContext: (context: DailyHintsContext) => void; coverageStatus?: string; summaryOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
-  const requestPoolId = ['__single__', '__all_watchlist__'].includes(poolId) ? undefined : poolId;
+  const strategyScope = poolId.startsWith('strategy:');
+  const requestPoolId = strategyScope || ['__single__', '__all_watchlist__'].includes(poolId) ? undefined : poolId;
   const watchSummaryQuery = useQuery({
     queryKey: ['watchSummary', date, poolId],
     queryFn: () => watchApi.getSummary({ tradeDate: date, poolId: requestPoolId }),
@@ -2703,7 +2731,7 @@ export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymb
   });
   const watchSnapshotsQuery = useQuery({
     queryKey: ['watchSnapshots', date, poolId],
-    queryFn: () => watchApi.getSnapshots({ tradeDate: date, poolId: requestPoolId }),
+    queryFn: () => watchApi.getSnapshots({ tradeDate: date, poolId: requestPoolId, strategy: strategyScope || undefined }),
     enabled: Boolean(date && poolId) && poolId !== REPORT_LINKED_POOL_ID,
     staleTime: 30_000,
   });
@@ -2790,9 +2818,9 @@ export function SharedDailyHints({ date, poolId, poolName, members, onSelectSymb
   return <DailyHintsPanel date={date} poolId={poolId} poolName={poolName} members={members}
     watchSignals={watchHintSignals.filter((signal) => memberSymbols.has(signal.symbol))}
     onSelectSymbol={onSelectSymbol} onContext={onContext} summaryOnly={summaryOnly}
-    watchStatus={coverageStatus || (watchSnapshotsQuery.isError ? '低吸状态读取失败' : watchSnapshotsQuery.isLoading ? '低吸状态读取中'
+    watchStatus={coverageStatus || (strategyScope && watchSnapshotsQuery.isSuccess ? `低吸状态覆盖 ${new Set(scopedSnapshots.map((row) => row.symbol)).size}/${memberSymbols.size} 只` : '') || (watchSnapshotsQuery.isError ? '低吸状态读取失败' : watchSnapshotsQuery.isLoading ? '低吸状态读取中'
       : !scopedSnapshots.length ? '低吸所选日期暂无状态' : scopedEvents.some((event) => !event.symbol && event.trade_date === date && !['resolved', 'acknowledged'].includes(text(event.status, '').toLowerCase()) && !event.resolved_at && normalizedWatchEventType(event) === 'DATA_BLOCKED') ? '存在系统数据阻断，请查看历史提醒' : '')}
-    legacyActions={<TodayActionBox compact scopeKey={poolId} tradeDate={date} poolName={poolId === '__single__' ? `${poolName} · 含系统提醒` : poolName}
+    legacyActions={strategyScope ? null : <TodayActionBox compact scopeKey={poolId} tradeDate={date} poolName={poolId === '__single__' ? `${poolName} · 含系统提醒` : poolName}
       summary={['__single__', '__all_watchlist__'].includes(poolId) ? {} : watchSummary} snapshots={scopedSnapshots} events={scopedEvents}
       loading={watchSummaryQuery.isLoading || watchSnapshotsQuery.isLoading || watchEventsQuery.isLoading}
       failed={watchSummaryQuery.isError || watchSnapshotsQuery.isError || watchEventsQuery.isError}
@@ -2826,7 +2854,7 @@ export function AllWatchlistDailyHints({ date, onSelectSymbol, onContext, summar
   }
   const pending = poolsQuery.isLoading || memberQueries.some((query) => query.isLoading);
   const failed = poolsQuery.isError || memberQueries.some((query) => query.isError);
-  const coverageStatus = pending ? '正在读取 Watchlist 全部分组，覆盖尚未完成'
+  const coverageStatus = pending ? '正在读取全部自选分组，覆盖尚未完成'
     : failed ? '部分分组读取失败，当前仅展示已读取成员机会'
     : pools.length > 32 || bySymbol.size >= 6000 ? '已达到覆盖上限，当前机会可能不完整' : '';
   const forwardContext = useCallback((context: DailyHintsContext) => {

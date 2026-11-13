@@ -1,5 +1,6 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { RefreshCw } from 'lucide-react';
@@ -158,25 +159,26 @@ export default function MarketPage() {
 
   const dashboard = dashboardQuery.data;
   const hero = dashboard?.hero;
-  const isRefreshing = datesQuery.isFetching || dashboardQuery.isFetching;
-
-  const refresh = () => {
-    datesQuery.refetch();
-    dashboardQuery.refetch();
-  };
+  const pageHeader = (
+    <section className="evo-page-header dashboard-span-12 flex flex-wrap items-center justify-between gap-2">
+      <h1 className="evo-page-title"><span className="evo-page-index">02</span> 市场强度与交易权限</h1>
+      <span className="dashboard-sync ml-auto min-h-8 !h-auto max-w-full !whitespace-normal">
+        <span className={dashboard ? 'status-dot bg-success text-success' : 'status-dot bg-current'} />
+        {dashboard
+          ? `交易日 ${dashboard.tradeDate} · 数据更新 ${dashboard.updatedAt || '—'}`
+          : dashboardQuery.isLoading ? '市场数据加载中' : '暂无更新时间'}
+      </span>
+    </section>
+  );
 
   if (dashboardQuery.isLoading && !dashboard) {
     return (
       <main className="dashboard-page">
+      <TopbarTradeDate value={selectedDate} dates={dates} onChange={setGlobalDate} />
         <div className="dashboard-grid">
-          <section className="dashboard-header dashboard-span-12">
-            <div>
-              <span className="dashboard-eyebrow">MARKET / 市场温度</span>
-              <h1>市场强度与交易权限</h1>
-            </div>
-          </section>
+          {pageHeader}
           <section className="dashboard-panel dashboard-panel-span-full">
-            <div className="dashboard-empty">Market 数据加载中</div>
+            <div className="dashboard-empty">市场数据加载中</div>
           </section>
         </div>
       </main>
@@ -186,17 +188,14 @@ export default function MarketPage() {
   if (dashboardQuery.error || !dashboard || !hero) {
     return (
       <main className="dashboard-page">
+      <TopbarTradeDate value={selectedDate} dates={dates} onChange={setGlobalDate} />
         <div className="dashboard-grid">
-          <section className="dashboard-header dashboard-span-12">
-            <div>
-              <span className="dashboard-eyebrow">MARKET / 市场温度</span>
-              <h1>市场强度与交易权限</h1>
-              <p>后台真实市场数据暂不可用。</p>
-            </div>
-            <button type="button" className="dashboard-primary-button" onClick={refresh}>
+          {pageHeader}
+          <section className="dashboard-panel dashboard-panel-span-full">
+            <div className="dashboard-empty">后台真实市场数据暂不可用。 <button type="button" className="dashboard-primary-button" onClick={() => { void datesQuery.refetch(); void dashboardQuery.refetch(); }}>
               <RefreshCw size={14} />
               重试
-            </button>
+            </button></div>
           </section>
         </div>
       </main>
@@ -205,29 +204,9 @@ export default function MarketPage() {
 
   return (
     <main className="dashboard-page market-overview">
+      <TopbarTradeDate value={selectedDate} dates={dates} onChange={setGlobalDate} />
       <div className="dashboard-grid">
-        <section className="dashboard-header dashboard-span-12">
-          <div>
-            <span className="dashboard-eyebrow">MARKET / 市场温度</span>
-            <h1>市场强度与交易权限</h1>
-            <p>交易日 {dashboard.tradeDate} · 数据更新 {dashboard.updatedAt}</p>
-          </div>
-          <div className="dashboard-header-actions market-header-actions">
-            <label className="dashboard-date-select market-action-control">
-              <select value={dashboard.tradeDate} onChange={(event) => setGlobalDate(event.target.value)}>
-                {dates.map((date) => (
-                  <option key={date} value={date}>
-                    {date}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button type="button" className="dashboard-primary-button market-action-control" onClick={refresh}>
-              <RefreshCw size={14} className={isRefreshing ? 'dashboard-spin' : ''} />
-              刷新
-            </button>
-          </div>
-        </section>
+        {pageHeader}
 
         <div className="dashboard-panel-span-full market-overview-hero">
           <MarketOverviewCard

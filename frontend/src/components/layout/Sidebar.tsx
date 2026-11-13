@@ -23,17 +23,17 @@ import { quantApi } from '@/lib/api';
 import { asList } from '@/components/workspace/DashboardPrimitives';
 
 const MODULES = [
-  { id: 'dashboard', name: 'Dashboard', sub: '总览', path: '/a/dashboard', activePath: '/a/dashboard', icon: Radar },
-  { id: 'market', name: 'Market', sub: '市场温度', path: '/a/market', activePath: '/a/market', icon: Activity },
-  { id: 'industries', name: 'Industries', sub: '行业战役', path: '/a/sector', activePath: '/a/sector', icon: Layers },
+  { id: 'dashboard', name: '总览', sub: '总览', path: '/a/dashboard', activePath: '/a/dashboard', icon: Radar },
+  { id: 'market', name: '市场', sub: '市场温度', path: '/a/market', activePath: '/a/market', icon: Activity },
+  { id: 'industries', name: '行业', sub: '行业战役', path: '/a/sector', activePath: '/a/sector', icon: Layers },
   { id: 'alpha', name: 'Alpha Pool', sub: '机会池', path: '/a/alpha-pool', activePath: '/a/alpha-pool', icon: Sparkles },
-  { id: 'research', name: 'Research', sub: '产业研究池', path: '/a/research', activePath: '/a/research', icon: Sparkles },
+  { id: 'research', name: '研究', sub: '产业研究池', path: '/a/research', activePath: '/a/research', icon: Sparkles },
   { id: 'stock', name: 'Stocks', sub: '个股作战', path: '/a/stock', activePath: '/a/stock', icon: BarChart3 },
   { id: 'signals', name: 'Signals', sub: '买点信号', path: '/a/signals', activePath: '/a/signals', icon: Zap },
-  { id: 'portfolio', name: 'Portfolio', sub: '持仓风控', path: '/a/portfolio', activePath: '/a/portfolio', icon: BriefcaseBusiness },
-  { id: 'review', name: 'Review', sub: '复盘进化', path: '/a/report', activePath: '/a/report', icon: FileText },
+  { id: 'portfolio', name: '持仓', sub: '持仓风控', path: '/a/portfolio', activePath: '/a/portfolio', icon: BriefcaseBusiness },
+  ...(process.env.NEXT_PUBLIC_EVOALPHA_HIDE_REVIEW === '1' ? [] : [{ id: 'review', name: '复盘', sub: '复盘进化', path: '/a/report', activePath: '/a/report', icon: FileText }]),
   { id: 'ai', name: 'AI Lab', sub: 'AI实验室', path: '/a/dashboard#ai-brief', icon: Bot },
-  { id: 'settings', name: 'Settings', sub: '系统设置', path: '/a/data', activePath: '/a/data', icon: Database },
+  { id: 'settings', name: '系统设置', sub: '系统设置', path: '/a/data', activePath: '/a/data', icon: Database },
 ];
 
 function isActive(pathname: string, activePath?: string) {

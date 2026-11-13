@@ -26,7 +26,7 @@ export default function EquityChart({ snapshots, baselineDate }: Props) {
   const zeroOffset = max === min ? 0.5 : max / (max - min);
   const isEquity = metric === 'equity';
   const label = metric === 'equity' ? '总资产' : metric === 'pnl' ? '区间累计盈亏' : '区间收益率';
-  return <section className="rounded-2xl border border-white/10 bg-[var(--bg-secondary)] p-2">
+  return <section className="min-w-0 px-2">
     <div className="mb-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
         <h2 className="text-sm font-semibold text-[var(--text-primary)]">账户权益</h2>

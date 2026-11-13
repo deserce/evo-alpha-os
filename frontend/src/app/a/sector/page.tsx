@@ -360,13 +360,14 @@ function IndustryStockWorkbench({
       </div>
       <section className={`${mobilePane === 'chart' ? 'flex' : 'hidden lg:flex'} min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border-secondary bg-bg-primary/35`}>
         <div className="flex min-h-9 items-center justify-between gap-2 border-b border-border-secondary bg-bg-secondary/45 px-2">
-          <div className="flex min-w-0 items-center gap-1">
+          <div className="chart-mode-switch flex min-w-0 items-center gap-1">
             <button
               type="button"
+              aria-pressed={chartMode === 'sector'}
               onClick={() => setChartMode('sector')}
               className={`inline-flex h-7 items-center gap-1.5 rounded border px-2 text-[11px] font-black transition-colors ${
                 chartMode === 'sector'
-                  ? 'border-brand-blue/70 bg-brand-blue/15 text-brand-blue-light'
+                  ? 'text-brand-blue-light'
                   : 'border-border-primary bg-bg-primary/50 text-text-secondary hover:border-brand-blue/45 hover:text-white'
               }`}
             >
@@ -376,10 +377,11 @@ function IndustryStockWorkbench({
             <button
               type="button"
               disabled={!selectedStock}
+              aria-pressed={chartMode === 'stock'}
               onClick={() => selectedStock && setChartMode('stock')}
               className={`inline-flex h-7 min-w-0 items-center gap-1.5 rounded border px-2 text-[11px] font-black transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 chartMode === 'stock'
-                  ? 'border-brand-blue/70 bg-brand-blue/15 text-brand-blue-light'
+                  ? 'text-brand-blue-light'
                   : 'border-border-primary bg-bg-primary/50 text-text-secondary hover:border-brand-blue/45 hover:text-white'
               }`}
             >
@@ -514,6 +516,14 @@ export default function IndustriesPage() {
   const { globalDate, setGlobalDate, selectedSector: globalSector, setSelectedSector } = useGlobalStore();
   const [localSector, setLocalSector] = useState(globalSector);
   const [detailOpen, setDetailOpen] = useState(false);
+  useEffect(() => {
+    const name = new URLSearchParams(window.location.search).get('sector')?.trim();
+    if (name) {
+      setLocalSector(name);
+      setSelectedSector(name);
+      setDetailOpen(true);
+    }
+  }, [setSelectedSector]);
   const detailDialog = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -607,15 +617,6 @@ export default function IndustriesPage() {
   const totalStocks = toNumber(stocksQuery.data?.total, stocks.length);
   const s4s5 = stocks.filter((row) => ['S4', 'S5'].includes(String(row.lifecycle_state))).length;
 
-  const refresh = () => {
-    datesQuery.refetch();
-    heatmapQuery.refetch();
-    if (detailOpen) {
-      industryQuery.refetch();
-      stocksQuery.refetch();
-    }
-  };
-
   const sortStocks = (key: string) => {
     if (key === activeStockSortBy) {
       setStockSortDirection((direction) => direction === 'desc' ? 'asc' : 'desc');
@@ -628,12 +629,11 @@ export default function IndustriesPage() {
   return (
     <WorkbenchPage
       index="03"
-      title="Industries  行业战役"
+      title="行业战役"
       subtitle="点击热图中的行业或 RPS 数值，查看行业作战详情。"
       date={selectedDate}
       dates={dates}
       onDateChange={setGlobalDate}
-      onRefresh={refresh}
     >
       <CockpitPanel
         title="行业 RPS 热图"

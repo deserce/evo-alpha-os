@@ -1,19 +1,17 @@
 'use client';
 
+import { TopbarTradeDate } from '@/components/layout/TopbarTradeDate';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import type { CSSProperties, ReactNode } from 'react';
 import { useState } from 'react';
 import dynamic from 'next/dynamic';
 import type { DailyHintsContext } from '@/components/stock/DailyHintsPanel';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
   Bot,
-  CalendarDays,
   ChevronRight,
   FileText,
   Layers3,
-  RefreshCw,
   ShieldAlert,
   Sparkles,
   Target,
@@ -232,12 +230,9 @@ function MiniTable({
 }
 
 export default function DashboardPage() {
-  const router = useRouter();
-  const queryClient = useQueryClient();
-  const { globalDate, setGlobalDate, setSelectedSector, setStockSidebarUi } = useGlobalStore();
+  const { globalDate, setGlobalDate, setStockSidebarUi } = useGlobalStore();
   const [strategy, setStrategy] = useState<string>('mrgc_v1');
   const [hints, setHints] = useState<DailyHintsContext>();
-  const [hintsRefresh, setHintsRefresh] = useState(0);
   const [showFullBrief, setShowFullBrief] = useState(false);
 
   const datesQuery = useQuery({
@@ -273,10 +268,19 @@ export default function DashboardPage() {
     queryFn: () => quantApi.getResearchSnapshot(selectedDate, 7, true),
     enabled: Boolean(selectedDate),
   });
+  const identity = useQuery({
+    queryKey: ['navigation-identity'],
+    queryFn: async () => {
+      const response = await fetch('/api/v1/users/me', { cache: 'no-store' });
+      return response.ok ? await response.json() as { role: string } : null;
+    },
+    retry: false,
+  });
+  const canViewBrief = identity.data?.role === 'admin';
   const briefQuery = useQuery({
     queryKey: ['dashboardBrief', selectedDate],
     queryFn: () => quantApi.getAiBrief(selectedDate, true),
-    enabled: Boolean(selectedDate),
+    enabled: canViewBrief && Boolean(selectedDate),
   });
 
   const dashboard = dashboardQuery.data ?? {};
@@ -304,56 +308,24 @@ export default function DashboardPage() {
   const riskTotal = portfolio ? Object.values(portfolio.counts).reduce((sum, count) => sum + count, 0) : 0;
   const portfolioStatus = queryMessage(portfolioQuery, !portfolio?.snapshot_ready
     ? '持仓快照缺失' : riskTotal ? `${riskTotal} 条提醒` : '当日无提醒');
-  const queries = [datesQuery, dashboardQuery, industryQuery, strategyQuery, portfolioQuery,
-    researchQuery, briefQuery];
-  const isRefreshing = queries.some((query) => query.isFetching);
   const openHints = (direction: 'buy' | 'sell') => {
     setGlobalDate(selectedDate);
     setStockSidebarUi({ tab: 'hints', hintsFilter: direction, assistantLink: null, infoHidden: false });
   };
 
-  function refreshAll() {
-    if (!selectedDate) {
-      void datesQuery.refetch();
-      return;
-    }
-    setHints(undefined);
-    setHintsRefresh((value) => value + 1);
-    void queryClient.invalidateQueries({
-      predicate: ({ queryKey }) => queryKey.includes(selectedDate)
-        && ['stockPools', 'stockPoolStocks', 'watchSnapshots', 'watchEvents', 'structureMonitor', 'mrgcDailyReport'].includes(String(queryKey[0])),
-    });
-    void Promise.all(queries.map((query) => query.refetch()));
-  }
-
   return (
     <main className="dashboard-page quant-overview">
-      {selectedDate && <WatchlistHints key={`${selectedDate}:${hintsRefresh}`} date={selectedDate}
+      {selectedDate && <WatchlistHints key={selectedDate} date={selectedDate}
         onSelectSymbol={ignoreSymbol} onContext={setHints} summaryOnly />}
       <div className="dashboard-grid">
-        <section className="dashboard-header dashboard-span-12">
-          <div className="dashboard-header-copy">
-            <span className="dashboard-eyebrow">Dashboard / 总览</span>
-            <h1>今日作战中枢</h1>
-            </div>
+        <section className="evo-page-header dashboard-span-12 flex flex-wrap items-center justify-between gap-2">
+          <h1 className="evo-page-title"><span className="evo-page-index">01</span> 今日作战中枢</h1>
           <div className="dashboard-header-actions">
-            <label className="dashboard-date-select">
-              <CalendarDays size={14} />
-              <select value={selectedDate || ''} onChange={(event) => setGlobalDate(event.target.value)}>
-                {dateOptions.map((date) => <option key={date} value={date}>{date}</option>)}
-              </select>
-            </label>
-            <span className="dashboard-sync">
+            <TopbarTradeDate value={selectedDate} dates={dateOptions} onChange={setGlobalDate} />
+            <span className="dashboard-sync !h-8 max-w-full !whitespace-normal">
               <span className="status-dot bg-success text-success" />
               {selectedDate ? `查看 ${selectedDate} · 最新行情 ${datesQuery.data?.latest ?? '—'}` : queryMessage(datesQuery, '暂无交易日')}
             </span>
-            <button type="button" className="dashboard-icon-button" onClick={refreshAll} title="刷新">
-              <RefreshCw size={15} className={isRefreshing ? 'dashboard-spin' : ''} />
-            </button>
-            <button type="button" className="dashboard-primary-button" onClick={() => { setShowFullBrief(true); document.getElementById('ai-brief')?.scrollIntoView(); }}>
-              <Bot size={15} />
-              查看盘后简报
-            </button>
           </div>
         </section>
 
@@ -394,7 +366,7 @@ export default function DashboardPage() {
         <Link href="/a/watchlist" onClick={() => openHints('sell')} className="dashboard-status-card dashboard-span-3">
           <div className="dashboard-status-head">
             <span>当日卖出关注</span>
-            <StatusPill tone="amber">Watchlist</StatusPill>
+            <StatusPill tone="amber">自选股</StatusPill>
           </div>
           <div className="dashboard-status-main">
             <strong>{hintsCount(sellHints.length)} <small>只</small></strong>
@@ -409,7 +381,7 @@ export default function DashboardPage() {
 
         <Link href="#portfolio-risk" className="dashboard-status-card dashboard-span-3">
           <div className="dashboard-status-head">
-            <span>Portfolio 持仓风险</span>
+            <span>持仓风险</span>
             <StatusPill tone={riskTotal || !portfolio?.snapshot_ready ? 'amber' : 'green'}>{portfolioStatus}</StatusPill>
           </div>
           <div className="dashboard-risk-grid">
@@ -420,36 +392,35 @@ export default function DashboardPage() {
           </div>
           <div className="dashboard-status-foot">查看当日持仓提醒 <ChevronRight size={14} /></div>
         </Link>
-        <Panel id="industry-ranking" span={5} title="强行业榜" subtitle="按当日强度排序" icon={<Layers3 size={16} />}
+        <Panel id="industry-ranking" span={5} title="强行业榜" subtitle="按行业综合分排序" icon={<Layers3 size={16} />}
           extra={<Link href="/a/sector" onClick={() => setGlobalDate(selectedDate)}>查看行业</Link>}>
           <MiniTable
             data={rankedIndustries}
             limit={8}
             empty={queryMessage(industryQuery, '当日行业强度尚未生成。')}
-            onRowClick={(row) => {
-              const sectorName = firstText(row, ['sector_name'], '');
-              if (sectorName) {
-                setSelectedSector(sectorName);
-                router.push('/a/sector');
-              }
-            }}
             columns={[
               { key: 'rank', label: '排名', render: (_row, index) => index + 1 },
-              { key: 'sector_name', label: '行业' },
+              { key: 'sector_name', label: '行业', render: (row) => {
+                const name = firstText(row, ['sector_name'], '');
+                return name ? <Link className="text-accent hover:underline" href={`/a/sector?sector=${encodeURIComponent(name)}`}>{name}</Link> : '—';
+              } },
               { key: 'industry_state', label: '状态', render: (row) => <StatusPill tone={stateTone(row.industry_state)}>{text(row.industry_state, 'I-')}</StatusPill> },
-              { key: 'industry_strength_score', label: '强度', align: 'right', render: (row) => num(row.industry_strength_score, 0) },
+              { key: 'industry_strength_score', label: '综合分（100）', align: 'right', render: (row) => num(row.industry_strength_score, 0) },
               { key: 'return_20d', label: '20日', align: 'right', render: (row) => pct(row.return_20d, 1) },
-              { key: 'rps90_ratio', label: 'RPS90', align: 'right', render: (row) => `${num(toNumber(row.rps90_stock_ratio, Number.NaN) * 100, 0)}%` },
-              { key: 'leader_name', label: '龙头', render: (row) => (
-                <span title={firstText(row, ['leader_symbol'])}>
-                  {firstText(row, ['leader_name', 'leader_symbol'])}
-                </span>
-              ) },
+              { key: 'sector_rps_20', label: '板块 RPS20', align: 'right', render: (row) => row.sector_rps_20 == null ? '—' : num(row.sector_rps_20, 0) },
+              { key: 'rps90_ratio', label: '强势股占比', align: 'right', render: (row) => `${num(toNumber(row.rps90_stock_ratio, Number.NaN) * 100, 0)}%` },
+              { key: 'leader_name', label: '龙头', render: (row) => {
+                const symbol = firstText(row, ['leader_symbol'], '');
+                const label = firstText(row, ['leader_name', 'leader_symbol']);
+                return /^[0-9]{6}$/.test(symbol)
+                  ? <Link className="text-accent hover:underline" href={`/a/stock/${symbol}?returnTo=%2Fa%2Fdashboard`}>{label}</Link>
+                  : label;
+              } },
             ]}
           />
         </Panel>
 
-        <Panel span={4} title="当日买入关注" subtitle={`Watchlist 全部 · ${hintsCount(buyHints.length)} 只`}
+        <Panel span={4} title="当日买入关注" subtitle={`全部自选分组 · ${hintsCount(buyHints.length)} 只`}
           icon={<Zap size={16} />} extra={<Link href="/a/watchlist" onClick={() => openHints('buy')}>查看全部</Link>}>
           <div className="dashboard-alert-list quant-buy-list">
             {buyHints.slice(0, 7).map((item) => {
@@ -465,7 +436,7 @@ export default function DashboardPage() {
           </div>
         </Panel>
 
-        <Panel id="ai-brief" span={3} title="盘后规则简报" subtitle="今日结论" icon={<Bot size={16} />}>
+        {canViewBrief && <Panel id="ai-brief" span={3} title="盘后规则简报" subtitle="今日结论" icon={<Bot size={16} />}>
           <div className="dashboard-brief-box">
             {Number.isFinite(marketScore) && <ScoreRing value={marketScore} label="作战分" />}
             <div className="dashboard-brief-lines">
@@ -476,9 +447,8 @@ export default function DashboardPage() {
           </div>
           <div className="dashboard-brief-actions">
             <button type="button" onClick={() => setShowFullBrief(!showFullBrief)}><FileText size={14} />{showFullBrief ? '收起' : '完整日报'}</button>
-            <button type="button" onClick={() => void briefQuery.refetch()}><RefreshCw size={14} />刷新简报</button>
           </div>
-        </Panel>
+        </Panel>}
 
         <Panel span={3} title="研究池动态" icon={<Sparkles size={16} />}
           extra={<Link href="/a/research">查看研究</Link>}>
@@ -489,14 +459,14 @@ export default function DashboardPage() {
             columns={[
               { key: 'theme_name', label: '研究主题' },
               { key: 'stock_count', label: '股票数', align: 'right', render: (row) => int(row.stock_count) },
-              { key: 'core', label: 'Core', align: 'right', render: (row) => int(row.core) },
+              { key: 'core', label: '核心标的', align: 'right', render: (row) => int(row.core) },
               { key: 'status', label: '最高状态', render: (row) => <StatusPill tone={stateTone(row.s5 ? 'S5' : row.s4 ? 'S4' : row.s3 ? 'S3' : '')}>{row.s5 ? 'S5' : row.s4 ? 'S4' : row.s3 ? 'S3' : '—'}</StatusPill> },
             ]}
           />
         </Panel>
 
         <Panel id="strategy-picks" span={5} title="策略筛选结果"
-          subtitle={strategyReady ? `当日命中 ${strategyTotal} 只 · 展示前 ${strategyRows.length} 只` : 'Strategy 当日筛选'}
+          subtitle={strategyReady ? `当日命中 ${strategyTotal} 只 · 展示前 ${strategyRows.length} 只` : '当日策略筛选'}
           icon={<Target size={16} />}
           extra={<div className="flex items-center gap-3">
             <select aria-label="筛选策略" value={strategy} onChange={(event) => setStrategy(event.target.value)}
@@ -521,9 +491,9 @@ export default function DashboardPage() {
           />
         </Panel>
 
-        <Panel id="portfolio-risk" span={4} title="Portfolio 持仓提醒"
+        <Panel id="portfolio-risk" span={4} title="持仓提醒"
           subtitle={`${selectedDate} · 数量按事件触发时记录`} icon={<ShieldAlert size={16} />}
-          extra={<Link href="/a/portfolio">查看 Portfolio</Link>}>
+          extra={<Link href="/a/portfolio">查看持仓</Link>}>
           <div className="dashboard-alert-list">
             {portfolio?.rows.map((row) => (
               <Link key={row.id} href={`/a/stock/${row.symbol}`} onClick={() => setGlobalDate(selectedDate)} className="dashboard-alert-row">
